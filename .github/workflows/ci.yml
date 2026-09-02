@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    name: Lint + Typecheck + Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- install uv ----
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.x"
+
+      # ---- cache the uv-managed environment ----
+      - name: Cache uv environment
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ matrix.python-version }}-
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # ---- reproducible install from the committed lockfile ----
+      - name: Install dependencies (frozen lock)
+        run: uv sync --frozen --all-extras --dev
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Type-check (mypy, strict)
+        run: uv run mypy effect_broker
+
+      - name: Test (pytest)
+        run: uv run pytest
+
+      # ---- smoke-run the trace suite and assert expected outcomes ----
+      - name: Verify trace outcomes
+        run: |
+          uv run python run_traces.py > /tmp/traces.txt
+          grep -q "T1 clean send -> ALLOW.*allow=True" /tmp/traces.txt
+          grep -q "T2 injected send -> BLOCK FlowOK.*allow=False" /tmp/traces.txt
+          grep -q "T3 delete wrong-target -> BLOCK Auth.*allow=False" /tmp/traces.txt
+          grep -q "T4 stale/expired -> BLOCK Fresh.*allow=False" /tmp/traces.txt
+          grep -q "T5 forged network -> BLOCK NoAmp.*allow=False" /tmp/traces.txt
+          echo "trace outcomes OK"
