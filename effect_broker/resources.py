@@ -42,12 +42,30 @@ class ResourceStore:
             return self.mailboxes[target]
         return None
 
+    def mailbox_for(self, email: Email) -> Mailbox:
+        """Resolve an email address to its owner's mailbox (address -> user)
+
+        For the minimal model the mailbox owner is the local part of the
+        address (the part before '@'); the domain class (internal/external)
+        determines which mailbox space it belongs to. This is the address ->
+        mailbox association the report describes
+        """
+        local = email.address.split("@")[0]
+        return self.mailboxes.setdefault(local, Mailbox(local))
+
     def apply_effect(self, effect: Effect) -> None:
         """Mutate external state for a committed (allowed) effect
 
         Intended to be called ONLY by EffectBroker.commit_effect after the
         predicate gate passed. This is the single point where "prepared"
         effects become real side effects
+
+        Semantics:
+          - write/delete act on files
+          - send delivers into the sender's OUTBOX (address -> mailbox)
+          - read retrieves a message from a mailbox (target may be an address
+            or a mailbox)
+          - network is logged with no persistent resource
         """
         target_id = effect.target
         resource = self.resolve(target_id)
@@ -56,11 +74,20 @@ class ResourceStore:
 
         if effect.etype == "delete" and isinstance(resource, File):
             del self.files[target_id]
+            self.effects_log.append(("delete", f"file:{target_id}"))
         elif effect.etype == "write" and isinstance(resource, File):
             # For the minimal model a write just records the new state in the log.
             self.effects_log.append(("write", f"file:{target_id}"))
         elif effect.etype == "send" and isinstance(resource, Email):
+            # deliver into the sender's outbox (address -> mailbox)
+            self.mailbox_for(resource).outbox.append(target_id)
             self.effects_log.append(("send", f"email:{target_id}"))
+        elif effect.etype in ("read", "send") and isinstance(resource, Mailbox):
+            # read from / send into a mailbox directly
+            self.effects_log.append((effect.etype, f"mailbox:{target_id}"))
+        elif effect.etype == "read" and isinstance(resource, Email):
+            # read on an email retrieves the message from its owner's mailbox
+            self.effects_log.append(("read", f"inbox:{self.mailbox_for(resource).user}"))
         elif effect.etype == "network":
             # network has no persistent resource here; log it as committed.
             self.effects_log.append(("network", target_id))
