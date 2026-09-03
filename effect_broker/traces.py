@@ -549,8 +549,7 @@ def run_all() -> EffectBroker:
             f"(blocker={evidence['primary_blocker']})"
         )
         print(
-            f"[{trace_name}] -> {status}  "
-            f"primary_blocker={evidence['primary_blocker'] or 'none'}"
+            f"[{trace_name}] -> {status}  primary_blocker={evidence['primary_blocker'] or 'none'}"
         )
         for predicate_name, predicate_message in evidence["predicates"].items():
             print(f"    {predicate_name}: {predicate_message}")
@@ -607,8 +606,7 @@ def run_all() -> EffectBroker:
     allow1, evidence1 = esc_broker.commit(Commit(risky))
     assert allow1 is True and evidence1["primary_blocker"] is None
     print(
-        "    commit with approved one-shot cap -> ALLOW "
-        f"(blocker={evidence1['primary_blocker']})"
+        f"    commit with approved one-shot cap -> ALLOW (blocker={evidence1['primary_blocker']})"
     )
     # The one-shot capability is now consumed -> replay (Fresh) on second use.
     allow2, evidence2 = esc_broker.commit(Commit(risky))
