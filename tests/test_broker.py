@@ -416,3 +416,43 @@ def test_risk_escalation_one_shot_approval() -> None:
     assert allow2 is False
     assert evidence2["primary_blocker"] == "Fresh"  # one-shot consumed (replay)
 
+
+# ---- mailbox semantics (B1): send delivers into the sender's outbox ----
+def test_send_delivers_to_outbox(broker: EffectBroker) -> None:
+    effect = Effect(
+        "send",
+        "internal@corp.com",
+        {},
+        (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        "r-send:Agent:EffectBroker",
+        CHAIN,
+    )
+    allow, _ = broker.commit(Commit(effect))
+    assert allow is True
+    # the mailbox for local part "internal" should now hold the sent message
+    local = effect.target.split("@")[0]
+    assert local in broker.store.mailboxes
+    assert effect.target in broker.store.mailboxes[local].outbox
+    assert any(entry == ("send", "email:internal@corp.com") for entry in broker.store.effects_log)
+
+
+# ---- C1: Auth is static, revoked is a Fresh (time-sensitive) rejection ----
+def test_revoked_blocked_by_fresh_not_auth(broker: EffectBroker) -> None:
+    # revoke the broker-held send capability used by the clean trace
+    broker.revoke("r-send:Agent:EffectBroker")
+    effect = Effect(
+        "send",
+        "internal@corp.com",
+        {},
+        (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        "r-send:Agent:EffectBroker",
+        CHAIN,
+    )
+    allow, evidence = broker.commit(Commit(effect))
+    assert allow is False
+    # Auth is static: holder/right/target still match -> auth-ok
+    assert evidence["predicates"]["Auth"] == "auth-ok"
+    # Fresh is the time-sensitive predicate that rejects the revoked capability
+    assert evidence["primary_blocker"] == "Fresh"
+    assert evidence["predicates"]["Fresh"] == "revoked"
+
