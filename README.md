@@ -83,6 +83,35 @@ Following Report #1 model v0.1, the primitive effects are
 This makes "the LLM proposes (prepares effects), the EffectBroker commits" a
 literal part of the data model, not just a description.
 
+## Mailbox & email-domain semantics
+
+The `send`/`read` effects give the email domain a concrete, testable meaning so
+`Mailbox` (M) carries real structure rather than being a dead type:
+
+- `send` targets an email address and **delivers into the sender's outbox** via
+  an `address -> mailbox` resolution (`ResourceStore.mailbox_for`).
+- `read` on an email **retrieves the message from its owner's inbox**.
+- Mailboxes are therefore part of the email domain (message + its inbox/outbox),
+  not a separate enforcement domain; they still appear in `R = F ∪ E ∪ M` as a
+  resource class the broker may target
+
+## Risk evaluation -> Approver -> one-shot capability (R1)
+
+A (learned) `risk_theta` classifier may route a high-risk effect to an
+`Approver` (`needs_review`). Approval grants a **fresh, one-shot** capability
+(`grant_approval`), which must **still** pass `Auth ∧ FlowOK ∧ NoAmp ∧ Fresh` at
+commit — the classifier is **not** part of the formal allow rule. Reusing the
+one-shot capability is a `Fresh` replay rejection
+
+## Static Auth vs dynamic Fresh (revocation hangs off Fresh)
+
+`Auth` is **static**: it checks that the broker holds a capability whose
+holder, right, and target match the effect. `Fresh` is **dynamic**: it checks at
+commit time `t` that the capability is unexpired, unrevoked, and not replayed.
+Revocation is enforced **solely by `Fresh`** in the current implementation, so a
+revoked capability passes `Auth` but is rejected by `Fresh` (see
+`test_revoked_blocked_by_fresh_not_auth`)
+
 ## Design note: why NoAmp is path-based, not set-based
 
 The first version of the week-1 model checked NoAmp: effect_authority
@@ -118,28 +147,79 @@ broker's store
 effect_broker/
   lattice.py     Confidentiality / Integrity lattices
   model.py       pure model types: principals + resources (File, Email, Mailbox,
-                 Domain) + Data, Capability, Effect(prepared), Commit, LabelException
-  resources.py   mutable ResourceStore (F ∪ E ∪ M) — the broker's external state
+                 Domain) + Data, Capability, Effect(prepared), Commit,
+                 LabelException
+  resources.py   mutable ResourceStore (F ∪ E ∪ M) — the broker's external state;
+                 mailbox send->outbox / read->inbox semantics + address->mailbox
+                 resolution (mailbox_for)
+  mediation.py   tool-boundary / MCP-semantics-honesty mediation (T13/T14/T15):
+                 MediationVerdict / mediate, decided via the broker's commit gate
+                 (remote-boundary mode)
   broker.py      EffectBroker (the only committer) + four predicates
                  + commit primitive + declass/endorse grants (broker-only)
-  traces.py      adversarial trace suite (all 20 traces). The T13/T14/T15
-                 tool-boundary / MCP-semantics-honesty traces are modeled as a
-                 mediation step (MediationVerdict / mediat) alongside the
-                 predicate-gate traces — no separate module
+                 + attempt_wide (honest, non-monotonic widening) + risk-evaluation
+                 / approval (R1 one-shot) + static Auth / Fresh-owned revocation
+  traces.py      adversarial trace suite (20 predicate/gate traces plus the R1
+                 escalation trace); T13/T14/T15 wired through the mediation module
 run_traces.py    entry point
 ```
 
-## Run
+## Run (make / dev.sh)
+
+The repository is managed with **uv**. Two equivalent wrappers drive the same
+targets: the **Makefile** (`make <target>`) and the **`dev.sh`** helper
+(`./dev.sh <target>`).
+
+### One-shot: run the model
 
 ```bash
-python run_traces.py     # prints all 20 traces with per-predicate evidence
-make                     # full gate: lint + test + run (trace outcomes asserted)
+make all        # full CI gate: lint + typecheck + test + verify
+make run        # run the adversarial trace suite (20 traces + R1) with evidence
+make help       # list all available targets
 ```
+
+or, equivalently, via the `dev.sh` helper:
+
+```bash
+./dev.sh run      # run the trace suite
+./dev.sh lint     # ruff
+./dev.sh typecheck  # mypy (strict)
+./dev.sh test     # pytest
+./dev.sh verify   # assert trace outcomes (same as CI)
+```
+
+### Step-by-step from a fresh clone
+
+```bash
+./dev.sh setup        # install uv itself (idempotent), if missing
+./dev.sh install      # uv sync: create venv + install project & dev deps
+./dev.sh run          # run the tiny executable model (T1–T20 + R1, with evidence)
+make all              # full CI gate: lint + typecheck + test + verify
+```
+
+### Available targets
+
+| `make` / `./dev.sh`      | What it does                                             |
+| ------------------------ | -------------------------------------------------------- |
+| `setup`                  | Ensure `uv` is installed (idempotent)                    |
+| `install` (alias `sync`) | venv + locked deps via `uv sync`                         |
+| `lint`                   | ruff check                                               |
+| `format`                 | ruff format + `--fix`                                    |
+| `typecheck`              | mypy (strict) on `effect_broker`                         |
+| `test`                   | pytest (regression suite encoding T1–T20 + mediation)    |
+| `run`                    | `python run_traces.py` (the trace suite, with evidence)  |
+| `verify`                 | assert the machine-checkable trace outcomes (same as CI) |
+| `all`                    | setup → lint → typecheck → test → verify (full gate)     |
+| `doctor`                 | show env + dependency status                             |
+| `clean`                  | remove caches/build                                      |
+| `shell` _(dev.sh only)_  | drop into a venv-activated shell                         |
+
+`make all` is exactly what CI (`./.github/workflows/ci.yml`) runs on every push.
 
 ## Adversarial trace suite (20 traces)
 
-Each trace is a runnable script: initial state → agent proposal → broker
-decision → expected outcome. They map 1:1 to the brief's Section-4 attack
+Each trace is a runnable script: initial state -> agent proposal -> broker
+decision -> expected outcome. They map 1:1 to the brief's Section-4 attack
 classes and are asserted in `tests/test_broker.py`.
 
 | #   | Attack class                         | Expected result  |
@@ -147,20 +227,20 @@ classes and are asserted in `tests/test_broker.py`.
 | T1  | clean send (benign)                  | ✅ ALLOW         |
 | T2  | prompt injection                     | ⛔ FlowOK        |
 | T3  | confused deputy                      | ⛔ Auth          |
-| T4  | attacker-controlled path/URL (SSRF)  | ⛔ Auth/NoAmp    |
+| T4  | attacker-controlled URL (SSRF)       | ⛔ NoAmp         |
 | T5  | capability laundering                | ⛔ FlowOK        |
 | T6  | delegation widening                  | ⛔ NoAmp         |
 | T7  | confidential-data leakage            | ⛔ FlowOK        |
-| T8  | low-integrity→privileged action      | ⛔ FlowOK        |
+| T8  | low-integrity->privileged action     | ⛔ FlowOK        |
 | T9  | stale approval                       | ⛔ Fresh         |
 | T10 | replay                               | ⛔ Fresh         |
 | T11 | declassification abuse               | ⛔ FlowOK        |
 | T12 | endorsement abuse                    | ⛔ FlowOK        |
 | T13 | false MCP description (hidden write) | ⛔ boundary stop |
 | T14 | hidden side effect                   | ⛔ boundary stop |
-| T15 | monitor bypass                       | ⛔ no commit     |
+| T15 | monitor bypass                       | ⛔ boundary stop |
 | T16 | capability forgery                   | ⛔ NoAmp         |
-| T17 | path traversal                       | ⛔ Auth/FlowOK   |
+| T17 | path traversal                       | ⛔ Auth          |
 | T18 | recipient spoofing via BCC/CC        | ⛔ FlowOK        |
 | T19 | memory-poisoned instruction          | ⛔ FlowOK        |
 | T20 | amplification via composition        | ⛔ NoAmp         |
@@ -169,9 +249,9 @@ classes and are asserted in `tests/test_broker.py`.
 > prints the attack class. The several `BoundaryStop` outcomes (T13/T14/T15)
 > are a _mediation_ verdict, not a predicate — the effect never reaches the
 > remote tool because the broker either blocks it or the guarantee stops at the
-> broker→tool boundary (per "Tool/MCP semantics honesty" in the brief).
+> broker->tool boundary (per "Tool/MCP semantics honesty" in the brief).
 
-## Findings (Week 1, after fix)
+## Findings (Week 1)
 
 - The invariant is expressible and machine-checkable (per-predicate evidence,
   including a `primary_blocker`).
@@ -186,10 +266,14 @@ classes and are asserted in `tests/test_broker.py`.
   effect provably never reaches external state (`effects_log` stays empty for
   blocked effects), while an allowed effect is applied exactly once.
 - **Declass/endorse are broker-only, explicit, and machine-checkable.** A
-  `conf-leak`/`low-integrity` flow commits **only** when a broker-recorded
-  `LabelException` (granted by User/Approver) validates it (T3-completeness).
-  An LLM-attached exception that was never broker-granted is rejected at commit
-  (T7), confirming "LLM may request, never perform".
+  conf-leak/low-integrity flow commits only when a broker-recorded LabelException
+  (granted by User/Approver) validates it (test_validated_declass_allowed). An LLM-attached
+  exception that was never broker-granted is rejected at commit — trace T11 (declass-abuse)
+  and T12 (endorse-abuse) — confirming "LLM may request, never perform
+- Risk escalation (R1) is outside the allow rule. A learned risk model may
+  route a high-risk effect to an Approver, but its grant is a fresh one-shot
+  capability that must still pass Auth ∧ FlowOK ∧ NoAmp ∧ Fresh; reusing it is
+  a Fresh replay (tested in test_risk_escalation_one_shot_approval)
 
 ## Honest limitations
 
@@ -198,11 +282,10 @@ classes and are asserted in `tests/test_broker.py`.
   the resource + `commit_effect` primitive mechanics are now modeled.
 - Provenance lists are hand-assigned, not extracted from a real LLM/tool layer
   (real taint propagation is Week-3 work).
-- The tool-boundary / MCP-semantics-honesty decision is **scaffolded**, not
-  fully modeled: T13/T14/T15 show a `MediationVerdict` (`MediationVerdict` /
-  `mediat`) where the effect is screened _before_ forwarding to the remote
-  tool, but real tool adapters and the mechanized checker ↔ semantics proof
-  are **not yet modeled** — they are the next steps and the two sharpest
-  differentiators.
+- Tool-boundary / MCP-semantics-honesty mediation (T13/T14/T15) is implemented as
+  a MediationVerdict/mediate module (effect_broker/mediation.py), invoked through
+  EffectBroker.commit(..., mediation=...): the effect never reaches the remote tool.
+  Not yet modeled are the real tool adapters and the mechanized checker ↔ semantics
+  consistency proof — the next steps and the two sharpest differentiators.
 - The TCB-expansion trade-off (effect mediation pulls small primitives into the
   trusted core) must be argued explicitly in Week 2; this model does not decide it.
