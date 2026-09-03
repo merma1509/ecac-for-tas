@@ -365,7 +365,12 @@ def test_conditioned_mediation_prevents_commit() -> None:
     broker = build()
     # a broker-held write capability to secrets (so the four predicates pass)
     broker.capabilities["r-write-secrets"] = Capability(
-        USER, BROKER, "write", "file:///secrets", frozenset({"confidential"}), 100,
+        USER,
+        BROKER,
+        "write",
+        "file:///secrets",
+        frozenset({"confidential"}),
+        100,
         "r-write-secrets",
     )
     effect = Effect(
@@ -455,4 +460,3 @@ def test_revoked_blocked_by_fresh_not_auth(broker: EffectBroker) -> None:
     # Fresh is the time-sensitive predicate that rejects the revoked capability
     assert evidence["primary_blocker"] == "Fresh"
     assert evidence["predicates"]["Fresh"] == "revoked"
-
