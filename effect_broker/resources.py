@@ -1,0 +1,70 @@
+"""Mutable external state (R = F ∪ E ∪ M) the broker may mutate
+
+The pure resource *types* (File, Email, Mailbox, Domain, Resource) live in
+`model.py` alongside the rest of the model (P + R + Effect). This module holds
+only the mutable `ResourceStore`: the "external state" that effects act upon
+
+Only the EffectBroker may mutate resources via the commit primitive
+(commit_effect); the LLM and tool code never touch this store directly
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from .model import Effect, Email, File, Mailbox, Resource
+
+
+@dataclass
+class ResourceStore:
+    """The external state the broker may mutate. Only `commit_effect` writes here
+
+    - files:    path -> File
+    - emails:   address -> Email
+    - mailboxes: user -> Mailbox
+    - effects_log: append-only record of effects the broker actually committed
+      (proves the "prepared vs committed" split: nothing mutates unless the
+      broker's predicate gate passed)
+    """
+
+    files: dict[str, File] = field(default_factory=dict)
+    emails: dict[str, Email] = field(default_factory=dict)
+    mailboxes: dict[str, Mailbox] = field(default_factory=dict)
+    effects_log: list[tuple[str, str]] = field(default_factory=list)
+
+    def resolve(self, target: str) -> Resource | None:
+        """Look up a resource by its target string (id)"""
+        if target in self.files:
+            return self.files[target]
+        if target in self.emails:
+            return self.emails[target]
+        if target in self.mailboxes:
+            return self.mailboxes[target]
+        return None
+
+    def apply_effect(self, effect: Effect) -> None:
+        """Mutate external state for a committed (allowed) effect
+
+        Intended to be called ONLY by EffectBroker.commit_effect after the
+        predicate gate passed. This is the single point where "prepared"
+        effects become real side effects
+        """
+        target_id = effect.target
+        resource = self.resolve(target_id)
+        if resource is None:
+            raise KeyError(f"effect targets unknown resource: {target_id}")
+
+        if effect.etype == "delete" and isinstance(resource, File):
+            del self.files[target_id]
+        elif effect.etype == "write" and isinstance(resource, File):
+            # For the minimal model a write just records the new state in the log.
+            self.effects_log.append(("write", f"file:{target_id}"))
+        elif effect.etype == "send" and isinstance(resource, Email):
+            self.effects_log.append(("send", f"email:{target_id}"))
+        elif effect.etype == "network":
+            # network has no persistent resource here; log it as committed.
+            self.effects_log.append(("network", target_id))
+        else:
+            raise ValueError(
+                f"effect type {effect.etype} not applicable to resource {type(resource).__name__}"
+            )
