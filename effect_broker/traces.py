@@ -20,10 +20,9 @@ so NoAmp truly reflects the "broker is always in the chain" property that the
 early set-based model got wrong.
 """
 
-from dataclasses import dataclass
-
 from .broker import EffectBroker
 from .lattice import Confidentiality, Integrity
+from .mediation import mediate
 from .model import (
     AGENT,
     BROKER,
@@ -179,6 +178,20 @@ def build() -> EffectBroker:
             nonce="declass-1",
         )
     )
+    # ---- HONEST delegation widening (T6), NOT a forgery ----
+    #   An Agent tries to hand the broker a delete-on-secrets capability derived
+    #   from its delete-on-reports capability. Root-anchored (owner=User) but
+    #   NON-monotonic (widens target to secrets the parent never granted) ->
+    #   NoAmp rejects it at commit time (this is "authority increased via
+    #   delegation", the brief's T6, without needing Mallory to forge anything)
+    broker.attempt_wide(
+        "r-del:Agent",
+        BROKER,
+        "delete",
+        "file:///secrets",
+        frozenset({"confidential"}),
+        100,
+    )
     return broker
 
 
@@ -201,101 +214,89 @@ def _clean_effect() -> Effect:
 # the effect's declared shape. The brief's "Tool / MCP semantics honesty"
 # traces (T13, T14, T15) are therefore a *mediation* decision: given the
 # declared effect, does the broker refuse to forward it to the remote tool?
-# The verdict is a `BoundaryStop`, not a predicate blocker.
+# The verdict is a `BoundaryStop`, not a predicate blocker
 
 
-@dataclass(frozen=True)
-class MediationVerdict:
-    """Machine-checkable outcome of the broker -> tool mediation step."""
-
-    allow: bool
-    boundary_stop: str | None  # reason the effect is not forwarded, if blocked
-
-
-def mediat(
-    effect: Effect,
-    *,
-    declared_write_target: str | None = None,
-    hidden_side_effect: bool = False,
-    monitoring_bypass: bool = False,
-) -> MediationVerdict:
-    """Decide whether to forward a prepared effect to the remote tool.
-
-    Mirrors the three MCP-semantics-honesty failures from the brief:
-      - a tool whose *declared* write target (from its MCP description) differs
-        from the actual target it would touch  -> false description (T13)
-      - a tool that performs a side effect it does not declare          -> T14
-      - an effect that monitors/validates the system but could bypass the
-        mediation itself                                                -> T15
-    Any such mismatch stops at the boundary: the effect is not forwarded.
-    """
-    if monitoring_bypass:
-        return MediationVerdict(False, "monitor-bypass")
-    if hidden_side_effect:
-        return MediationVerdict(False, "hidden-side-effect")
-    if declared_write_target is not None and declared_write_target != effect.target:
-        return MediationVerdict(
-            False, f"false-description(declared={declared_write_target},actual={effect.target})"
-        )
-    return MediationVerdict(True, None)
+# Backwards-compatible alias: the mediation logic now lives in `.mediation`
+# and is invoked through the broker's commit gate (remote-boundary mode)
+# `mediat` is kept so the existing tests keep importing it
+mediat = mediate
 
 
 def run_mediation_traces() -> EffectBroker:
-    """Run the tool-boundary traces T13/T14/T15. At this layer effects are
-    *not* committed to the ResourceStore; they are screened by the mediator
-    before forwarding to the remote tool. No side effect occurs."""
+    """Run the tool-boundary traces T13/T14/T15 THROUGH the broker's commit gate
+    (remote-boundary mode). Even though all four predicates pass, the mediating
+    verdict stops the boundary, so NO side effect reaches external state
+    (effects_log stays empty)"""
     # T13: false MCP description — tool's declared write target (the reports
     #   dir) differs from the actual path it would touch (secrets) once invoked
     broker = build()
+    # a broker-held write capability to secrets (so the gate passes Auth/NoAmp)
+    broker.capabilities["r-write-secrets"] = _capability(
+        USER,
+        BROKER,
+        "write",
+        "file:///secrets",
+        frozenset({"confidential"}),
+        100,
+        "r-write-secrets",
+    )
     false_desc = Effect(
         "write",
         "file:///secrets",  # actual target the tool *would* write
         {},
         (Data("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
-        "r-write:Agent:EffectBroker",
+        "r-write-secrets",
         CHAIN,
     )
-    t13 = mediat(false_desc, declared_write_target="file:///reports")
-    assert not t13.allow and t13.boundary_stop == "false-description(declared=file:///reports,actual=file:///secrets)"  # noqa: E501
+    t13_mediation = mediate(false_desc, declared_write_target="file:///reports")
+    assert not t13_mediation.allow and t13_mediation.boundary_stop == (
+        "false-description(declared=file:///reports,actual=file:///secrets)"
+    )
+    t13_allow, t13_evidence = broker.commit(Commit(false_desc), mediation=t13_mediation)
+    assert t13_allow is False and t13_evidence["boundary_stop"] == t13_mediation.boundary_stop
     print("[T13 false-mcp-description: hidden write to secrets] -> BLOCK BoundaryStop")
-    print(f"    boundary_stop={t13.boundary_stop}")
+    print(f"    boundary_stop={t13_evidence['boundary_stop']}")
+    print("    gate predicates all pass, boundary stops forward")
+    print()
 
     # T14: hidden side effect — tool performs an undeclared side effect
     #   (exfiltrating a file) even though the declared effect is a benign read
-    t14 = mediat(
-        Effect(
-            "read",
-            "file:///trusted",
-            {},
-            (Data("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
-            "r-read:Agent:EffectBroker",
-            CHAIN,
-        ),
-        hidden_side_effect=True,
+    t14_effect = Effect(
+        "read",
+        "file:///trusted",
+        {},
+        (Data("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
+        "r-read:Agent:EffectBroker",
+        CHAIN,
     )
-    assert not t14.allow and t14.boundary_stop == "hidden-side-effect"
+    t14_mediation = mediate(t14_effect, hidden_side_effect=True)
+    assert not t14_mediation.allow and t14_mediation.boundary_stop == "hidden-side-effect"
+    t14_allow, t14_evidence = broker.commit(Commit(t14_effect), mediation=t14_mediation)
+    assert t14_allow is False and t14_evidence["boundary_stop"] == "hidden-side-effect"
     print("[T14 hidden-side-effect: undeclared exfil sidesteps read] -> BLOCK BoundaryStop")
-    print(f"    boundary_stop={t14.boundary_stop}")
+    print(f"    boundary_stop={t14_evidence['boundary_stop']}")
+    print()
 
     # T15: monitor bypass — the effect is itself a monitoring/validation action
     #   that, if forwarded, could observe or bypass the mediation boundary
-    t15 = mediat(
-        Effect(
-            "read",
-            "file:///trusted",
-            {},
-            (Data("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
-            "r-read:Agent:EffectBroker",
-            CHAIN,
-        ),
-        monitoring_bypass=True,
+    t15_effect = Effect(
+        "read",
+        "file:///trusted",
+        {},
+        (Data("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
+        "r-read:Agent:EffectBroker",
+        CHAIN,
     )
-    assert not t15.allow and t15.boundary_stop == "monitor-bypass"
+    t15_mediation = mediate(t15_effect, monitoring_bypass=True)
+    assert not t15_mediation.allow and t15_mediation.boundary_stop == "monitor-bypass"
+    t15_allow, t15_evidence = broker.commit(Commit(t15_effect), mediation=t15_mediation)
+    assert t15_allow is False and t15_evidence["boundary_stop"] == "monitor-bypass"
     print("[T15 monitor-bypass: monitoring action can bypass mediation] -> BLOCK BoundaryStop")
-    print(f"    boundary_stop={t15.boundary_stop}")
+    print(f"    boundary_stop={t15_evidence['boundary_stop']}")
     print()
 
-    # The boundary is not reached: no side effect was committed to the store
+    # The boundary stopped the forward: no side effect was committed to the store
     assert broker.store.effects_log == []
     return broker
 
@@ -375,16 +376,18 @@ def run_all() -> EffectBroker:
             ),
             False,
         ),
-        # T6: delegation widening: Mallory widens authority to a resource the User
-        #   never granted -> NoAmp (non-root-anchored forged capability).
+        # T6: honest delegation widening: an Agent tries to derive a
+        #   delete-on-secrets capability from its delete-on-reports one. Root
+        #   anchored (owner=User) but NON-monotonic (target widened to secrets)
+        #   -> NoAmp rejects authority that increased via delegation
         (
-            "T6 delegation-widening: Mallory widens delete to secrets -> BLOCK NoAmp",
+            "T6 delegation-widening: agent widens delete to secrets -> BLOCK NoAmp",
             Effect(
                 "delete",
                 "file:///secrets",
                 {},
                 (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
-                "forged-wide",
+                "r-del:Agent:EffectBroker:wide",
                 CHAIN,
             ),
             False,
@@ -572,6 +575,47 @@ def run_all() -> EffectBroker:
     for entry in broker.store.effects_log:
         print(f"    {entry[0]} -> {entry[1]}")
     print("remaining files (final broker):", {path for path in broker.store.files})
+    print()
+
+    # ---- risk-model escalation -> Approver -> fresh ONE-SHOT capability ----
+    # (Section 3 of the brief.) A learned risk_theta classifier may route a
+    # high-risk effect to an Approver; approval grants a fresh, one-shot
+    # capability which must STILL pass Auth ^ FlowOK ^ NoAmp ^ Fresh at commit
+    # The classifier itself is NOT part of the allow rule
+    esc_broker = build()
+    risky = Effect(
+        "send",
+        "internal@corp.com",
+        {},
+        (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        "r-send:Agent:EffectBroker",
+        CHAIN,
+    )
+    esc_broker.risk_override = 0.9  # simulate a high-risk assessment (learned model)
+    print("[R1 risk-escalation: high-risk effect routed to Approver]")
+    print("    needs_review(source=risky assessment):", esc_broker.needs_review(risky))
+    # Approver grants a fresh, one-shot capability for exactly this effect.
+    approved_nonce = esc_broker.grant_approval(risky, expiry=esc_broker.logical_time + 50)
+    risky = Effect(
+        "send",
+        "internal@corp.com",
+        {},
+        (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        approved_nonce,
+        CHAIN,
+    )
+    allow1, evidence1 = esc_broker.commit(Commit(risky))
+    assert allow1 is True and evidence1["primary_blocker"] is None
+    print(
+        "    commit with approved one-shot cap -> ALLOW "
+        f"(blocker={evidence1['primary_blocker']})"
+    )
+    # The one-shot capability is now consumed -> replay (Fresh) on second use.
+    allow2, evidence2 = esc_broker.commit(Commit(risky))
+    assert allow2 is False and evidence2["primary_blocker"] == "Fresh"
+    print(f"    second use of one-shot cap -> BLOCK Fresh ({evidence2['predicates']['Fresh']})")
+    print("    (approval does NOT bypass the gate: it already passed the risk route")
+    print("     AND must still satisfy the formal invariant)")
     print()
 
     # tool-boundary / MCP-semantics-honesty traces (T13/T14/T15)
