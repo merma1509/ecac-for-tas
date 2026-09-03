@@ -30,4 +30,5 @@ Thumbs.db
 # Evidence / scratch (not part of the kernel)
 out/
 scratch/
+docs/
 
