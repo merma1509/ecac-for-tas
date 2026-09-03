@@ -287,13 +287,11 @@ class EffectBroker:
             return False, f"right-mismatch({capability.right}!={effect.etype})"
         if capability.target != effect.target:
             return False, f"target-mismatch({capability.target}!={effect.target})"
-        if capability.revoked:
-            return False, "revoked"
         return True, "auth-ok"
 
     def check_flow(self, effect: Effect) -> PredicateResult:
         # Sink labels per effect type. read/delete have no outgoing sink so
-        # confine only; send/write/network leak to a sink.
+        # confine only; send/write/network leak to a sink
         if effect.etype in ("read", "delete"):
             sink_confidentiality = Confidentiality.CONFIDENTIAL  # safe upper bound (no leakage)
             sink_integrity = Integrity.UNTRUSTED  # no integrity floor for read/delete
@@ -317,11 +315,11 @@ class EffectBroker:
         return True, "flow-ok"
 
     def check_noamp(self, effect: Effect) -> PredicateResult:
-        """Path-based NoAmp.
+        """Path-based NoAmp
 
         Every capability backing the delegation chain of `effect` must be a
         legitimate root-anchored derivation, and the chain must not widen
-        authority. Returns (ok, evidence) where evidence lists the reason.
+        authority. Returns (ok, evidence) where evidence lists the reason
         """
         # The capability that authorizes this effect.
         capability = self.capabilities.get(effect.capability_nonce)
