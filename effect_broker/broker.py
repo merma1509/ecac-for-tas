@@ -14,7 +14,8 @@ from __future__ import annotations
 from typing import TypedDict
 
 from .lattice import Confidentiality, Integrity
-from .model import BROKER, USER, Capability, Effect
+from .model import APPROVER, BROKER, USER, Capability, Commit, Effect, LabelException
+from .resources import ResourceStore
 
 # Trusted roots: only these principals may seed NEW authority. Everything else
 # must attenuate an existing root-anchored capability (monotonic, no widening)
@@ -43,6 +44,10 @@ class EffectBroker:
         self.revoked: set[str] = set()  # revoked nonces
         self.used: set[str] = set()  # committed (replay-prevention) nonces
         self.logical_time: float = 0.0  # logical time counter
+        self.store: ResourceStore = ResourceStore()  # external state (R = F ∪ E ∪ M)
+        # Validated declass/endorse grants. Only the broker writes here (LLM may
+        # only request). keyed by nonce
+        self.label_exceptions: dict[str, LabelException] = {}
 
     # ---- capability management (monotonic, root-anchored) ----
     def grant_root(self, capability: Capability) -> None:
@@ -77,7 +82,7 @@ class EffectBroker:
         # Capabilities may be forwarded (standard object-capability transitivity);
         # NoAmp safety comes from *monotonic narrowing* + *root-anchoring* (the
         # child still carries the root owner via derives_from), not from banning
-        # delegation. A holder may pass a capability on subject to monotonicity.
+        # delegation. A holder may pass a capability on subject to monotonicity
         child = Capability(
             owner=parent.owner,
             holder=holder,
@@ -94,10 +99,64 @@ class EffectBroker:
     def revoke(self, nonce: str) -> None:
         self.revoked.add(nonce)
 
+    # ---- declass/endorse (broker-only privileged operations) ----
+    def grant_label_exception(self, exception: LabelException) -> None:
+        """Record a validated declass/endorse grant. BROKER-ONLY
+
+        declass/endorse are privileged operations performed ONLY
+        by the EffectBroker on explicit User Policy or a validated approval.
+        The LLM may request (see request_label_exception), never perform. This
+        is the single trusted spot where an otherwise-forbidden flow may be
+        explicitly allowed (T3): the label reclassification is explicit and
+        attributable to a trusted grantor
+        """
+        if exception.granted_by not in (USER, APPROVER):
+            raise ValueError(
+                f"label exception must be granted by a trusted principal "
+                f"(User or Approver), got {exception.granted_by}"
+            )
+        if exception.nonce in self.label_exceptions:
+            raise ValueError(f"duplicate label exception nonce {exception.nonce}")
+        self.label_exceptions[exception.nonce] = exception
+
+    @staticmethod
+    def request_label_exception(
+        *, kind: str, target: str, from_label: str, to_label: str
+    ) -> LabelException:
+        """LLM/agent-side REQUEST for a declass/endorse
+
+        Important: this only builds the *request*; it does NOT grant anything
+        The broker must later record it via grant_label_exception after checking
+        policy. This enforces "LLM may request, never perform".
+        """
+        return LabelException(kind, target, from_label, to_label, "?", "?")
+
+    def _has_validated_exception(self, effect: Effect, kind: str, datum_label_name: str) -> bool:
+        """True if a broker-recorded, validated exception sanctions this override
+
+        An exception applies only if:
+          - it targets this effect's sink (or "*")
+          - its `from_label` names the label currently violating the flow
+          - the grant was actually recorded by the broker (nonce known)
+        This makes declass/endorse explicit, attributable, and broker-validated
+        """
+        for exception in effect.label_exceptions:
+            grant = self.label_exceptions.get(exception.nonce)
+            if grant is None:
+                continue  # not yet broker-validated
+            if grant.kind != kind:
+                continue
+            if grant.match_target != "*" and grant.match_target != effect.target:
+                continue
+            if grant.from_label != datum_label_name:
+                continue
+            return True
+        return False
+
     # ---- root-anchored derivation check (helper for NoAmp) ----
     def _is_legitimate(self, capability: Capability) -> bool:
         """Root-anchored AND monotonic: owner is a trusted root and the whole
-        chain down to `capability` was produced only by monotonic attenuation."""
+        chain down to `capability` was produced only by monotonic attenuation"""
         if capability.owner not in TRUSTED_ROOTS:
             return False
         seen: set[str] = set()
@@ -147,12 +206,16 @@ class EffectBroker:
             sink_confidentiality = Confidentiality.INTERNAL
             sink_integrity = Integrity.USER  # privileged actions need user trust
         for datum in effect.provenance:
-            if datum.confidentiality > sink_confidentiality:
+            if datum.confidentiality > sink_confidentiality and not self._has_validated_exception(
+                effect, "declass", datum.confidentiality.name
+            ):
                 return False, (
                     f"conf-leak({datum.name}:"
                     f"{datum.confidentiality.name}>{sink_confidentiality.name})"
                 )
-            if datum.integrity < sink_integrity:
+            if datum.integrity < sink_integrity and not self._has_validated_exception(
+                effect, "endorse", datum.integrity.name
+            ):
                 return False, (
                     f"low-integrity({datum.name}:{datum.integrity.name}<{sink_integrity.name})"
                 )
@@ -204,8 +267,17 @@ class EffectBroker:
             return False, "replay"
         return True, "fresh"
 
-    # ---- commit gate ----
-    def commit(self, effect: Effect) -> tuple[bool, Evidence]:
+    # ---- commit gate (the ONLY way external state changes) ----
+    def commit(self, commit: Commit) -> tuple[bool, Evidence]:
+        """Evaluate the four-predicate gate over the COMMIT primitive
+
+        read/write/send/delete/network are prepared (staged, non-mutating);
+        only COMMIT changes external state, and only the EffectBroker may
+        invoke it. `commit` performs the predicate gate on the wrapped prepared
+        `Effect`. If allowed, the prepared effect is applied
+        (and its capability nonce marked used, playing replay prevention)
+        """
+        effect = commit.effect
         predicate_results: dict[str, PredicateResult] = {
             "Auth": self.check_auth(effect),
             "FlowOK": self.check_flow(effect),
@@ -219,9 +291,7 @@ class EffectBroker:
             (predicate for predicate in predicate_order if not predicate_results[predicate][0]),
             None,
         )
-        if allow:
-            self.used.add(effect.capability_nonce)
-        return allow, {
+        evidence: Evidence = {
             "allow": allow,
             "primary_blocker": blocking_predicate,
             "predicates": {
@@ -229,3 +299,17 @@ class EffectBroker:
                 for predicate, predicate_result in predicate_results.items()
             },
         }
+        if allow:
+            self.used.add(effect.capability_nonce)
+            self.store.apply_effect(effect)  # prepared effect becomes a real side effect
+        return allow, evidence
+
+    # backward-compatible convenience: commit a prepared Effect directly
+    def commit_effect(self, effect: Effect) -> tuple[bool, Evidence]:
+        """Convenience wrapper: commit(Commit(effect))
+
+        Kept so callers can stage an effect and commit it in one step; the
+        semantic is identical to wrapping it as a Commit primitive. The broker
+        remains the only principal that can commit and thus mutate external state
+        """
+        return self.commit(Commit(effect))
