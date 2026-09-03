@@ -10,6 +10,7 @@ import pytest
 
 from effect_broker.broker import EffectBroker
 from effect_broker.lattice import Confidentiality, Integrity
+from effect_broker.mediation import mediate
 from effect_broker.model import (
     AGENT,
     BROKER,
@@ -24,7 +25,7 @@ from effect_broker.model import (
     LabelException,
     Mailbox,
 )
-from effect_broker.traces import mediat
+from effect_broker.traces import build, mediat
 
 CHAIN = (USER, AGENT, BROKER)
 
@@ -339,4 +340,79 @@ def test_benign_mediation_forwarded() -> None:
     verdict = mediat(effect, declared_write_target="file:///reports")
     assert verdict.allow is True
     assert verdict.boundary_stop is None
+
+
+# ---- T6 (honest): delegation widening is a NoAmp rejection, not a crash ----
+def test_honest_delegation_widening_blocked_noamp() -> None:
+    broker = build()  # contains a genuine (non-forged) widened delete-on-secrets cap
+    effect = Effect(
+        "delete",
+        "file:///secrets",
+        {},
+        (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        "r-del:Agent:EffectBroker:wide",  # widened (non-monotonic) capability
+        CHAIN,
+    )
+    allow, evidence = broker.commit(Commit(effect))
+    assert allow is False
+    assert evidence["primary_blocker"] == "NoAmp"
+    # root-anchored (owner=User) so Auth passes; only NoAmp sees the widening
+    assert evidence["predicates"]["Auth"] == "auth-ok"
+
+
+# ---- mediation stops a gate-allowed effect before any side effect (T13 path) ----
+def test_conditioned_mediation_prevents_commit() -> None:
+    broker = build()
+    # a broker-held write capability to secrets (so the four predicates pass)
+    broker.capabilities["r-write-secrets"] = Capability(
+        USER, BROKER, "write", "file:///secrets", frozenset({"confidential"}), 100,
+        "r-write-secrets",
+    )
+    effect = Effect(
+        "write",
+        "file:///secrets",
+        {},
+        (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        "r-write-secrets",
+        CHAIN,
+    )
+    # false MCP description: tool declares it will write reports, actually writes secrets
+    mediation = mediate(effect, declared_write_target="file:///reports")
+    allow, evidence = broker.commit(Commit(effect), mediation=mediation)
+    assert allow is False
+    assert evidence["boundary_stop"] == (
+        "false-description(declared=file:///reports,actual=file:///secrets)"
+    )
+    assert broker.store.effects_log == []  # nothing reached external state
+    assert "file:///secrets" in broker.store.files  # no write/delete performed
+
+
+# ---- risk escalation -> Approver -> fresh ONE-SHOT capability (Sec-3) ----
+def test_risk_escalation_one_shot_approval() -> None:
+    broker = build()
+    broker.risk_override = 0.9  # high-risk assessment (learned risk model)
+    effect = Effect(
+        "send",
+        "internal@corp.com",
+        {},
+        (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        "r-send:Agent:EffectBroker",
+        CHAIN,
+    )
+    assert broker.needs_review(effect) is True  # routed to Approver
+    # Approver grants a fresh, one-shot capability; the gate must still pass
+    nonce = broker.grant_approval(effect, expiry=broker.logical_time + 50)
+    approved = Effect(
+        "send",
+        "internal@corp.com",
+        {},
+        (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        nonce,
+        CHAIN,
+    )
+    allow1, _ = broker.commit(Commit(approved))
+    assert allow1 is True  # approved cap still passes Auth^FlowOK^NoAmp^Fresh
+    allow2, evidence2 = broker.commit(Commit(approved))
+    assert allow2 is False
+    assert evidence2["primary_blocker"] == "Fresh"  # one-shot consumed (replay)
 
