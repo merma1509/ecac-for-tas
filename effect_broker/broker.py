@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import TypedDict
 
 from .lattice import Confidentiality, Integrity
+from .mediation import MediationVerdict
 from .model import APPROVER, BROKER, USER, Capability, Commit, Effect, LabelException
 from .resources import ResourceStore
 
@@ -31,6 +32,8 @@ class Evidence(TypedDict):
     allow: bool
     primary_blocker: str | None
     predicates: dict[str, str]
+    boundary_stop: str | None  # tool-boundary mediation reason, if the commit
+    # was allowed by the gate but stopped before forwarding to the remote tool
 
 
 def _provides(auth_capability: Capability, right: str, target: str) -> bool:
@@ -48,6 +51,12 @@ class EffectBroker:
         # Validated declass/endorse grants. Only the broker writes here (LLM may
         # only request). keyed by nonce
         self.label_exceptions: dict[str, LabelException] = {}
+        # One-shot approvals granted by an Approver after risk escalation
+        # nonce -> expiry; a one-shot capability used once is then consumed
+        self.approvals: dict[str, float] = {}
+        # Risk model (sample): a learned risk_theta classifier may route an
+        # effect to an Approver, but it is NOT part of the formal allow rule
+        self.risk_override: float = 0.0  # > 0 triggers escalation for testing
 
     # ---- capability management (monotonic, root-anchored) ----
     def grant_root(self, capability: Capability) -> None:
@@ -97,7 +106,48 @@ class EffectBroker:
         return child
 
     def revoke(self, nonce: str) -> None:
+        """Revoke a capability by nonce (freshness check rejects revoked caps)"""
+        capability = self.capabilities.get(nonce)
+        if capability is None:
+            raise KeyError(f"cannot revoke unknown capability: {nonce}")
         self.revoked.add(nonce)
+
+    def attempt_wide(
+        self,
+        parent_nonce: str,
+        holder: str,
+        right: str,
+        target: str,
+        scope: frozenset[str],
+        expiry: float,
+    ) -> Capability:
+        """Deliberately create a NON-monotonic (widened) capability.
+
+        This models "delegation widening" (T6): an agent tries to hand a
+        sub-agent a capability that is NOT a monotonic narrowing of its own —
+        either a wider scope or a right/target the parent never granted. The
+        capability is still *root-anchored* in the sense that it carries the
+        parent's owner, so it will PASS Auth (right+target match, holder=broker)
+        but will be rejected by NoAmp because the derivation is non-monotonic.
+
+        Unlike `attenuate`, this deliberately violates the monotonic rule on
+        purpose — it is used ONLY to build an adversarial widening trace so the
+        gate can reject it at commit time with machine-checkable NoAmp evidence,
+        rather than the restricted path crashing.
+        """
+        parent = self.capabilities[parent_nonce]
+        child = Capability(
+            owner=parent.owner,
+            holder=holder,
+            right=right,
+            target=target,
+            scope=scope,
+            expiry=expiry,
+            nonce=f"{parent.nonce}:{holder}:wide",
+            derives_from=parent.nonce,
+        )
+        self.capabilities[child.nonce] = child
+        return child
 
     # ---- declass/endorse (broker-only privileged operations) ----
     def grant_label_exception(self, exception: LabelException) -> None:
@@ -130,6 +180,51 @@ class EffectBroker:
         policy. This enforces "LLM may request, never perform".
         """
         return LabelException(kind, target, from_label, to_label, "?", "?")
+
+    # ---- risk model placement: escalation, NOT in the allow rule ----
+    def assess_risk(self, effect: Effect) -> float:
+        """Learned/stub risk classifier. May route to an Approver for review
+
+        This is deliberately NOT part of the formal allow rule: the four
+        predicates decide allow/deny regardless of this score. If the score is
+        high, the effect is *routed* to an Approver; approval grants a fresh,
+        one-shot capability which must STILL pass Auth ^ FlowOK ^ NoAmp ^ Fresh
+        at commit. The theorem holds even if this classifier is wrong
+        """
+        # Minimal stub: escalate sensitive-target effects unless overridden
+        score = 0.0
+        if effect.target.endswith("/secrets") or effect.target.startswith("http://"):
+            score = 0.9
+        # test override lets us force a high/low risk deterministically
+        return max(score, self.risk_override)
+
+    def needs_review(self, effect: Effect) -> bool:
+        """True if the risk model wants human review before commit."""
+        return self.assess_risk(effect) >= 0.8
+
+    def grant_approval(self, effect: Effect, expiry: float) -> str:
+        """Approver grants a FRESH, ONE-SHOT capability for `effect`
+
+        Called after the risk model routes the effect to an Approver and the
+        Approver approves it. The approved capability is fresh (expiry>now) and
+        single-use (consumed on first successful commit). It grants the exact
+        right+target of the effect — it does not widen anything. The resulting
+        capability still must pass Auth ^ FlowOK ^ NoAmp ^ Fresh at commit
+        """
+        nonce = f"approval:{effect.etype}:{effect.target}:{len(self.approvals)}"
+        cap = Capability(
+            owner=USER,
+            holder=BROKER,
+            right=effect.etype,
+            target=effect.target,
+            scope=frozenset({effect.target}),
+            expiry=expiry,
+            nonce=nonce,
+            derives_from=None,
+        )
+        self.capabilities[nonce] = cap
+        self.approvals[nonce] = expiry  # one-shot: consumed after first commit
+        return nonce
 
     def _has_validated_exception(self, effect: Effect, kind: str, datum_label_name: str) -> bool:
         """True if a broker-recorded, validated exception sanctions this override
@@ -268,7 +363,9 @@ class EffectBroker:
         return True, "fresh"
 
     # ---- commit gate (the ONLY way external state changes) ----
-    def commit(self, commit: Commit) -> tuple[bool, Evidence]:
+    def commit(
+        self, commit: Commit, mediation: MediationVerdict | None = None
+    ) -> tuple[bool, Evidence]:
         """Evaluate the four-predicate gate over the COMMIT primitive
 
         read/write/send/delete/network are prepared (staged, non-mutating);
@@ -276,6 +373,11 @@ class EffectBroker:
         invoke it. `commit` performs the predicate gate on the wrapped prepared
         `Effect`. If allowed, the prepared effect is applied
         (and its capability nonce marked used, playing replay prevention)
+
+        `mediation` (optional) models the broker->tool boundary (remote-boundary
+        mode). Even if all four predicates pass, a mediating verdict that stops
+        the boundary prevents the effect from being forwarded to the remote
+        tool — so no side effect occurs (T13/T14/T15)
         """
         effect = commit.effect
         predicate_results: dict[str, PredicateResult] = {
@@ -291,6 +393,13 @@ class EffectBroker:
             (predicate for predicate in predicate_order if not predicate_results[predicate][0]),
             None,
         )
+        # If a mediating verdict stops the boundary, the forward is blocked even
+        # though the gate allowed it (tool/MCP-semantics-honesty).
+        boundary_stop: str | None = None
+        if allow and mediation is not None and not mediation.allow:
+            allow = False
+            boundary_stop = mediation.boundary_stop
+
         evidence: Evidence = {
             "allow": allow,
             "primary_blocker": blocking_predicate,
@@ -298,6 +407,7 @@ class EffectBroker:
                 predicate: predicate_result[1]
                 for predicate, predicate_result in predicate_results.items()
             },
+            "boundary_stop": boundary_stop,
         }
         if allow:
             self.used.add(effect.capability_nonce)
