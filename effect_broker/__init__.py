@@ -9,7 +9,22 @@ tool code are outside this model
 
 from .broker import EffectBroker
 from .lattice import Confidentiality, Integrity
-from .model import AGENT, APPROVER, BROKER, TOOL, USER, Capability, Data, Effect
+from .model import (
+    AGENT,
+    APPROVER,
+    BROKER,
+    TOOL,
+    USER,
+    Capability,
+    Data,
+    Domain,
+    Effect,
+    Email,
+    File,
+    Mailbox,
+    Resource,
+)
+from .resources import ResourceStore
 
 __all__ = [
     "Confidentiality",
@@ -23,4 +38,10 @@ __all__ = [
     "BROKER",
     "APPROVER",
     "EffectBroker",
+    "Domain",
+    "Email",
+    "File",
+    "Mailbox",
+    "Resource",
+    "ResourceStore",
 ]
