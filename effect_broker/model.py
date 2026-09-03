@@ -1,6 +1,6 @@
 """Core data types: principals, resources, data values, capabilities, effects"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from .lattice import Confidentiality, Integrity
@@ -41,11 +41,19 @@ class Email:
     domain: Domain
 
 
-@dataclass(frozen=True)
+@dataclass
 class Mailbox:
-    """A mailbox resource (M): belongs to one user (inbox/outbox style)"""
+    """A mailbox resource (M): belongs to one user, holds inbox/outbox messages
+
+    Inbox holds incoming messages; outbox holds messages this user sent. A
+    `send` effect appends to the sender's outbox; a `read` effect retrieves a
+    message from a mailbox. The address -> owning-user association is maintained
+    by the ResourceStore (see `mailbox_for`)
+    """
 
     user: str
+    inbox: list[str] = field(default_factory=list)
+    outbox: list[str] = field(default_factory=list)
 
 
 # Union of all resource kinds — R = F ∪ E ∪ M
