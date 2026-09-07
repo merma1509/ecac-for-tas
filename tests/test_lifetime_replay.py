@@ -13,7 +13,7 @@ avoiding Auth mismatch from build()-seeded nonces.
 from __future__ import annotations
 
 from effect_broker.lattice import Confidentiality, Integrity
-from effect_broker.model import Capability, Commit, Data, Effect, Task
+from effect_broker.model import Capability, Data, Effect, Task
 from effect_broker.traces import build
 
 
@@ -24,18 +24,24 @@ def _provenance(name: str) -> tuple[Data, ...]:
 def _make_task(task_id: str) -> Task:
     """Create a permissive task with wildcard ceiling (same pattern as test_flow_declass)."""
     ceiling = Capability(
-        owner="User", holder="EffectBroker", right="*", target="*",
-        scope=frozenset({"*"}), expiry=float("inf"), nonce=f"ceil-{task_id}",
+        owner="User",
+        holder="EffectBroker",
+        right="*",
+        target="*",
+        scope=frozenset({"*"}),
+        expiry=float("inf"),
+        nonce=f"ceil-{task_id}",
     )
     return Task(task_id=task_id, owner="User", ceiling=ceiling)
 
 
-def _grant(broker, task: Task, etype: str, target: str,
-           expiry: float = 100.0) -> str:
+def _grant(broker, task: Task, etype: str, target: str, expiry: float = 100.0) -> str:
     """Grant a one-shot approval for (etype, target) in the given task."""
     broker.register_task(task)
     request = Effect(
-        etype=etype, target=target, metadata={},
+        etype=etype,
+        target=target,
+        metadata={},
         provenance=_provenance("__req__"),
         capability_nonce=f"r-{etype}:Agent:EffectBroker",
         delegation_chain=(),
@@ -68,8 +74,11 @@ class TestLifetimeLogicalClock:
         nonce = _grant(broker, task, "send", "internal@corp.com", expiry=10.0)
 
         effect = Effect(
-            etype="send", target="internal@corp.com", metadata={},
-            provenance=_provenance("valid"), capability_nonce=nonce,
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("valid"),
+            capability_nonce=nonce,
             delegation_chain=(),
         )
         commit = broker._make_commit(effect, task_id="default")
@@ -97,8 +106,11 @@ class TestReplayProtection:
         nonce = _grant(broker, task, "send", "internal@corp.com")
 
         effect = Effect(
-            etype="send", target="internal@corp.com", metadata={},
-            provenance=_provenance("msg"), capability_nonce=nonce,
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce=nonce,
             delegation_chain=(),
         )
         commit = broker._make_commit(effect, task_id="default")
@@ -125,13 +137,19 @@ class TestReplayProtection:
         nonce2 = _grant(broker, task2, "send", "internal@corp.com", expiry=200.0)
 
         effect1 = Effect(
-            etype="send", target="internal@corp.com", metadata={},
-            provenance=_provenance("m1"), capability_nonce=nonce1,
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("m1"),
+            capability_nonce=nonce1,
             delegation_chain=(),
         )
         effect2 = Effect(
-            etype="send", target="internal@corp.com", metadata={},
-            provenance=_provenance("m2"), capability_nonce=nonce2,
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("m2"),
+            capability_nonce=nonce2,
             delegation_chain=(),
         )
 
@@ -152,8 +170,11 @@ class TestReplayProtection:
         nonce = _grant(broker, task, "send", "internal@corp.com")
 
         approved = Effect(
-            etype="send", target="internal@corp.com", metadata={},
-            provenance=_provenance("approved"), capability_nonce=nonce,
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("approved"),
+            capability_nonce=nonce,
             delegation_chain=(),
         )
         commit = broker._make_commit(approved, task_id="default")
@@ -183,32 +204,46 @@ class TestRevocationScope:
 
         # SEPARATE capabilities for each task (different nonces)
         cap1 = Capability(
-            owner="User", holder="EffectBroker",
-            right="send", target="internal@corp.com",
-            scope=frozenset({"internal"}), expiry=float("inf"),
-            nonce="cap-task1", derives_from=None,
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="cap-task1",
+            derives_from=None,
         )
         cap2 = Capability(
-            owner="User", holder="EffectBroker",
-            right="send", target="internal@corp.com",
-            scope=frozenset({"internal"}), expiry=float("inf"),
-            nonce="cap-task2", derives_from=None,
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="cap-task2",
+            derives_from=None,
         )
         broker.capabilities["cap-task1"] = cap1
         broker.capabilities["cap-task2"] = cap2
 
         # Initial commit for task1 (will be revoked later)
         effect1 = Effect(
-            etype="send", target="internal@corp.com", metadata={},
-            provenance=_provenance("m1"), capability_nonce="cap-task1",
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("m1"),
+            capability_nonce="cap-task1",
             delegation_chain=(),
         )
         assert broker.commit(broker._make_commit(effect1, task_id="task1"))[0] is True
 
         # Initial commit for task2 (unaffected by revoke of task1's cap)
         effect2 = Effect(
-            etype="send", target="internal@corp.com", metadata={},
-            provenance=_provenance("m2"), capability_nonce="cap-task2",
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("m2"),
+            capability_nonce="cap-task2",
             delegation_chain=(),
         )
         assert broker.commit(broker._make_commit(effect2, task_id="task2"))[0] is True
@@ -218,8 +253,11 @@ class TestRevocationScope:
 
         # Task1: BLOCKed (cap-task1 revoked in task1)
         effect1_reuse = Effect(
-            etype="send", target="internal@corp.com", metadata={},
-            provenance=_provenance("m1b"), capability_nonce="cap-task1",
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("m1b"),
+            capability_nonce="cap-task1",
             delegation_chain=(),
         )
         _, ev_task1 = broker.commit(broker._make_commit(effect1_reuse, task_id="task1"))
@@ -231,20 +269,25 @@ class TestRevocationScope:
         # → replay check should block it. So we test with a DIFFERENT nonce
         # (cap-task2-first) to avoid the replay issue.
         cap2_first = Capability(
-            owner="User", holder="EffectBroker",
-            right="send", target="internal@corp.com",
-            scope=frozenset({"internal"}), expiry=float("inf"),
-            nonce="cap-task2-first-use", derives_from=None,
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="cap-task2-first-use",
+            derives_from=None,
         )
         broker.capabilities["cap-task2-first-use"] = cap2_first
         effect2_fresh = Effect(
-            etype="send", target="internal@corp.com", metadata={},
-            provenance=_provenance("m2-fresh"), capability_nonce="cap-task2-first-use",
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("m2-fresh"),
+            capability_nonce="cap-task2-first-use",
             delegation_chain=(),
         )
-        allow_task2, ev_task2 = broker.commit(
-            broker._make_commit(effect2_fresh, task_id="task2")
-        )
+        allow_task2, ev_task2 = broker.commit(broker._make_commit(effect2_fresh, task_id="task2"))
         assert allow_task2 is True, (
             f"Per-task revocation should not affect task2. Evidence: {ev_task2}"
         )
@@ -258,16 +301,23 @@ class TestRevocationScope:
         broker.register_task(task2)
 
         cap = Capability(
-            owner="User", holder="EffectBroker",
-            right="send", target="internal@corp.com",
-            scope=frozenset({"internal"}), expiry=float("inf"),
-            nonce="global-revoke-cap", derives_from=None,
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="global-revoke-cap",
+            derives_from=None,
         )
         broker.capabilities["global-revoke-cap"] = cap
 
         effect = Effect(
-            etype="send", target="internal@corp.com", metadata={},
-            provenance=_provenance("msg"), capability_nonce="global-revoke-cap",
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce="global-revoke-cap",
             delegation_chain=(),
         )
 
@@ -298,16 +348,23 @@ class TestFreshSessionIntegration:
         broker.register_task(task)
 
         cap = Capability(
-            owner="User", holder="EffectBroker",
-            right="send", target="internal@corp.com",
-            scope=frozenset({"internal"}), expiry=100.0,
-            nonce="fresh-cap", derives_from=None,
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=100.0,
+            nonce="fresh-cap",
+            derives_from=None,
         )
         broker.capabilities["fresh-cap"] = cap
 
         effect = Effect(
-            etype="send", target="internal@corp.com", metadata={},
-            provenance=_provenance("ok"), capability_nonce="fresh-cap",
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("ok"),
+            capability_nonce="fresh-cap",
             delegation_chain=(),
         )
         _, ev = broker.commit(broker._make_commit(effect, task_id="default"))
@@ -321,16 +378,23 @@ class TestFreshSessionIntegration:
         broker.advance_time("default", 20.0)
 
         cap = Capability(
-            owner="User", holder="EffectBroker",
-            right="send", target="internal@corp.com",
-            scope=frozenset({"internal"}), expiry=10.0,  # expired
-            nonce="failing-cap", derives_from=None,
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=10.0,  # expired
+            nonce="failing-cap",
+            derives_from=None,
         )
         broker.capabilities["failing-cap"] = cap
 
         effect = Effect(
-            etype="send", target="internal@corp.com", metadata={},
-            provenance=_provenance("late"), capability_nonce="failing-cap",
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("late"),
+            capability_nonce="failing-cap",
             delegation_chain=(),
         )
         _, ev = broker.commit(broker._make_commit(effect, task_id="default"))
