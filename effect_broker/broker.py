@@ -248,9 +248,7 @@ class EffectBroker:
         """True if the risk model wants human review before commit."""
         return self.assess_risk(effect) >= 0.8
 
-    def grant_approval(
-        self, effect: Effect, expiry: float, task_id: TaskId | None = None
-    ) -> str:
+    def grant_approval(self, effect: Effect, expiry: float, task_id: TaskId | None = None) -> str:
         """Approver grants a FRESH, ONE-SHOT capability for `effect`.
 
         The approved capability is scoped to task_id (defaults to "default")
@@ -346,7 +344,7 @@ class EffectBroker:
         The task `t` is the authoritative bound — it is the task passed to
         commit() (which wraps the effect). `effect.task_id` may be set for
         logging/audit; this method validates against the ceiling in `t`.
-        
+
 
         Rejects forged/widened capabilities at the gate, not downstream.
         The five sub-checks:
@@ -384,11 +382,14 @@ class EffectBroker:
         # scope AND the effect's target must be a member of the ceiling scope.
         is_wildcard = "*" in task.ceiling.scope
         scope_ok = is_wildcard or (
-            capability.scope <= task.ceiling.scope
-            and effect.target in task.ceiling.scope
+            capability.scope <= task.ceiling.scope and effect.target in task.ceiling.scope
         )
         if not scope_ok:
-            return False, f"task-bounded-fail(e-target={effect.target} not in ceiling-scope={task.ceiling.scope})"
+            return (
+                False,
+                "task-bounded-fail("
+                f"e-target={effect.target} not in ceiling-scope={task.ceiling.scope})",
+            )
 
         # Sub-check 5: matches (right, target) — holder is implied by the
         # derivation chain: root-anchoring + monotonicity already prove the
@@ -411,17 +412,15 @@ class EffectBroker:
         """
         sink_confidentiality, sink_integrity = task.flow_boundary
         for datum in effect.provenance:
-            if (
-                datum.confidentiality > sink_confidentiality
-                and not self._has_validated_exception(effect, "declass", datum.confidentiality.name)
+            if datum.confidentiality > sink_confidentiality and not self._has_validated_exception(
+                effect, "declass", datum.confidentiality.name
             ):
                 return False, (
                     f"conf-leak({datum.name}:"
                     f"{datum.confidentiality.name}>{sink_confidentiality.name})"
                 )
-            if (
-                datum.integrity < sink_integrity
-                and not self._has_validated_exception(effect, "endorse", datum.integrity.name)
+            if datum.integrity < sink_integrity and not self._has_validated_exception(
+                effect, "endorse", datum.integrity.name
             ):
                 return False, (
                     f"low-integrity({datum.name}:{datum.integrity.name}<{sink_integrity.name})"
@@ -442,8 +441,10 @@ class EffectBroker:
         is_wildcard = "*" in task.ceiling.scope
         target_in_scope = is_wildcard or effect.target in task.ceiling.scope
         if not target_in_scope:
-            return False, (
-                f"composition-fail(target={effect.target} not in ceiling-scope={task.ceiling.scope})"
+            return (
+                False,
+                "composition-fail("
+                f"target={effect.target} not in ceiling-scope={task.ceiling.scope})",
             )
 
         # Right dominance: ceiling.right = "*" dominates all rights (any right allowed).
@@ -460,6 +461,7 @@ class EffectBroker:
         # SSRF containment for network effects
         if effect.etype == "network":
             from .model import URL as _URL
+
             resource = self.store.resolve(effect.target)
             if isinstance(resource, _URL) and resource.scope and "*" not in resource.scope:
                 if not capability.scope <= resource.scope:
@@ -596,18 +598,14 @@ class EffectBroker:
             self.store.apply_effect(effect)
         return allow, evidence
 
-    def commit_effect(
-        self, effect: Effect, task: Task | None = None
-    ) -> tuple[bool, Evidence]:
+    def commit_effect(self, effect: Effect, task: Task | None = None) -> tuple[bool, Evidence]:
         """Stage and commit an effect within task `task`.
 
         If task is None, a permissive default task is created (same as commit()).
         """
         return self.commit(Commit(effect, task))
 
-    def _make_commit(
-        self, effect: Effect, task_id: TaskId = "default"
-    ) -> Commit:
+    def _make_commit(self, effect: Effect, task_id: TaskId = "default") -> Commit:
         """Build a Commit from an effect and task_id (used by the shim)."""
         task = self.tasks.get(task_id)
         if task is None:
