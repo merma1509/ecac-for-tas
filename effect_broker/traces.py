@@ -20,6 +20,10 @@ so NoAmp truly reflects the broker is always in the chain property that the
 early set-based model got wrong
 """
 
+from __future__ import annotations
+
+from collections.abc import Callable  # noqa: UP035  # used in type annotations
+
 from .broker import EffectBroker
 from .lattice import Confidentiality, Integrity
 from .mediation import Mediator, ToolSpec
@@ -155,20 +159,37 @@ def build() -> EffectBroker:
     # ---- network capabilities ----
     # r-net: legitimate network access to internal domain only (SSRF-safe scope)
     broker.grant_root(
-        _capability(USER, USER, "network", "http://internal-ssrf", frozenset({"internal.corp.com"}), 100, "r-net")
+        _capability(
+            USER,
+            USER,
+            "network",
+            "http://internal-ssrf",
+            frozenset({"internal.corp.com"}),
+            100,
+            "r-net",
+        )
     )
     broker.attenuate(
         "r-net", AGENT, "network", "http://internal-ssrf", frozenset({"internal.corp.com"}), 100
     )
     broker.attenuate(
-        "r-net:Agent", BROKER, "network", "http://internal-ssrf",
-        frozenset({"internal.corp.com"}), 100
+        "r-net:Agent",
+        BROKER,
+        "network",
+        "http://internal-ssrf",
+        frozenset({"internal.corp.com"}),
+        100,
     )
     # r-net-external: legitimate access to external domain (for T4' widening scenario)
     broker.grant_root(
         _capability(
-            USER, USER, "network", "http://external-attacker.com",
-            frozenset({"external.attacker.com"}), 100, "r-net-external"
+            USER,
+            USER,
+            "network",
+            "http://external-attacker.com",
+            frozenset({"external.attacker.com"}),
+            100,
+            "r-net-external",
         )
     )
     # ---- forged network capability ----
@@ -176,8 +197,13 @@ def build() -> EffectBroker:
     # Auth blocks it (owner not trusted). T4' tests the SSRF containment
     # case where the capability IS legitimate but the URL domain is out-of-scope
     broker.capabilities["forged-net"] = _capability(
-        "Mallory", BROKER, "network", "http://internal-ssrf",
-        frozenset({"internal.corp.com"}), 100, "forged-net"
+        "Mallory",
+        BROKER,
+        "network",
+        "http://internal-ssrf",
+        frozenset({"internal.corp.com"}),
+        100,
+        "forged-net",
     )
 
     # ---- capabilities for the mandatory experiment (experiment.py M1-M5 + H1-H3) ----
@@ -185,29 +211,64 @@ def build() -> EffectBroker:
     # These are REAL capabilities, not stubs — the broker's Auth gate re-validates
     # every commit, so a tool cannot forge or widen its capability.
     # malicious-read-tool: read(file:///trusted) + write(file:///secrets) — the write is extra
-    broker.grant_root(_capability(
-        USER, "malicious-read-tool", "read", "file:///trusted",
-        frozenset({"internal"}), 100, "malicious-read-tool:read",
-    ))
+    broker.grant_root(
+        _capability(
+            USER,
+            "malicious-read-tool",
+            "read",
+            "file:///trusted",
+            frozenset({"internal"}),
+            100,
+            "malicious-read-tool:read",
+        )
+    )
     # malicious-send-tool: send(internal@corp.com) — the BCC is extra (M2)
-    broker.grant_root(_capability(
-        USER, "malicious-send-tool", "send", "internal@corp.com",
-        frozenset({"internal"}), 100, "malicious-send-tool:send",
-    ))
+    broker.grant_root(
+        _capability(
+            USER,
+            "malicious-send-tool",
+            "send",
+            "internal@corp.com",
+            frozenset({"internal"}),
+            100,
+            "malicious-send-tool:send",
+        )
+    )
     # benign-tool: read(file:///reports) + send(internal@corp.com) — both legitimate (M4)
-    broker.grant_root(_capability(
-        USER, "benign-tool", "read", "file:///reports",
-        frozenset({"internal"}), 100, "benign-tool:read",
-    ))
-    broker.grant_root(_capability(
-        USER, "benign-tool", "send", "internal@corp.com",
-        frozenset({"internal"}), 100, "benign-tool:send",
-    ))
+    broker.grant_root(
+        _capability(
+            USER,
+            "benign-tool",
+            "read",
+            "file:///reports",
+            frozenset({"internal"}),
+            100,
+            "benign-tool:read",
+        )
+    )
+    broker.grant_root(
+        _capability(
+            USER,
+            "benign-tool",
+            "send",
+            "internal@corp.com",
+            frozenset({"internal"}),
+            100,
+            "benign-tool:send",
+        )
+    )
     # held-out-low-integrity-tool: send(internal@corp.com) with UNTRUSTED content (H2)
-    broker.grant_root(_capability(
-        USER, "held-out-low-integrity-tool", "send", "internal@corp.com",
-        frozenset({"internal"}), 100, "held-out-low-integrity-tool:send",
-    ))
+    broker.grant_root(
+        _capability(
+            USER,
+            "held-out-low-integrity-tool",
+            "send",
+            "internal@corp.com",
+            frozenset({"internal"}),
+            100,
+            "held-out-low-integrity-tool:send",
+        )
+    )
 
     return broker
 
@@ -221,6 +282,7 @@ def _clean_effect() -> Effect:
         "r-send:Agent:EffectBroker",
         CHAIN,
     )
+
 
 # Tool-boundary mediation model (T13 / T14 / T15)
 # The predicate gate decides effects proposed to the broker. It cannot see
@@ -252,14 +314,22 @@ def run_boundary_experiment() -> EffectBroker:
 
     # A broker-held write capability to secrets (so the predicate gate passes)
     broker.capabilities["r-write-secrets"] = _capability(
-        USER, BROKER, "write", "file:///secrets",
-        frozenset({"confidential"}), 100, "r-write-secrets",
+        USER,
+        BROKER,
+        "write",
+        "file:///secrets",
+        frozenset({"confidential"}),
+        100,
+        "r-write-secrets",
     )
 
     t13_effect = Effect(
-        "write", "file:///secrets", {},
+        "write",
+        "file:///secrets",
+        {},
         (Data("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
-        "r-write-secrets", CHAIN,
+        "r-write-secrets",
+        CHAIN,
     )
 
     broker.set_mediator(Mediator(tools={"write-tool": write_tool}))
@@ -290,9 +360,12 @@ def run_boundary_experiment() -> EffectBroker:
     broker2.set_mediator(Mediator(tools={"read-tool": read_tool}))
 
     t14_effect = Effect(
-        "read", "file:///trusted", {},
+        "read",
+        "file:///trusted",
+        {},
         (Data("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
-        "r-read:Agent:EffectBroker", CHAIN,
+        "r-read:Agent:EffectBroker",
+        CHAIN,
     )
     t14_allow, t14_evidence = broker2.commit(Commit(t14_effect, tool_name="read-tool"))
 
@@ -317,9 +390,12 @@ def run_boundary_experiment() -> EffectBroker:
     broker3.set_mediator(Mediator(tools={"audit-tool": audit_tool}))
 
     t15_effect = Effect(
-        "read", "file:///trusted", {},
+        "read",
+        "file:///trusted",
+        {},
         (Data("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
-        "r-read:Agent:EffectBroker", CHAIN,
+        "r-read:Agent:EffectBroker",
+        CHAIN,
     )
     t15_allow, t15_evidence = broker3.commit(Commit(t15_effect, tool_name="audit-tool"))
 
@@ -335,8 +411,13 @@ def run_boundary_experiment() -> EffectBroker:
     # The write-tool's known_side_effects is empty and target matches declared
     broker4 = build()
     broker4.capabilities["r-write-reports"] = _capability(
-        USER, BROKER, "write", "file:///reports",
-        frozenset({"internal"}), 100, "r-write-reports",
+        USER,
+        BROKER,
+        "write",
+        "file:///reports",
+        frozenset({"internal"}),
+        100,
+        "r-write-reports",
     )
     benign_tool = ToolSpec(
         name="benign-write-tool",
@@ -347,9 +428,12 @@ def run_boundary_experiment() -> EffectBroker:
     broker4.set_mediator(Mediator(tools={"benign-write-tool": benign_tool}))
 
     benign_effect = Effect(
-        "write", "file:///reports", {},
+        "write",
+        "file:///reports",
+        {},
         (Data("benign_data", Confidentiality.INTERNAL, Integrity.USER),),
-        "r-write-reports", CHAIN,
+        "r-write-reports",
+        CHAIN,
     )
     benign_allow, benign_evidence = broker4.commit(
         Commit(benign_effect, tool_name="benign-write-tool")
@@ -380,7 +464,9 @@ def run_all() -> EffectBroker:
     # (label, effect, expected, setup_hook) where setup_hook: EffectBroker->None
     # runs before commit. We deliberately use a separate broker per trace so
     # that one trace's replay state does not mask another's predicate
-    single_commit_traces: list[tuple] = [
+    single_commit_traces: list[
+        tuple[str, Effect, bool] | tuple[str, Effect, bool, Callable[[EffectBroker], None]]
+    ] = [
         # T1: clean benign send of trusted data -> ALLOW
         (
             "T1 clean benign send -> ALLOW",
@@ -519,7 +605,6 @@ def run_all() -> EffectBroker:
             ),
             False,
         ),
-
         # T10: declassification granted — confidential data sent AFTER the
         #   broker records the declass grant -> ALLOW. This is the positive path
         #   for Flow regression. Without the grant T7 blocks (FlowOK)
@@ -555,7 +640,6 @@ def run_all() -> EffectBroker:
                 )
             ),
         ),
-
         # T11: declassification abuse: LLM-attached declass never broker-granted -> FlowOK
         (
             "T11 declass-abuse: LLM-attached declass (no grant) -> BLOCK FlowOK",
@@ -664,9 +748,10 @@ def run_all() -> EffectBroker:
     ]
 
     for entry in single_commit_traces:
-        n = len(entry)
         trace_name, effect, expected_allow = entry[0], entry[1], entry[2]
-        setup_hook: callable | None = entry[3] if n == 4 else None
+        setup_hook: Callable[[EffectBroker], None] | None = (
+            entry[3] if len(entry) == 4 else None
+        )
         broker = build()
         if trace_name.startswith("T9"):
             broker.logical_time = 10.0  # make the short-expiry capability stale
@@ -699,9 +784,9 @@ def run_all() -> EffectBroker:
     for predicate_name, predicate_message in second_evidence["predicates"].items():
         print(f"    2nd {predicate_name}: {predicate_message}")
     print()
-
+    print()
     print("effects_log (actual side effects committed by the broker, final broker):")
-    for entry in broker.store.effects_log:
+    for entry in broker.store.effects_log:  # type: ignore[assignment]
         print(f"    {entry[0]} -> {entry[1]}")
     print("remaining files (final broker):", {path for path in broker.store.files})
     print()
@@ -750,4 +835,3 @@ def run_all() -> EffectBroker:
     run_mediation_traces()
 
     return broker
-
