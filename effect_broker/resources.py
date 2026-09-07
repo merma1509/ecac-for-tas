@@ -89,8 +89,12 @@ class ResourceStore:
             # read on an email retrieves the message from its owner's mailbox
             self.effects_log.append(("read", f"inbox:{self.mailbox_for(resource).user}"))
         elif effect.etype == "network":
-            # network has no persistent resource here; log it as committed.
-            self.effects_log.append(("network", target_id))
+            # Deferred: "network" is out-of-scope for the next future work
+            # When re-introduced in Plan 2, this branch must enforce the task
+            # ceiling (right="network") and a resource identity for URLs
+            raise NotImplementedError(
+                "network is deferred — add it back in Plan 2 with a Resource type for URLs"
+            )
         else:
             raise ValueError(
                 f"effect type {effect.etype} not applicable to resource {type(resource).__name__}"
