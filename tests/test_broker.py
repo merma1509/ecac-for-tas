@@ -10,11 +10,22 @@ import pytest
 
 from effect_broker.broker import EffectBroker
 from effect_broker.lattice import Confidentiality, Integrity
-from effect_broker.mediation import mediate
-from effect_broker.model import ( AGENT, BROKER, USER,
-    Capability, Commit, Data, Domain, Effect, Email,
-    File, LabelException, Mailbox,)
-from effect_broker.traces import build, mediat
+from effect_broker.mediation import MediationVerdict, Mediator, ToolSpec
+from effect_broker.model import (
+    AGENT,
+    BROKER,
+    USER,
+    Capability,
+    Commit,
+    Data,
+    Domain,
+    Effect,
+    Email,
+    File,
+    LabelException,
+    Mailbox,
+)
+from effect_broker.traces import build
 
 CHAIN = (USER, AGENT, BROKER)
 
@@ -75,12 +86,10 @@ def broker() -> Iterator[EffectBroker]:
         "r-send-short:Agent", BROKER, "send", "internal@corp.com", frozenset({"internal"}), 5
     )
     # Forged capability: injected straight into the store (no grant_root)
-    # NOTE: "network" is deferred to the future work. T5 (forged cap) uses
-    # build() which creates a forged write-to-secrets (not network)
-    # broker_instance.capabilities["forged-net"] = _capability(
-    #     "Mallory", BROKER, "network", "http://internal-ssrf",
-    #     frozenset({"internal"}), 100, "forged-net",
-    # )
+    broker_instance.capabilities["forged-net"] = _capability(
+        "Mallory", BROKER, "network", "http://internal-ssrf",
+        frozenset({"internal.corp.com"}), 100, "forged-net",
+    )
     yield broker_instance
 
 
@@ -148,11 +157,11 @@ def test_stale_capability_blocked_fresh(broker: EffectBroker) -> None:
     assert "expired" in evidence["predicates"]["Fresh"]
 
 
-# ---- T16: capability forgery (T4 network-SSRF deferred to Plan 2;
-#             the forgery attack is now covered by forged-write to secrets) ----
+# ---- T16: capability forgery (network-SSRF covered by T4 in traces.py;
+#             the write-to-secrets forgery is preserved here) ----
 def test_forged_capability_blocked_noamp() -> None:
-    """network is deferred to the future work. The SSRF capability-forgery
-    attackis preserved as T16: a forged write-to-secrets capability
+    """T4 (traces.py) covers the network-SSRF forgery case.
+    This test covers the file-write forgery: a forged write-to-secrets capability
     with owner=Mallory (not root-anchored) is correctly rejected by Auth
     """
     broker = build()  # build() creates forged-write (not forged-net)
@@ -273,25 +282,37 @@ def test_endorse_abuse_blocked(broker: EffectBroker) -> None:
     assert "low-integrity" in evidence["predicates"]["FlowOK"]
 
 
-# ---- T13: false MCP description (hidden write) is a boundary stop ----
+# ---- T13: false MCP description is a boundary stop ----
 def test_false_mcp_description_stops_at_boundary() -> None:
+    write_tool = ToolSpec(
+        name="write-tool",
+        declared_targets=frozenset({"file:///reports"}),
+        actual_targets=frozenset({"file:///reports", "file:///secrets"}),
+        known_side_effects=frozenset({"file:///secrets"}),
+    )
+    mediator = Mediator(tools={"write-tool": write_tool})
     effect = Effect(
         "write",
-        "file:///secrets",  # actual target the hidden tool would touch
+        "file:///secrets",
         {},
         (Data("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
         "r-write:Agent:EffectBroker",
         CHAIN,
     )
-    verdict = mediat(effect, declared_write_target="file:///reports")
+    verdict = mediator.inspect(effect, "write-tool")
     assert verdict.allow is False
-    assert verdict.boundary_stop == (
-        "false-description(declared=file:///reports,actual=file:///secrets)"
-    )
+    assert verdict.boundary_stop == "hidden-side-effect"
 
 
 # ---- T14: hidden (undeclared) side effect is a boundary stop ----
 def test_hidden_side_effect_stops_at_boundary() -> None:
+    read_tool = ToolSpec(
+        name="read-tool",
+        declared_targets=frozenset({"file:///trusted"}),
+        actual_targets=frozenset({"file:///trusted", "file:///secrets"}),
+        known_side_effects=frozenset({"file:///secrets"}),
+    )
+    mediator = Mediator(tools={"read-tool": read_tool})
     effect = Effect(
         "read",
         "file:///trusted",
@@ -300,13 +321,21 @@ def test_hidden_side_effect_stops_at_boundary() -> None:
         "r-read:Agent:EffectBroker",
         CHAIN,
     )
-    verdict = mediat(effect, hidden_side_effect=True)
+    verdict = mediator.inspect(effect, "read-tool")
     assert verdict.allow is False
     assert verdict.boundary_stop == "hidden-side-effect"
 
 
 # ---- T15: monitor bypass is a boundary stop ----
 def test_monitor_bypass_stops_at_boundary() -> None:
+    audit_tool = ToolSpec(
+        name="audit-tool",
+        declared_targets=frozenset({"file:///trusted"}),
+        actual_targets=frozenset({"file:///trusted"}),
+        known_side_effects=frozenset(),
+        monitoring=True,
+    )
+    mediator = Mediator(tools={"audit-tool": audit_tool})
     effect = Effect(
         "read",
         "file:///trusted",
@@ -315,13 +344,20 @@ def test_monitor_bypass_stops_at_boundary() -> None:
         "r-read:Agent:EffectBroker",
         CHAIN,
     )
-    verdict = mediat(effect, monitoring_bypass=True)
+    verdict = mediator.inspect(effect, "audit-tool")
     assert verdict.allow is False
     assert verdict.boundary_stop == "monitor-bypass"
 
 
 # ---- benign mediation: an honest effect with matching declaration is forwarded ----
 def test_benign_mediation_forwarded() -> None:
+    write_tool = ToolSpec(
+        name="write-tool",
+        declared_targets=frozenset({"file:///reports"}),
+        actual_targets=frozenset({"file:///reports"}),
+        known_side_effects=frozenset(),
+    )
+    mediator = Mediator(tools={"write-tool": write_tool})
     effect = Effect(
         "write",
         "file:///reports",
@@ -330,7 +366,7 @@ def test_benign_mediation_forwarded() -> None:
         "r-write:Agent:EffectBroker",
         CHAIN,
     )
-    verdict = mediat(effect, declared_write_target="file:///reports")
+    verdict = mediator.inspect(effect, "write-tool")
     assert verdict.allow is True
     assert verdict.boundary_stop is None
 
@@ -377,7 +413,7 @@ def test_conditioned_mediation_prevents_commit() -> None:
         CHAIN,
     )
     # false MCP description: tool declares it will write reports, actually writes secrets
-    mediation = mediate(effect, declared_write_target="file:///reports")
+    mediation = MediationVerdict(False, "false-description(declared=file:///reports,actual=file:///secrets)")
     allow, evidence = broker.commit(Commit(effect), mediation=mediation)
     assert allow is False
     assert evidence["boundary_stop"] == (
@@ -387,7 +423,7 @@ def test_conditioned_mediation_prevents_commit() -> None:
     assert "file:///secrets" in broker.store.files  # no write/delete performed
 
 
-# ---- risk escalation -> Approver -> fresh ONE-SHOT capability (Sec-3) ----
+# ---- risk escalation -> Approver -> fresh ONE-SHOT capability --------
 def test_risk_escalation_one_shot_approval() -> None:
     broker = build()
     broker.risk_override = 0.9  # high-risk assessment (learned risk model)
