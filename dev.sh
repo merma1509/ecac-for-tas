@@ -8,6 +8,8 @@
 #   ./dev.sh typecheck  run mypy
 #   ./dev.sh test       run pytest
 #   ./dev.sh run        run the trace suite
+#   ./dev.sh experiment run the adversarial workload (M1-M5 + H1-H3)
+#   ./dev.sh verify     assert trace outcomes
 #   ./dev.sh clean      remove caches/build
 #   ./dev.sh doctor     environment status
 #   ./dev.sh shell      drop into a shell with the venv active
@@ -24,6 +26,8 @@ case "$TARGET" in
   typecheck) make typecheck ;;
   test)      make test ;;
   run)       make run ;;
+  experiment) make experiment ;;
+  verify)    make verify ;;
   clean)     make clean ;;
   doctor)    make doctor ;;
   shell)
@@ -34,6 +38,6 @@ case "$TARGET" in
     ;;
   help|*)
     # Print only the leading usage comment block, stripped of the '#' marker
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 esac
