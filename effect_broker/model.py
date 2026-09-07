@@ -35,6 +35,7 @@ class Domain(Enum):
 # Task authority ceiling: every effect's authority must be a subset of ceiling(t)
 # Session clock: per-task logical time, revocation set, and replay set
 
+
 @dataclass
 class Session:
     """A task's logical clock and per-task revocation/replay state
@@ -87,9 +88,10 @@ class Capability:
 class Task:
     """A task carrying an authority ceiling and per-task policy bounds
 
-    The commit rule requires authority(e) to be a subset of the task's ceiling for every effect committed
-    within this task. FlowOK uses the task's flow_boundary rather than a global
-    lattice. The Session carries the per-task clock/revocation/replay model
+    The commit rule requires authority(e) ⊆ ceiling(t) for every effect
+    committed within this task. FlowOK uses the task's flow_boundary rather
+    than a global lattice. The Session carries the per-task
+    clock/revocation/replay model
     """
 
     task_id: TaskId
