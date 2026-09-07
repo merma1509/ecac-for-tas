@@ -168,9 +168,8 @@ class TestM4BenignTool:
 
         # Should NOT raise — both operations are legitimate
         content, _ = tool.run()
-
-        # Read should return content
-        assert content is not None, "Read should return content"
+        assert content is not None
+        assert isinstance(content, str)
 
     def test_m4_complete_mediation(self) -> None:
         broker = _build_broker()
@@ -228,8 +227,8 @@ class TestM5ApprovalReplay:
         # Only 1 effect committed (first use), second use was blocked
         # If there were 2 effects, Fresh replay protection failed
         assert len(broker.store.effects_log) == 1, (
-            f"M5 second use should be BLOCKed by Fresh (replay), got {len(broker.store.effects_log)}: "
-            f"{broker.store.effects_log}"
+            "M5 second use should be BLOCKed by Fresh (replay), got "
+            f"{len(broker.store.effects_log)}: {broker.store.effects_log}"
         )
 
     def test_m5_approval_nonce_consumed(self) -> None:
@@ -327,13 +326,8 @@ class TestRunAllExperiments:
         results = run_all_experiments()
 
         # All scenarios should have complete mediation
-        incomplete = [
-            name for name, r in results.items()
-            if not r.mediation_complete
-        ]
-        assert len(incomplete) == 0, (
-            f"Scenarios with incomplete mediation: {incomplete}"
-        )
+        incomplete = [name for name, r in results.items() if not r.mediation_complete]
+        assert len(incomplete) == 0, f"Scenarios with incomplete mediation: {incomplete}"
 
     def test_m4_is_paired_success_case(self) -> None:
         """M4 must SUCCEED to prove we don't break benign work."""
@@ -356,20 +350,19 @@ class TestRunAllExperiments:
         results = run_all_experiments()
 
         blocked_scenarios = [
-            "M1-malicous-read-hidden-write",  # M1: hidden write blocked
-            "M2-send-with-bcc",              # M2: BCC blocked
-            "M3-forged-capability",          # M3: forged cap blocked
-            "H1-path-alias",                 # H1: path traversal blocked
-            "H2-low-integrity",              # H2: low-integrity content blocked
-            "H3-forged-capability",          # H3: forged cap blocked
+            "M1-malicious-read-hidden-write",  # M1: hidden write blocked
+            "M2-send-with-bcc",  # M2: BCC blocked
+            "M3-forged-capability",  # M3: forged cap blocked
+            "H1-path-alias",  # H1: path traversal blocked
+            "H2-low-integrity",  # H2: low-integrity content blocked
+            "H3-forged-capability",  # H3: forged cap blocked
         ]
 
         for key in blocked_scenarios:
             r = results.get(key)
             assert r is not None, f"Scenario {key} not found"
             assert r.actual_allow is False, (
-                f"{key} should be BLOCKed (got ALLOW). "
-                f"expected_blocker={r.expected_blocker}"
+                f"{key} should be BLOCKed (got ALLOW). expected_blocker={r.expected_blocker}"
             )
 
     def test_eight_total_scenarios(self) -> None:
@@ -378,7 +371,9 @@ class TestRunAllExperiments:
 
         results = run_all_experiments()
 
-        assert len(results) == 8, f"Expected 8 scenarios, got {len(results)}: {list(results.keys())}"
+        assert len(results) == 8, (
+            f"Expected 8 scenarios, got {len(results)}: {list(results.keys())}"
+        )
 
     def test_print_results_runs(self) -> None:
         """print_results() should run without errors."""
