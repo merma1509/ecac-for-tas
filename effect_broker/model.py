@@ -1,5 +1,7 @@
 """Core data types: principals, resources, data values, capabilities, effects"""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -49,6 +51,36 @@ class Session:
     live: bool = True  # False when task is ended/revoked
     revoked: set[str] = field(default_factory=set)  # revoked capability nonces
     used: set[str] = field(default_factory=set)  # replay-prevention nonce set
+
+
+@dataclass(frozen=True)
+class Capability:
+    """Object-capability style capability. Issued only by monotonic attenuation
+
+    owner         : the root principal that seeded the authority (only a root
+                    may seed a new grant; everything else attenuates an existing capability)
+    holder        : the principal currently holding the capability
+    right         : one of read|write|send|delete|commit
+    target        : the specific resource the capability authorizes
+    scope         : the allowed target scope (must narrow monotonically on attenuation)
+    expiry        : unix/logical time after which the capability is stale
+    nonce         : unique identifier (also used for replay detection)
+    task_id       : the task this capability is scoped to; None = any task
+    derives_from   : nonce of the parent this was attenuated from, or None if
+                    this is a root grant. Used by NoAmp to prove root-anchored, monotonic derivation
+    revoked       : True if the capability has been explicitly revoked
+    """
+
+    owner: str
+    holder: str
+    right: str
+    target: str
+    scope: frozenset[str]
+    expiry: float
+    nonce: str
+    task_id: TaskId | None = None
+    derives_from: str | None = None
+    revoked: bool = False
 
 
 @dataclass
@@ -104,8 +136,21 @@ class Mailbox:
     outbox: list[str] = field(default_factory=list)
 
 
-# Union of all resource kinds — R = F ∪ E ∪ M
-Resource = File | Email | Mailbox
+@dataclass(frozen=True)
+class URL:
+    """A network resource (N), identified by URI string
+
+    The scope is a frozenset of allowed domain strings (e.g. {"internal.corp.com"})
+    used by NoAmp/Auth for SSRF containment: a network effect whose URL domain
+    is not within the capability's scope is rejected by the gate
+    """
+
+    uri: str
+    scope: frozenset[str]
+
+
+# Union of all resource kinds — R = F ∪ E ∪ M ∪ N (files, emails, mailboxes, URLs)
+Resource = File | Email | Mailbox | URL
 
 
 @dataclass(frozen=True)
@@ -143,36 +188,6 @@ class LabelException:
 
 
 @dataclass(frozen=True)
-class Capability:
-    """Object-capability style capability. Issued only by monotonic attenuation
-
-    owner         : the root principal that seeded the authority (only a root
-                    may seed a new grant; everything else attenuates an existing capability)
-    holder        : the principal currently holding the capability
-    right         : one of read|write|send|delete|commit
-    target        : the specific resource the capability authorizes
-    scope         : the allowed target scope (must narrow monotonically on attenuation)
-    expiry        : unix/logical time after which the capability is stale
-    nonce         : unique identifier (also used for replay detection)
-    task_id       : the task this capability is scoped to; None = any task
-    derives_from   : nonce of the parent this was attenuated from, or None if
-                    this is a root grant. Used by NoAmp to prove root-anchored, monotonic derivation
-    revoked       : True if the capability has been explicitly revoked
-    """
-
-    owner: str
-    holder: str
-    right: str
-    target: str
-    scope: frozenset[str]
-    expiry: float
-    nonce: str
-    task_id: TaskId | None = None
-    derives_from: str | None = None
-    revoked: bool = False
-
-
-@dataclass(frozen=True)
 class Effect:
     """A PREPARED (staged, non-mutating) effect
 
@@ -186,10 +201,10 @@ class Effect:
 
     etype: str  # read|write|send|delete  (prepared only)
     target: str
-    args: dict[str, object]
+    metadata: dict[str, object]  # extra context (resource extras, etc.)
     provenance: tuple[Data, ...]  # values influencing the effect
     capability_nonce: str
-    chain: tuple[str, ...]  # principals in the delegation chain
+    delegation_chain: tuple[str, ...]  # principals in the delegation chain
     # Optional validated declass/endorse exceptions attached to this effect
     # Only the broker fills this; the LLM may only request them
     label_exceptions: tuple[LabelException, ...] = ()
@@ -206,8 +221,11 @@ class Commit:
     (Auth and FlowOK and NoAmp and Fresh) passes at commit time
 
     `task` carries the authority ceiling and session state needed by the
-    predicates. The broker looks up the task by effect.task_id at commit time
+    predicates. `tool_name` optionally names the MCP tool performing this effect
+    — the broker's Mediator consults its ToolSpec to detect declared-vs-actual
+    mismatches (T13/T14/T15 boundary failures)
     """
 
     effect: Effect
     task: Task | None = None  # None → broker creates a permissive default Task
+    tool_name: str | None = None  # MCP tool name for boundary mediation
