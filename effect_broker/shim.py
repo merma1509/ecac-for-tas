@@ -26,10 +26,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 if TYPE_CHECKING:
     from .broker import EffectBroker
+
+T = TypeVar("T")
 
 
 @dataclass
@@ -39,8 +41,9 @@ class ShimOp:
     This is the ONLY record of what the untrusted tool actually did.
     Compare with broker.store.effects_log for verification.
     """
-    operation: str                       # "read" | "write" | "delete" | "send"
-    resource: str                        # actual resource the shim observed
+
+    operation: str  # "read" | "write" | "delete" | "send"
+    resource: str  # actual resource the shim observed
     extra_resources: frozenset[str] = field(default_factory=frozenset)
     # For T14 (hidden exfil): any ADDITIONAL resources the tool touched
     # For T2 (BCC send): extra recipients beyond the declared one
@@ -56,6 +59,7 @@ class SecurityError(Exception):
     - The broker's gate + mediation stopped the attack
     - The claim "every real effect is broker-authorized" holds for this op
     """
+
     pass
 
 
@@ -87,7 +91,7 @@ class FileShim:
 
     # ---- public shim API (untrusted tool calls these) ----
 
-    def read(self, path: str) -> bytes:
+    def read(self, path: str) -> str:
         """Read a file. The shim derives the read effect and submits to broker."""
         return self._commit_op(
             ShimOp(operation="read", resource=path, tool_name=self.tool_name),
@@ -144,23 +148,23 @@ class FileShim:
                 # BLOCKed ops are expected NOT to be in effects_log (that's correct behavior)
                 continue
             # Map shim op to broker effects_log entry format
-            resource_label = f"file:{op.resource}" if op.operation != "send" else f"email:{op.resource}"
+            resource_label = (
+                f"file:{op.resource}" if op.operation != "send" else f"email:{op.resource}"
+            )
             found = any(
                 eff_op == op.operation and eff_res == resource_label
                 for eff_op, eff_res in self.broker.store.effects_log
             )
             if not found:
-                failures.append(
-                    f"MISSING broker authorization for {op.operation} on {op.resource}"
-                )
+                failures.append(f"MISSING broker authorization for {op.operation} on {op.resource}")
         return failures
 
     # ---- private: the shim enforcement logic ----
     def _commit_op(
         self,
         op: ShimOp,
-        action: Callable[[], object],
-    ) -> object:
+        action: Callable[[], T],
+    ) -> T:
         """Commit an op to the broker. Apply ONLY if ALLOW. Raise if BLOCK."""
         from .lattice import Confidentiality, Integrity
         from .model import Data, Effect
@@ -215,14 +219,17 @@ class FileShim:
                 return nonce
         return f"no-cap-{right}-{target}"
 
-    def _do_read(self, path: str) -> bytes:
+    def _do_read(self, path: str) -> str:
         file = self.broker.store.files.get(path)
         if file is None:
             raise FileNotFoundError(f"no such file: {path}")
-        return b"(simulated file content)"
+        return "(simulated file content)"
 
     def _do_write(self, path: str, content: bytes) -> None:
-        self.broker.store.files[path] = content
+        from .lattice import Confidentiality
+        from .model import File
+
+        self.broker.store.files[path] = File(path, Confidentiality.INTERNAL)
 
     def _do_delete(self, path: str) -> None:
         self.broker.store.files.pop(path, None)
@@ -244,7 +251,7 @@ class FileShim:
         local = recipient.split("@")[0]
         if local not in self.broker.store.mailboxes:
             self.broker.store.mailboxes[local] = Mailbox(local)
-        self.broker.store.mailboxes[local].outbox.append((recipient, body))
+        self.broker.store.mailboxes[local].outbox.append(f"{recipient}: {body[:50]}")
 
         for _label, extra_recip in extra_recipients.items():
             extra_domain = _domain_for(extra_recip)
@@ -252,4 +259,4 @@ class FileShim:
             extra_local = extra_recip.split("@")[0]
             if extra_local not in self.broker.store.mailboxes:
                 self.broker.store.mailboxes[extra_local] = Mailbox(extra_local)
-            self.broker.store.mailboxes[extra_local].outbox.append((extra_recip, body))
+            self.broker.store.mailboxes[extra_local].outbox.append(f"{extra_recip}: {body[:50]}")
