@@ -87,8 +87,13 @@ def broker() -> Iterator[EffectBroker]:
     )
     # Forged capability: injected straight into the store (no grant_root)
     broker_instance.capabilities["forged-net"] = _capability(
-        "Mallory", BROKER, "network", "http://internal-ssrf",
-        frozenset({"internal.corp.com"}), 100, "forged-net",
+        "Mallory",
+        BROKER,
+        "network",
+        "http://internal-ssrf",
+        frozenset({"internal.corp.com"}),
+        100,
+        "forged-net",
     )
     yield broker_instance
 
@@ -413,7 +418,9 @@ def test_conditioned_mediation_prevents_commit() -> None:
         CHAIN,
     )
     # false MCP description: tool declares it will write reports, actually writes secrets
-    mediation = MediationVerdict(False, "false-description(declared=file:///reports,actual=file:///secrets)")
+    mediation = MediationVerdict(
+        False, "false-description(declared=file:///reports,actual=file:///secrets)"
+    )
     allow, evidence = broker.commit(Commit(effect), mediation=mediation)
     assert allow is False
     assert evidence["boundary_stop"] == (
@@ -493,6 +500,7 @@ def test_revoked_blocked_by_fresh_not_auth(broker: EffectBroker) -> None:
     assert evidence["primary_blocker"] == "Fresh"
     assert evidence["predicates"]["Fresh"] == "revoked(in_task=default or global)"
 
+
 # Resource-identity regression assertions
 # The model separates four identity axes:
 #   mailbox identity (container / ownership boundary)
@@ -519,7 +527,9 @@ def test_sender_provenance_different_from_owner() -> None:
     broker.store.emails["bob@corp.com"] = Email("bob@corp.com", Domain.INTERNAL)
     broker.store.emails["alice@corp.com"] = Email("alice@corp.com", Domain.INTERNAL)
     # grant a send capability for bob@corp.com
-    broker.grant_root(_capability(USER, USER, "send", "bob@corp.com", frozenset({"internal"}), 100, "r-send-bob"))
+    broker.grant_root(
+        _capability(USER, USER, "send", "bob@corp.com", frozenset({"internal"}), 100, "r-send-bob")
+    )
     broker.attenuate("r-send-bob", BROKER, "send", "bob@corp.com", frozenset({"internal"}), 100)
 
     # Sender account (alice@corp.com) has CONFIDENTIAL provenance — this is the
