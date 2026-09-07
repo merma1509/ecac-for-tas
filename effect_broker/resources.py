@@ -1,6 +1,6 @@
-"""Mutable external state (R = F ∪ E ∪ M) the broker may mutate
+"""Mutable external state (R = F ∪ E ∪ M ∪ N) the broker may mutate
 
-The pure resource *types* (File, Email, Mailbox, Domain, Resource) live in
+The pure resource *types* (File, Email, Mailbox, URL, Domain, Resource) live in
 `model.py` alongside the rest of the model (P + R + Effect). This module holds
 only the mutable `ResourceStore`: the "external state" that effects act upon
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .model import Effect, Email, File, Mailbox, Resource
+from .model import URL, Effect, Email, File, Mailbox, Resource
 
 
 @dataclass
@@ -40,7 +40,19 @@ class ResourceStore:
             return self.emails[target]
         if target in self.mailboxes:
             return self.mailboxes[target]
+        # URLs are indexed by URI string (e.g. "http://example.com")
+        if target.startswith("http://") or target.startswith("https://"):
+            return self._url_for(target)
         return None
+
+    def _url_for(self, uri: str) -> URL:
+        """Resolve a URI string to a URL resource, creating one if needed
+
+        The URL's scope is inferred from the URI's domain for SSRF containment
+        """
+        # Parse domain from URI for scope inference
+        domain = uri.split("://", 1)[1].split("/")[0] if "://" in uri else uri
+        return URL(uri=uri, scope=frozenset({domain}))
 
     def mailbox_for(self, email: Email) -> Mailbox:
         """Resolve an email address to its owner's mailbox (address -> user)
@@ -76,8 +88,9 @@ class ResourceStore:
             del self.files[target_id]
             self.effects_log.append(("delete", f"file:{target_id}"))
         elif effect.etype == "write" and isinstance(resource, File):
-            # For the minimal model a write just records the new state in the log.
             self.effects_log.append(("write", f"file:{target_id}"))
+        elif effect.etype == "read" and isinstance(resource, File):
+            self.effects_log.append(("read", f"file:{target_id}"))
         elif effect.etype == "send" and isinstance(resource, Email):
             # deliver into the sender's outbox (address -> mailbox)
             self.mailbox_for(resource).outbox.append(target_id)
@@ -88,13 +101,10 @@ class ResourceStore:
         elif effect.etype == "read" and isinstance(resource, Email):
             # read on an email retrieves the message from its owner's mailbox
             self.effects_log.append(("read", f"inbox:{self.mailbox_for(resource).user}"))
-        elif effect.etype == "network":
-            # Deferred: "network" is out-of-scope for the next future work
-            # When re-introduced in Plan 2, this branch must enforce the task
-            # ceiling (right="network") and a resource identity for URLs
-            raise NotImplementedError(
-                "network is deferred — add it back in Plan 2 with a Resource type for URLs"
-            )
+        elif effect.etype == "network" and isinstance(resource, URL):
+            # network effects are now fully supported
+            # SSRF containment was checked by check_noamp before this runs
+            self.effects_log.append(("network", f"url:{resource.uri}"))
         else:
             raise ValueError(
                 f"effect type {effect.etype} not applicable to resource {type(resource).__name__}"
