@@ -21,8 +21,7 @@ from __future__ import annotations
 
 from typing import TypedDict
 
-from .lattice import Confidentiality, Integrity
-from .mediation import MediationVerdict
+from .mediation import MediationVerdict, Mediator
 from .model import (
     APPROVER,
     BROKER,
@@ -31,7 +30,6 @@ from .model import (
     Commit,
     Effect,
     LabelException,
-    Session,
     Task,
     TaskId,
 )
@@ -76,10 +74,14 @@ class EffectBroker:
         self.risk_override: float = 0.0  # > 0 triggers escalation for testing
         # Nonces revoked without a task_id (global revocation, affects all sessions)
         self.global_revoked: set[str] = set()
-        # Default logical clock (task-scoped clock lives in Session; this
-        # attribute lets legacy callers set broker.logical_time directly.
-        # Prefer advance_time(task_id, delta) when a registered task exists.
         self.logical_time: float = 0.0
+        # Mediator: the enforcement shim that detects declared-vs-actual
+        # mismatches (T13/T14/T15). None = boundary mediation disabled
+        self._mediator: Mediator | None = None
+
+    def set_mediator(self, mediator: Mediator) -> None:
+        """Attach a Mediator (the enforcement shim) to this broker"""
+        self._mediator = mediator
 
     # ---- capability management (monotonic, root-anchored) ----
     def grant_root(self, capability: Capability) -> None:
@@ -174,12 +176,9 @@ class EffectBroker:
     ) -> Capability:
         """Deliberately create a NON-monotonic (widened) capability.
 
-        This models "delegation widening" (T6): an agent tries to hand a
-        sub-agent a capability that is NOT a monotonic narrowing of its own.
-        With the revised Auth, the widened capability will now fail
-        Auth at commit (right+target match, but the derivation is non-monotonic)
-        — making the blocker Auth, not NoAmp, after the root-anchoring/monotonicity
-        moves into Auth.
+        This models delegation widening (T6): an agent tries to hand a
+        sub-agent a capability that is NOT a monotonic narrowing of its own
+        Auth rejects the non-monotonic derivation chain at commit time
         """
         parent = self.capabilities[parent_nonce]
         child = Capability(
@@ -430,26 +429,16 @@ class EffectBroker:
         return True, "flow-ok"
 
     def check_noamp(self, effect: Effect, task: Task) -> PredicateResult:
-        """Composition safety: authority of compound effects is contained in the task ceiling.
+        """Composition safety: effect authority stays within the task ceiling
 
-        After moving root-anchoring and monotonicity into Auth,
-        NoAmp's sole remaining responsibility is checking whether a compound or
-        staged effect's total authority (across its chain of operations) stays
-        within the task's ceiling — i.e., that no single step within a composed
-        workflow widens beyond what the task authorized.
-
-        In the minimal model (one effect at a time), this checks whether the
-        effect's right+target is covered by the task ceiling's scope. The full
-        composition check would walk a multi-step workflow; this is the
-        single-effect baseline.
+        For `network` effects, also enforces SSRF containment: the capability's
+        scope must be a subset of the URL's domain scope
         """
         capability = self.capabilities.get(effect.capability_nonce)
         if capability is None:
             return False, "no-capability"
 
-        # The effect's authority must be within the task's ceiling scope
-        # A ceiling.scope containing "*" is a wildcard: covers any target.
-        # Otherwise, the effect's target must be in the ceiling scope.
+        # The effect's target must be in the task's ceiling scope
         is_wildcard = "*" in task.ceiling.scope
         target_in_scope = is_wildcard or effect.target in task.ceiling.scope
         if not target_in_scope:
@@ -457,13 +446,34 @@ class EffectBroker:
                 f"composition-fail(target={effect.target} not in ceiling-scope={task.ceiling.scope})"
             )
 
-        # Verify the capability's right is consistent with the ceiling's right
-        # (a task ceiling for "send" cannot authorize a "write"; but a
-        # ceiling.right="*" is a wildcard that covers any right)
-        if task.ceiling.right != "*" and capability.right != task.ceiling.right:
+        # Right dominance: ceiling.right = "*" dominates all rights (any right allowed).
+        # Any other ceiling.right must exactly match the capability's right.
+        if task.ceiling.right == "*":
+            pass  # wildcard: any capability right is within ceiling
+        elif capability.right == task.ceiling.right:
+            pass  # exact match: within ceiling
+        else:
             return False, (
                 f"ceiling-right-mismatch(cap-right={capability.right}!=ceiling-right={task.ceiling.right})"
             )
+
+        # SSRF containment for network effects
+        if effect.etype == "network":
+            from .model import URL as _URL
+            resource = self.store.resolve(effect.target)
+            if isinstance(resource, _URL) and resource.scope and "*" not in resource.scope:
+                if not capability.scope <= resource.scope:
+                    return False, (
+                        f"ssrf containment failed: cap-scope={capability.scope} "
+                        f"not subset of url-scope={resource.scope}"
+                    )
+            elif "://" in effect.target:
+                target_domain = frozenset({effect.target.split("://", 1)[1].split("/")[0]})
+                if not capability.scope <= target_domain:
+                    return False, (
+                        f"ssrf containment failed: cap-scope={capability.scope} "
+                        f"not subset of url-domain={target_domain}"
+                    )
 
         return True, f"composition-ok(ceiling-scope={task.ceiling.scope})"
 
@@ -478,16 +488,16 @@ class EffectBroker:
             return False, "no-capability"
         assert task.session is not None, "task.session must be initialized by Task.__post_init__"
 
-        # Lifetime: capability not expired. Use task.session.logical_time if
-        # available; otherwise fall back to broker.logical_time. This keeps
-        # legacy tests (broker.logical_time = N) working while the normal code
-        # path uses the task-scoped session clock.
+        # Lifetime: capability not expired
         session_time = task.session.logical_time if task.session.live else 0.0
         effective_time = max(session_time, self.logical_time)
         if capability.expiry <= effective_time:
             return False, f"expired(t_session={effective_time},cap_exp={capability.expiry})"
 
         # Revocation: per-task nonce list AND broker-level global revocation
+        # NOTE: we use the `task` parameter directly, not a re-lookup via
+        # self.tasks, to preserve the correct session (revoke may have added
+        # the nonce to this task's session.revoked set already).
         if capability.nonce in task.session.revoked or capability.nonce in self.global_revoked:
             return False, f"revoked(in_task={task.task_id} or global)"
 
@@ -499,9 +509,17 @@ class EffectBroker:
 
     # ---- commit gate (the ONLY way external state changes) ----
     def commit(
-        self, commit: Commit, mediation: MediationVerdict | None = None
+        self,
+        commit: Commit,
+        mediation: MediationVerdict | None = None,
     ) -> tuple[bool, Evidence]:
-        """Evaluate the four-predicate gate over the Commit primitive."""
+        """Evaluate the four-predicate gate over the Commit primitive
+
+        If a Mediator is attached and commit.tool_name is set, the mediator
+        inspects the effect against the named tool's ToolSpec after the gate
+        passes. The verdict is recorded in evidence["boundary_stop"].
+        The mediation parameter allows direct verdict injection (for tests)
+        """
         effect = commit.effect
         task = commit.task
 
@@ -529,7 +547,6 @@ class EffectBroker:
                 self.tasks[task.task_id] = task
 
         assert task.session is not None, "Task must have a session (set by __post_init__)"
-        session = task.session
 
         predicate_results: dict[str, PredicateResult] = {
             "Auth": self.check_auth(effect, task),
@@ -544,9 +561,26 @@ class EffectBroker:
             None,
         )
         boundary_stop: str | None = None
-        if allow and mediation is not None and not mediation.allow:
-            allow = False
-            boundary_stop = mediation.boundary_stop
+
+        # Boundary mediation: the enforcement shim (Mediator) runs AFTER the
+        # four-predicate gate. The gate proved the effect is authorised; the
+        # mediator now checks whether the named tool will honour the declared shape.
+        # Priority: explicit mediation verdict > Mediator.inspect() > allow
+        if allow:
+            if mediation is not None:
+                boundary_verdict = mediation
+            elif self._mediator is not None and commit.tool_name is not None:
+                boundary_verdict = self._mediator.inspect(effect, commit.tool_name)
+            else:
+                boundary_verdict = MediationVerdict(True, None)
+
+            if not boundary_verdict.allow:
+                allow = False
+                boundary_stop = boundary_verdict.boundary_stop
+                # A boundary stop is NOT a predicate blocker — the gate passed;
+                # the issue is at the broker→tool forwarding boundary
+                if blocking_predicate is None:
+                    blocking_predicate = "Boundary"
 
         evidence: Evidence = {
             "allow": allow,
@@ -570,3 +604,22 @@ class EffectBroker:
         If task is None, a permissive default task is created (same as commit()).
         """
         return self.commit(Commit(effect, task))
+
+    def _make_commit(
+        self, effect: Effect, task_id: TaskId = "default"
+    ) -> Commit:
+        """Build a Commit from an effect and task_id (used by the shim)."""
+        task = self.tasks.get(task_id)
+        if task is None:
+            default_ceiling = Capability(
+                owner=USER,
+                holder=BROKER,
+                right="*",
+                target="*",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="default-ceiling",
+            )
+            task = Task(task_id=task_id, owner=USER, ceiling=default_ceiling)
+            self.tasks[task_id] = task
+        return Commit(effect, task)
