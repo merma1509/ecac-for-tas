@@ -25,8 +25,13 @@ def _make_permissive_task(task_id: str) -> Task:
     With the broker.py fix, "*" also makes NoAmp skip the right check.
     """
     ceiling = Capability(
-        owner="User", holder="EffectBroker", right="*", target="*",
-        scope=frozenset({"*"}), expiry=float("inf"), nonce=f"ceiling-{task_id}",
+        owner="User",
+        holder="EffectBroker",
+        right="*",
+        target="*",
+        scope=frozenset({"*"}),
+        expiry=float("inf"),
+        nonce=f"ceiling-{task_id}",
     )
     return Task(task_id=task_id, owner="User", ceiling=ceiling)
 
@@ -59,7 +64,9 @@ def _grant_for(broker, etype: str, target: str, expiry: float = 100.0) -> tuple[
     task = _make_permissive_task("default")
     broker.register_task(task)
     request = Effect(
-        etype=etype, target=target, metadata={},
+        etype=etype,
+        target=target,
+        metadata={},
         provenance=(Data("__request__", Confidentiality.INTERNAL, Integrity.USER),),
         capability_nonce=f"r-{etype}:Agent:EffectBroker",
         delegation_chain=(),
@@ -206,7 +213,9 @@ class TestFlowEndorseRegression:
         )
         allow, evidence = broker.commit(Commit(effect, task))
 
-        assert allow is True, f"FlowOK should ALLOW with broker-recorded endorse. Evidence: {evidence}"
+        assert allow is True, (
+            f"FlowOK should ALLOW with broker-recorded endorse. Evidence: {evidence}"
+        )
         assert len(broker.store.effects_log) == 1
 
     def test_declass_does_not_cover_integrity_violation(self) -> None:
@@ -249,8 +258,13 @@ class TestFlowBoundaryTaskScoped:
 
         # Task with wide flow boundary (accepts CONFIDENTIAL data)
         wide_ceiling = Capability(
-            owner="User", holder="EffectBroker", right="read", target="*",
-            scope=frozenset({"*"}), expiry=float("inf"), nonce="wide-ceiling",
+            owner="User",
+            holder="EffectBroker",
+            right="read",
+            target="*",
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce="wide-ceiling",
         )
         task_wide = Task(
             task_id="task-wide",
@@ -262,8 +276,13 @@ class TestFlowBoundaryTaskScoped:
 
         # Task with narrow flow boundary (rejects CONFIDENTIAL data)
         narrow_ceiling = Capability(
-            owner="User", holder="EffectBroker", right="read", target="*",
-            scope=frozenset({"*"}), expiry=float("inf"), nonce="narrow-ceiling",
+            owner="User",
+            holder="EffectBroker",
+            right="read",
+            target="*",
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce="narrow-ceiling",
         )
         task_narrow = Task(
             task_id="task-narrow",
