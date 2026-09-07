@@ -14,8 +14,6 @@ it was granted for. Any deviation is blocked.
 
 from __future__ import annotations
 
-import pytest
-
 from effect_broker.lattice import Confidentiality, Integrity
 from effect_broker.model import Capability, Data, Effect, Task
 from effect_broker.traces import build
@@ -104,8 +102,7 @@ class TestApprovalBindingExact:
 
         # Auth blocks (target mismatch) or Fresh blocks (if nonce consumed)
         assert allow2 is False, (
-            f"Approval for write(reports) should NOT authorize write(secrets). "
-            f"Evidence: {ev2}"
+            f"Approval for write(reports) should NOT authorize write(secrets). Evidence: {ev2}"
         )
 
     def test_approval_blocks_on_different_etype(self) -> None:
@@ -155,10 +152,7 @@ class TestApprovalBindingExact:
         allow, evidence = broker.commit(commit)
 
         # Auth blocks: right mismatch (capability right=read vs effect etype=write)
-        assert allow is False, (
-            f"Approval for read should NOT authorize write. "
-            f"Evidence: {evidence}"
-        )
+        assert allow is False, f"Approval for read should NOT authorize write. Evidence: {evidence}"
         assert evidence["primary_blocker"] in ("Auth", "NoAmp")
 
 
