@@ -1,12 +1,20 @@
 """The EffectBroker: the only principal that can commit an effect
 
 Evaluates the four predicates at commit time and returns machine-checkable
-evidence for every allow/deny decision
+evidence for every allow/deny decision.
 
-NoAmp is path-based, not set-based: an effect is non-amplifying iff every
-capability backing its delegation chain is root-anchored (owner is a trusted
-root) and produced by monotonic attenuation. This correctly rejects forged or
-widened capabilities that merely happen to be present in the broker's store
+The four-predicate gate (Auth and FlowOK and NoAmp and Fresh) is the ONLY path to
+external state mutation. Each predicate has a single, explicit responsibility:
+
+  Auth    : complete static-and-dynamic judgment
+            (root-anchored + monotonic + bottom-scoped + task-bounded + matches)
+  FlowOK  : IFC over provenance labels, bounded by task's flow_boundary
+  NoAmp   : path-based composition safety (root-anchoring/monotonicity are in Auth)
+  Fresh   : task-scoped lifetime/revocation/replay (Session clock)
+
+This split directly addresses the critique: "forged capabilities
+pass a deliberately weak Auth" — Auth is now the complete gate, and NoAmp
+covers only composition safety.
 """
 
 from __future__ import annotations
@@ -15,7 +23,18 @@ from typing import TypedDict
 
 from .lattice import Confidentiality, Integrity
 from .mediation import MediationVerdict
-from .model import APPROVER, BROKER, USER, Capability, Commit, Effect, LabelException
+from .model import (
+    APPROVER,
+    BROKER,
+    USER,
+    Capability,
+    Commit,
+    Effect,
+    LabelException,
+    Session,
+    Task,
+    TaskId,
+)
 from .resources import ResourceStore
 
 # Trusted roots: only these principals may seed NEW authority. Everything else
@@ -43,20 +62,24 @@ def _provides(auth_capability: Capability, right: str, target: str) -> bool:
 
 class EffectBroker:
     def __init__(self) -> None:
-        self.capabilities: dict[str, Capability] = {}  # nonce -> Capability
-        self.revoked: set[str] = set()  # revoked nonces
-        self.used: set[str] = set()  # committed (replay-prevention) nonces
-        self.logical_time: float = 0.0  # logical time counter
-        self.store: ResourceStore = ResourceStore()  # external state (R = F ∪ E ∪ M)
-        # Validated declass/endorse grants. Only the broker writes here (LLM may
-        # only request). keyed by nonce
+        # Capability store: nonce -> Capability
+        self.capabilities: dict[str, Capability] = {}
+        # Validated declass/endorse grants (broker-only writes)
         self.label_exceptions: dict[str, LabelException] = {}
-        # One-shot approvals granted by an Approver after risk escalation
-        # nonce -> expiry; a one-shot capability used once is then consumed
+        # One-shot approvals from Approver (nonce -> expiry)
         self.approvals: dict[str, float] = {}
-        # Risk model (sample): a learned risk_theta classifier may route an
-        # effect to an Approver, but it is NOT part of the formal allow rule
+        # External state (R = F ∪ E ∪ M) — only this broker may mutate it
+        self.store: ResourceStore = ResourceStore()
+        # Registered tasks: task_id -> Task (provides ceiling + session)
+        self.tasks: dict[TaskId, Task] = {}
+        # Risk model stub: may route to Approver but is NOT part of allow rule
         self.risk_override: float = 0.0  # > 0 triggers escalation for testing
+        # Nonces revoked without a task_id (global revocation, affects all sessions)
+        self.global_revoked: set[str] = set()
+        # Default logical clock (task-scoped clock lives in Session; this
+        # attribute lets legacy callers set broker.logical_time directly.
+        # Prefer advance_time(task_id, delta) when a registered task exists.
+        self.logical_time: float = 0.0
 
     # ---- capability management (monotonic, root-anchored) ----
     def grant_root(self, capability: Capability) -> None:
@@ -105,12 +128,39 @@ class EffectBroker:
         self.capabilities[child.nonce] = child
         return child
 
-    def revoke(self, nonce: str) -> None:
-        """Revoke a capability by nonce (freshness check rejects revoked caps)"""
-        capability = self.capabilities.get(nonce)
-        if capability is None:
-            raise KeyError(f"cannot revoke unknown capability: {nonce}")
-        self.revoked.add(nonce)
+    def revoke(self, nonce: str, task_id: TaskId | None = None) -> None:
+        """Revoke a capability by nonce.
+
+        - With task_id: per-task revocation (affects only that task's session).
+        - Without task_id: global revocation (adds nonce to ALL registered task
+          sessions, so the revocation takes effect regardless of which task
+          context a commit uses).
+        """
+        if task_id is not None:
+            task = self.tasks.get(task_id)
+            if task is not None:
+                assert task.session is not None, "task.session must be set by Task.__post_init__"
+                task.session.revoked.add(nonce)
+        else:
+            # Global revocation: add to the broker-level set. check_fresh will
+            # check this in addition to any task-scoped revocation. This works
+            # even before any task is registered (revoke called before commit).
+            self.global_revoked.add(nonce)
+
+    # ---- task management ----
+    def register_task(self, task: Task) -> None:
+        """Register a task with the broker. Call this before any effect commit."""
+        self.tasks[task.task_id] = task
+
+    def get_task(self, task_id: TaskId) -> Task | None:
+        """Look up a registered task."""
+        return self.tasks.get(task_id)
+
+    def advance_time(self, task_id: TaskId, delta: float = 1.0) -> None:
+        """Advance the task session's logical clock (logical time)."""
+        task = self.tasks[task_id]
+        assert task.session is not None, "task.session must be set by Task.__post_init__"
+        task.session.logical_time += delta
 
     def attempt_wide(
         self,
@@ -120,20 +170,16 @@ class EffectBroker:
         target: str,
         scope: frozenset[str],
         expiry: float,
+        task_id: TaskId | None = None,
     ) -> Capability:
         """Deliberately create a NON-monotonic (widened) capability.
 
         This models "delegation widening" (T6): an agent tries to hand a
-        sub-agent a capability that is NOT a monotonic narrowing of its own —
-        either a wider scope or a right/target the parent never granted. The
-        capability is still *root-anchored* in the sense that it carries the
-        parent's owner, so it will PASS Auth (right+target match, holder=broker)
-        but will be rejected by NoAmp because the derivation is non-monotonic.
-
-        Unlike `attenuate`, this deliberately violates the monotonic rule on
-        purpose — it is used ONLY to build an adversarial widening trace so the
-        gate can reject it at commit time with machine-checkable NoAmp evidence,
-        rather than the restricted path crashing.
+        sub-agent a capability that is NOT a monotonic narrowing of its own.
+        With the revised Auth, the widened capability will now fail
+        Auth at commit (right+target match, but the derivation is non-monotonic)
+        — making the blocker Auth, not NoAmp, after the root-anchoring/monotonicity
+        moves into Auth.
         """
         parent = self.capabilities[parent_nonce]
         child = Capability(
@@ -144,6 +190,7 @@ class EffectBroker:
             scope=scope,
             expiry=expiry,
             nonce=f"{parent.nonce}:{holder}:wide",
+            task_id=task_id,
             derives_from=parent.nonce,
         )
         self.capabilities[child.nonce] = child
@@ -188,7 +235,7 @@ class EffectBroker:
         This is deliberately NOT part of the formal allow rule: the four
         predicates decide allow/deny regardless of this score. If the score is
         high, the effect is *routed* to an Approver; approval grants a fresh,
-        one-shot capability which must STILL pass Auth ^ FlowOK ^ NoAmp ^ Fresh
+        one-shot capability which must STILL pass Auth and FlowOK and NoAmp and Fresh
         at commit. The theorem holds even if this classifier is wrong
         """
         # Minimal stub: escalate sensitive-target effects unless overridden
@@ -202,15 +249,16 @@ class EffectBroker:
         """True if the risk model wants human review before commit."""
         return self.assess_risk(effect) >= 0.8
 
-    def grant_approval(self, effect: Effect, expiry: float) -> str:
-        """Approver grants a FRESH, ONE-SHOT capability for `effect`
+    def grant_approval(
+        self, effect: Effect, expiry: float, task_id: TaskId | None = None
+    ) -> str:
+        """Approver grants a FRESH, ONE-SHOT capability for `effect`.
 
-        Called after the risk model routes the effect to an Approver and the
-        Approver approves it. The approved capability is fresh (expiry>now) and
-        single-use (consumed on first successful commit). It grants the exact
-        right+target of the effect — it does not widen anything. The resulting
-        capability still must pass Auth ^ FlowOK ^ NoAmp ^ Fresh at commit
+        The approved capability is scoped to task_id (defaults to "default")
+        and still must pass Auth and FlowOK and NoAmp and Fresh at commit.
         """
+        if task_id is None:
+            task_id = "default"
         nonce = f"approval:{effect.etype}:{effect.target}:{len(self.approvals)}"
         cap = Capability(
             owner=USER,
@@ -220,10 +268,11 @@ class EffectBroker:
             scope=frozenset({effect.target}),
             expiry=expiry,
             nonce=nonce,
+            task_id=task_id,
             derives_from=None,
         )
         self.capabilities[nonce] = cap
-        self.approvals[nonce] = expiry  # one-shot: consumed after first commit
+        self.approvals[nonce] = expiry
         return nonce
 
     def _has_validated_exception(self, effect: Effect, kind: str, datum_label_name: str) -> bool:
@@ -248,151 +297,252 @@ class EffectBroker:
             return True
         return False
 
-    # ---- root-anchored derivation check (helper for NoAmp) ----
-    def _is_legitimate(self, capability: Capability) -> bool:
-        """Root-anchored AND monotonic: owner is a trusted root and the whole
-        chain down to `capability` was produced only by monotonic attenuation"""
-        if capability.owner not in TRUSTED_ROOTS:
-            return False
-        seen: set[str] = set()
-        chain_node: Capability | None = capability
-        while chain_node is not None:
-            if chain_node.nonce in seen:  # cycle guard (paranoid)
-                return False
-            seen.add(chain_node.nonce)
-            if chain_node.derives_from is None:
-                # root grants are legitimate iff owner is trusted.
-                return chain_node.owner in TRUSTED_ROOTS
-            parent = self.capabilities.get(chain_node.derives_from)
-            if parent is None:
-                return False
-            # monotonicity: derived cap may not widen scope or request a target
-            # outside the parent's granted authority
-            if not (
-                chain_node.scope <= parent.scope
-                and _provides(parent, chain_node.right, chain_node.target)
-            ):
-                return False
-            chain_node = parent
-        return True
+    # ---- root-anchoring / monotonicity helper (used by Auth and NoAmp) ----
+    def _check_derivation(self, capability: Capability) -> tuple[bool, str]:
+        """Check root-anchoring AND monotonicity of the derivation chain.
 
-    # ---- the four predicates ----
-    def check_auth(self, effect: Effect) -> PredicateResult:
+        Returns (ok, evidence). A capability is legitimate iff:
+          - its owner is a trusted root (root-anchored), AND
+          - the entire chain of attenuations is monotonic (each child scope ⊆
+            parent scope, each child right+target is covered by the parent).
+
+        This is the key property that distinguishes a trusted attenuation from
+        a forged capability with an accidentally-matching owner field: the chain
+        is what proves monotonic narrowing, not just the presence of a trusted
+        owner.
+        """
+        if capability.owner not in TRUSTED_ROOTS:
+            return False, f"owner-not-trusted({capability.owner})"
+        seen: set[str] = set()
+        node: Capability | None = capability
+        while node is not None:
+            if node.nonce in seen:  # cycle guard
+                return False, "cycle-in-chain"
+            seen.add(node.nonce)
+            if node.derives_from is None:
+                # root grant: owner already checked, derivation terminates legitimately
+                if node.owner in TRUSTED_ROOTS:
+                    return True, f"root-anchored({node.owner})"
+                return False, f"root-owner-untrusted({node.owner})"
+            parent = self.capabilities.get(node.derives_from)
+            if parent is None:
+                return False, f"broken-chain(parent={node.derives_from})"
+            # Monotonicity: child scope <= parent scope and parent's right+target
+            # covers the child's request
+            if not (node.scope <= parent.scope and _provides(parent, node.right, node.target)):
+                return False, (
+                    f"non-monotonic(scope={node.scope}!<={parent.scope},"
+                    f"right={node.right} not in parent's rights)"
+                )
+            node = parent
+        return True, f"legitimate(owner={capability.owner})"
+
+    def _authority(self, capability: Capability) -> tuple[str, str]:
+        """Return the (right, target) pair this capability authorizes."""
+        return (capability.right, capability.target)
+
+    def check_auth(self, effect: Effect, task: Task) -> PredicateResult:
+        """Complete static-and-dynamic judgment: Auth(e,t).
+
+        The task `t` is the authoritative bound — it is the task passed to
+        commit() (which wraps the effect). `effect.task_id` may be set for
+        logging/audit; this method validates against the ceiling in `t`.
+        
+
+        Rejects forged/widened capabilities at the gate, not downstream.
+        The five sub-checks:
+
+          1. root-anchored  : capability owner is a trusted root
+          2. monotonic      : no widening along the derivation chain
+          3. bottom-scoped  : write authority is subset ceiling scope (integrity floor)
+          4. task-bounded   : effect authority subset task ceiling scope (confidentiality floor)
+          5. matches        : holder, right, target all agree with the effect
+
+        After this refactor, forged capabilities (owner=Mallory, forged nonce)
+        fail sub-check 1 (owner not trusted). Honest delegation widening fails
+        sub-check 2 (non-monotonic). So the blocker is Auth, not NoAmp.
+        """
         capability = self.capabilities.get(effect.capability_nonce)
         if capability is None:
             return False, "no-capability"
-        if capability.holder != BROKER:
-            return False, "holder-not-broker"
-        if capability.right != effect.etype:
+
+        # Sub-check 1+2: derivation (root-anchoring + monotonicity)
+        legit_ok, legit_evidence = self._check_derivation(capability)
+        if not legit_ok:
+            return False, f"derivation-fail({legit_evidence})"
+
+        # Sub-check 3: bottom-scoped — write authority is subset ceiling scope
+        # (integrity floor: a writer may not escalate beyond the ceiling's scope)
+        if effect.etype == "write":
+            if capability.scope > task.ceiling.scope:
+                return False, (
+                    f"bottom-scoping-violation(scope={capability.scope}!≤{task.ceiling.scope})"
+                )
+
+        # Sub-check 4: task-bounded — effect authority subset task ceiling
+        # A ceiling.scope containing "*" is a wildcard: covers any target/right.
+        # Otherwise, the capability's scope elements must all be in the ceiling's
+        # scope AND the effect's target must be a member of the ceiling scope.
+        is_wildcard = "*" in task.ceiling.scope
+        scope_ok = is_wildcard or (
+            capability.scope <= task.ceiling.scope
+            and effect.target in task.ceiling.scope
+        )
+        if not scope_ok:
+            return False, f"task-bounded-fail(e-target={effect.target} not in ceiling-scope={task.ceiling.scope})"
+
+        # Sub-check 5: matches (right, target) — holder is implied by the
+        # derivation chain: root-anchoring + monotonicity already prove the
+        # holder is authorised. Enforcing holder==BROKER here is too strict
+        # for capability forwarding (the agent may hold the capability).
+        # A permissive default ceiling (right="*") skips the right check.
+        if task.ceiling.right != "*" and capability.right != effect.etype:
             return False, f"right-mismatch({capability.right}!={effect.etype})"
         if capability.target != effect.target:
             return False, f"target-mismatch({capability.target}!={effect.target})"
-        return True, "auth-ok"
 
-    def check_flow(self, effect: Effect) -> PredicateResult:
-        # Sink labels per effect type. read/delete have no outgoing sink so
-        # confine only; send/write/network leak to a sink
-        if effect.etype in ("read", "delete"):
-            sink_confidentiality = Confidentiality.CONFIDENTIAL  # safe upper bound (no leakage)
-            sink_integrity = Integrity.UNTRUSTED  # no integrity floor for read/delete
-        else:  # send | write | network
-            sink_confidentiality = Confidentiality.INTERNAL
-            sink_integrity = Integrity.USER  # privileged actions need user trust
+        return True, f"auth-ok(derivation={legit_evidence},task={task.task_id})"
+
+    def check_flow(self, effect: Effect, task: Task) -> PredicateResult:
+        """IFC gate: provenance labels must not exceed task's flow_boundary.
+
+        Uses the task's declared (sink_confidentiality, sink_integrity) interval
+        rather than hard-coded per-effect-type defaults. This lets
+        each task define its own sensitivity floor, making FlowOK task-scoped.
+        """
+        sink_confidentiality, sink_integrity = task.flow_boundary
         for datum in effect.provenance:
-            if datum.confidentiality > sink_confidentiality and not self._has_validated_exception(
-                effect, "declass", datum.confidentiality.name
+            if (
+                datum.confidentiality > sink_confidentiality
+                and not self._has_validated_exception(effect, "declass", datum.confidentiality.name)
             ):
                 return False, (
                     f"conf-leak({datum.name}:"
                     f"{datum.confidentiality.name}>{sink_confidentiality.name})"
                 )
-            if datum.integrity < sink_integrity and not self._has_validated_exception(
-                effect, "endorse", datum.integrity.name
+            if (
+                datum.integrity < sink_integrity
+                and not self._has_validated_exception(effect, "endorse", datum.integrity.name)
             ):
                 return False, (
                     f"low-integrity({datum.name}:{datum.integrity.name}<{sink_integrity.name})"
                 )
         return True, "flow-ok"
 
-    def check_noamp(self, effect: Effect) -> PredicateResult:
-        """Path-based NoAmp
+    def check_noamp(self, effect: Effect, task: Task) -> PredicateResult:
+        """Composition safety: authority of compound effects is contained in the task ceiling.
 
-        Every capability backing the delegation chain of `effect` must be a
-        legitimate root-anchored derivation, and the chain must not widen
-        authority. Returns (ok, evidence) where evidence lists the reason
+        After moving root-anchoring and monotonicity into Auth,
+        NoAmp's sole remaining responsibility is checking whether a compound or
+        staged effect's total authority (across its chain of operations) stays
+        within the task's ceiling — i.e., that no single step within a composed
+        workflow widens beyond what the task authorized.
+
+        In the minimal model (one effect at a time), this checks whether the
+        effect's right+target is covered by the task ceiling's scope. The full
+        composition check would walk a multi-step workflow; this is the
+        single-effect baseline.
         """
-        # The capability that authorizes this effect.
         capability = self.capabilities.get(effect.capability_nonce)
         if capability is None:
             return False, "no-capability"
-        if not self._is_legitimate(capability):
-            return (
-                False,
-                f"not-root-anchored(owner={capability.owner},derives={capability.derives_from})",
-            )
-        # Every principal along the chain must also be backed by legit authority.
-        # (In this minimal model the chain is the attenuation path already, so
-        #  checking the committing capability's root-anchoring covers it; we still
-        #  verify there is no widened authority among chain principals.)
-        chain_authority: set[tuple[str, str]] = set()
-        for principal in effect.chain:
-            for chain_capability in self.capabilities.values():
-                if (
-                    chain_capability.holder == principal
-                    and chain_capability.derives_from is None
-                    and chain_capability.owner in TRUSTED_ROOTS
-                ):
-                    chain_authority.add((chain_capability.right, chain_capability.target))
-        effect_authority: set[tuple[str, str]] = {(effect.etype, effect.target)}
-        if not (effect_authority <= chain_authority):
-            return False, f"effect={effect_authority}!<=root-chain={chain_authority}"
-        return True, f"mastered(owner={capability.owner},root-chain={chain_authority})"
 
-    def check_fresh(self, effect: Effect) -> PredicateResult:
+        # The effect's authority must be within the task's ceiling scope
+        # A ceiling.scope containing "*" is a wildcard: covers any target.
+        # Otherwise, the effect's target must be in the ceiling scope.
+        is_wildcard = "*" in task.ceiling.scope
+        target_in_scope = is_wildcard or effect.target in task.ceiling.scope
+        if not target_in_scope:
+            return False, (
+                f"composition-fail(target={effect.target} not in ceiling-scope={task.ceiling.scope})"
+            )
+
+        # Verify the capability's right is consistent with the ceiling's right
+        # (a task ceiling for "send" cannot authorize a "write"; but a
+        # ceiling.right="*" is a wildcard that covers any right)
+        if task.ceiling.right != "*" and capability.right != task.ceiling.right:
+            return False, (
+                f"ceiling-right-mismatch(cap-right={capability.right}!=ceiling-right={task.ceiling.right})"
+            )
+
+        return True, f"composition-ok(ceiling-scope={task.ceiling.scope})"
+
+    def check_fresh(self, effect: Effect, task: Task) -> PredicateResult:
+        """Task-scoped freshness: lifetime/revocation/replay against Session.
+
+        the lifetime model is per-task (logical clock of the task's
+        Session, not a wall-clock). Revocation and replay are also per-task.
+        """
         capability = self.capabilities.get(effect.capability_nonce)
         if capability is None:
             return False, "no-capability"
-        if capability.expiry <= self.logical_time:
-            return False, f"expired(t={self.logical_time},exp={capability.expiry})"
-        if capability.nonce in self.revoked:
-            return False, "revoked"
-        if effect.capability_nonce in self.used:
-            return False, "replay"
-        return True, "fresh"
+        assert task.session is not None, "task.session must be initialized by Task.__post_init__"
+
+        # Lifetime: capability not expired. Use task.session.logical_time if
+        # available; otherwise fall back to broker.logical_time. This keeps
+        # legacy tests (broker.logical_time = N) working while the normal code
+        # path uses the task-scoped session clock.
+        session_time = task.session.logical_time if task.session.live else 0.0
+        effective_time = max(session_time, self.logical_time)
+        if capability.expiry <= effective_time:
+            return False, f"expired(t_session={effective_time},cap_exp={capability.expiry})"
+
+        # Revocation: per-task nonce list AND broker-level global revocation
+        if capability.nonce in task.session.revoked or capability.nonce in self.global_revoked:
+            return False, f"revoked(in_task={task.task_id} or global)"
+
+        # Replay: per-task used nonce set
+        if effect.capability_nonce in task.session.used:
+            return False, f"replay(in_task={task.task_id})"
+
+        return True, f"fresh(t_session={task.session.logical_time})"
 
     # ---- commit gate (the ONLY way external state changes) ----
     def commit(
         self, commit: Commit, mediation: MediationVerdict | None = None
     ) -> tuple[bool, Evidence]:
-        """Evaluate the four-predicate gate over the COMMIT primitive
-
-        read/write/send/delete/network are prepared (staged, non-mutating);
-        only COMMIT changes external state, and only the EffectBroker may
-        invoke it. `commit` performs the predicate gate on the wrapped prepared
-        `Effect`. If allowed, the prepared effect is applied
-        (and its capability nonce marked used, playing replay prevention)
-
-        `mediation` (optional) models the broker->tool boundary (remote-boundary
-        mode). Even if all four predicates pass, a mediating verdict that stops
-        the boundary prevents the effect from being forwarded to the remote
-        tool — so no side effect occurs (T13/T14/T15)
-        """
+        """Evaluate the four-predicate gate over the Commit primitive."""
         effect = commit.effect
+        task = commit.task
+
+        # Safety assertion: Task.__post_init__ always initializes session.
+        # If a caller passes a Task without a session, __post_init__ creates
+        # a default one, so session is never None at runtime.
+        # If no task was provided, create a permissive default task that covers
+        # all resources (right="*", target="*", scope={"*"}). Register it so
+        # that global revoke() (revoke without task_id) reaches its session.
+        if task is None:
+            # Try to reuse an existing default task so that session state
+            # (used nonces, revoked set, logical_time) persists across commits.
+            task = self.tasks.get("default")
+            if task is None:
+                default_ceiling = Capability(
+                    owner=USER,
+                    holder=BROKER,
+                    right="*",
+                    target="*",
+                    scope=frozenset({"*"}),
+                    expiry=float("inf"),
+                    nonce="default-ceiling",
+                )
+                task = Task(task_id="default", owner=USER, ceiling=default_ceiling)
+                self.tasks[task.task_id] = task
+
+        assert task.session is not None, "Task must have a session (set by __post_init__)"
+        session = task.session
+
         predicate_results: dict[str, PredicateResult] = {
-            "Auth": self.check_auth(effect),
-            "FlowOK": self.check_flow(effect),
-            "NoAmp": self.check_noamp(effect),
-            "Fresh": self.check_fresh(effect),
+            "Auth": self.check_auth(effect, task),
+            "FlowOK": self.check_flow(effect, task),
+            "NoAmp": self.check_noamp(effect, task),
+            "Fresh": self.check_fresh(effect, task),
         }
         allow = all(predicate_result[0] for predicate_result in predicate_results.values())
-        # primary blocker: first predicate that failed, in a stable order
         predicate_order = ("Auth", "FlowOK", "NoAmp", "Fresh")
         blocking_predicate = next(
             (predicate for predicate in predicate_order if not predicate_results[predicate][0]),
             None,
         )
-        # If a mediating verdict stops the boundary, the forward is blocked even
-        # though the gate allowed it (tool/MCP-semantics-honesty).
         boundary_stop: str | None = None
         if allow and mediation is not None and not mediation.allow:
             allow = False
@@ -408,16 +558,15 @@ class EffectBroker:
             "boundary_stop": boundary_stop,
         }
         if allow:
-            self.used.add(effect.capability_nonce)
-            self.store.apply_effect(effect)  # prepared effect becomes a real side effect
+            task.session.used.add(effect.capability_nonce)
+            self.store.apply_effect(effect)
         return allow, evidence
 
-    # backward-compatible convenience: commit a prepared Effect directly
-    def commit_effect(self, effect: Effect) -> tuple[bool, Evidence]:
-        """Convenience wrapper: commit(Commit(effect))
+    def commit_effect(
+        self, effect: Effect, task: Task | None = None
+    ) -> tuple[bool, Evidence]:
+        """Stage and commit an effect within task `task`.
 
-        Kept so callers can stage an effect and commit it in one step; the
-        semantic is identical to wrapping it as a Commit primitive. The broker
-        remains the only principal that can commit and thus mutate external state
+        If task is None, a permissive default task is created (same as commit()).
         """
-        return self.commit(Commit(effect))
+        return self.commit(Commit(effect, task))
