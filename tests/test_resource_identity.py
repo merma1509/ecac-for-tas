@@ -18,25 +18,32 @@ from effect_broker.model import Capability, Data, Effect, Task
 from effect_broker.traces import build
 
 
-def _provenance(name: str, conf: Confidentiality = Confidentiality.INTERNAL,
-                integ: Integrity = Integrity.USER) -> tuple[Data, ...]:
+def _provenance(
+    name: str, conf: Confidentiality = Confidentiality.INTERNAL, integ: Integrity = Integrity.USER
+) -> tuple[Data, ...]:
     return (Data(name, conf, integ),)
 
 
 def _make_task(task_id: str) -> Task:
     """Permissive task with wildcard ceiling (dominates all rights)."""
     ceiling = Capability(
-        owner="User", holder="EffectBroker", right="*", target="*",
-        scope=frozenset({"*"}), expiry=float("inf"), nonce=f"ceil-{task_id}",
+        owner="User",
+        holder="EffectBroker",
+        right="*",
+        target="*",
+        scope=frozenset({"*"}),
+        expiry=float("inf"),
+        nonce=f"ceil-{task_id}",
     )
     return Task(task_id=task_id, owner="User", ceiling=ceiling)
 
 
-def _grant(broker, task: Task, etype: str, target: str,
-           expiry: float = 100.0) -> str:
+def _grant(broker, task: Task, etype: str, target: str, expiry: float = 100.0) -> str:
     """Grant a one-shot approval for (etype, target)."""
     request = Effect(
-        etype=etype, target=target, metadata={},
+        etype=etype,
+        target=target,
+        metadata={},
         provenance=_provenance("__req__"),
         capability_nonce=f"r-{etype}:Agent:EffectBroker",
         delegation_chain=(),
@@ -61,8 +68,11 @@ class TestMailboxVsEmailIdentity:
         nonce = _grant(broker, task, "send", "internal@corp.com")
 
         effect = Effect(
-            etype="send", target="internal@corp.com", metadata={"body": "msg"},
-            provenance=_provenance("m"), capability_nonce=nonce,
+            etype="send",
+            target="internal@corp.com",
+            metadata={"body": "msg"},
+            provenance=_provenance("m"),
+            capability_nonce=nonce,
             delegation_chain=(),
         )
 
@@ -85,13 +95,19 @@ class TestMailboxVsEmailIdentity:
         nonce2 = _grant(broker, task, "send", "internal@corp.com", expiry=200.0)
 
         effect1 = Effect(
-            etype="send", target="internal@corp.com", metadata={"body": "A"},
-            provenance=_provenance("a"), capability_nonce=nonce1,
+            etype="send",
+            target="internal@corp.com",
+            metadata={"body": "A"},
+            provenance=_provenance("a"),
+            capability_nonce=nonce1,
             delegation_chain=(),
         )
         effect2 = Effect(
-            etype="send", target="internal@corp.com", metadata={"body": "B"},
-            provenance=_provenance("b"), capability_nonce=nonce2,
+            etype="send",
+            target="internal@corp.com",
+            metadata={"body": "B"},
+            provenance=_provenance("b"),
+            capability_nonce=nonce2,
             delegation_chain=(),
         )
 
@@ -122,9 +138,12 @@ class TestSenderVsRecipientDistinct:
         nonce = _grant(broker, task, "send", "internal@corp.com")
 
         effect = Effect(
-            etype="send", target="internal@corp.com", metadata={},
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
             provenance=(Data("web", Confidentiality.PUBLIC, Integrity.UNTRUSTED),),
-            capability_nonce=nonce, delegation_chain=(),
+            capability_nonce=nonce,
+            delegation_chain=(),
         )
         allow, evidence = broker.commit(broker._make_commit(effect, task_id="default"))
 
@@ -148,13 +167,19 @@ class TestMailboxContainerBoundary:
         nonce2 = _grant(broker, task, "send", "internal@corp.com", expiry=200.0)
 
         effect_a = Effect(
-            etype="send", target="internal@corp.com", metadata={"body": "A"},
-            provenance=_provenance("a"), capability_nonce=nonce1,
+            etype="send",
+            target="internal@corp.com",
+            metadata={"body": "A"},
+            provenance=_provenance("a"),
+            capability_nonce=nonce1,
             delegation_chain=(),
         )
         effect_b = Effect(
-            etype="send", target="internal@corp.com", metadata={"body": "B"},
-            provenance=_provenance("b"), capability_nonce=nonce2,
+            etype="send",
+            target="internal@corp.com",
+            metadata={"body": "B"},
+            provenance=_provenance("b"),
+            capability_nonce=nonce2,
             delegation_chain=(),
         )
 
@@ -179,9 +204,12 @@ class TestMailboxContainerBoundary:
         nonce = _grant(broker, task, "send", "internal@corp.com")
 
         effect = Effect(
-            etype="send", target="internal@corp.com", metadata={},
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
             provenance=_provenance("test"),
-            capability_nonce=nonce, delegation_chain=(),
+            capability_nonce=nonce,
+            delegation_chain=(),
         )
         broker.commit(broker._make_commit(effect, task_id="default"))
 
