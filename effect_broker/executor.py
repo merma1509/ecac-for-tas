@@ -1,12 +1,12 @@
-"""Isolated executor and independent effect ledger
+"""Isolated executor for tool/shim-motivated effects
 
 ARCHITECTURE:
   ┌─────────────────────────────────────────────────────────────┐
   │  IndependentEffectLedger                                    │
-  │  - Created EXTERNALLY (not by broker or executor)           │
+  │  - Created EXTERNALLY (not by broker or executor)            │
   │  - Passed to both broker and executor                       │
-  │  - Records authorization events (from broker.gate)          │
-  │  - Records observation events (from executor + store)       │
+  │  - Records authorization events (from broker.gate)           │
+  │  - Records observation events (from executor + store)        │
   │  - Makes UNAMBIGUOUS verdicts: COMMITTED/BLOCKED/UNKNOWN    │
   └─────────────────────────────────────────────────────────────┘
                        ↑                    ↑
@@ -16,20 +16,23 @@ ARCHITECTURE:
                               ↓
                    IndependentEffectLedger
 
-The executor is the SOLE path for external state mutation:
-  - Only executor.apply_effect() calls broker._apply_effect()
-  - Tool code, shim, and broker.governance never touch store directly
-  - The ledger watches broker.store.identity_log for verification
+MUTATION PATHS:
+  There are TWO paths to external state mutation — both mediated equally:
+    1. broker.commit()  — direct path (no shim/executor)
+    2. executor.execute() — via-shim path (executor calls gate, then apply_effect)
+  Both paths write to the SAME IndependentEffectLedger. The executor is NOT
+  the sole caller of _apply_effect; it is the isolation mechanism for tool/shim
+  calls. Direct calls (e.g., from a REPL or test) use broker.commit().
 
 THREAD SAFETY: broker.gate() uses per-task locks to atomically check AND reserve
 the nonce for Fresh. This prevents double-commit with the same nonce under
 concurrency (two threads could both read used=∅ before either reserves).
 If gate() fails after reservation, the nonce is rolled back.
 
-CRITICAL: In the same-process model, direct store mutation (broker.store._files._data[...]
-= ...) is still possible and untracked. The ledger returns "unknown" (not "safe")
-for any effect it cannot confirm. The same-process limitation is documented
-in restricted_store.py
+SAME-PROCESS LIMITATION: In this model, direct store mutation
+(broker.store._files._data[...]=...) is still possible and untracked.
+The ledger returns "unknown" (not "safe") for any effect it cannot confirm.
+The same-process limitation is documented in restricted_store.py.
 """
 
 from __future__ import annotations
@@ -46,7 +49,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class IsolatedExecutor:
-    """The only entity that may mutate ResourceStore.
+    """Execute effects through the broker gate with independent ledger observation.
 
     ARCHITECTURE:
       tool -> shim -> executor.execute()
@@ -57,9 +60,15 @@ class IsolatedExecutor:
               executor._ledger.record_authorization()
               executor._ledger.record_observation()
 
-    The executor uses an EXTERNAL IndependentEffectLedger (passed in).
-    Both executor.execute() (via-shim path) and broker.commit() (direct path)
-    record to the SAME ledger. verify_complete_mediation() works from BOTH paths.
+    This class provides the isolation mechanism for tool/shim-motivated effects.
+    The executor is NOT the sole path to _apply_effect — broker.commit() also
+    calls _apply_effect() directly (the direct path). Both paths record to
+    the same external ledger so verify_complete_mediation() works from both.
+
+    The executor is the _isolation mechanism_ for tool/shim calls: it ensures
+    that all tool-motivated effects go through the gate before mutation, and
+    that the independent ledger observes both authorization and observation
+    from a path separate from the broker's direct commit().
 
     In the current same-process model, direct store mutation bypass is
     still possible and untracked. The ledger returns "unknown" for any
