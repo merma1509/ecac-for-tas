@@ -21,6 +21,7 @@ from effect_broker.model import (
     Domain,
     Effect,
     LabelException,
+    Task,
 )
 from effect_broker.traces import build
 
@@ -229,6 +230,115 @@ def test_commit_effect_delete_removes_resource(broker: EffectBroker) -> None:
     assert allow is True
     assert "file:///reports" not in broker.store.files
     assert "file:///secrets" in broker.store.files  # untouched (good — default deny)
+
+
+# ---- T17: path traversal (auth / noamp target-mismatch) ----
+def test_path_traversal_dotdot_in_target_blocked_auth(broker: EffectBroker) -> None:
+    """T17: write to file:///../../etc/password -> Auth (target not in any cap).
+
+    The effect's declared target is outside any authorized scope.
+    Auth checks exact right+target match on the capability — a traversal
+    path like ../../etc/password does not match the authorized target.
+    The broker's gate blocks at Auth before any state is applied.
+    """
+    # Grant a write capability scoped only to file:///reports
+    broker.grant_root(
+        _capability(USER, USER, "write", "file:///reports",
+                    frozenset({"file:///reports"}), 100, "r-write-reports")
+    )
+    broker.attenuate("r-write-reports", AGENT, "write", "file:///reports",
+                     frozenset({"file:///reports"}), 100)
+
+    effect = Effect(
+        "write",
+        "file:///../../etc/password",
+        {},
+        (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        "r-write-reports:Agent",
+        CHAIN,
+    )
+    allow, evidence = broker.commit_effect(effect)
+    assert not allow
+    assert evidence["primary_blocker"] == "Auth"
+    assert "target-mismatch" in evidence["predicates"]["Auth"]
+    assert len(broker.store.effects_log) == 0
+    assert "file:///../../etc/password" not in broker.store.files
+
+
+def test_path_traversal_dotdot_in_known_targets_blocked(broker: EffectBroker) -> None:
+    """T17 variant: traversal path embedded in known_targets.additional.
+
+    Primary target is authorized; extra target carries a traversal path.
+    check_noamp checks extra targets against the capability's scope:
+    the traversal path's scope label does not match the cap scope.
+    """
+    from effect_broker.model import EffectTarget
+
+    # Use a restrictive task ceiling so check_noamp actually blocks
+    # based on scope, not wildcard. The default ceiling is right="*", scope={"*"},
+    # which passes NoAmp trivially — use a specific scope instead.
+    restrictive_task = Task(
+        task_id="t-restrict",
+        owner=USER,
+        ceiling=Capability(
+            owner=USER,
+            holder=BROKER,
+            right="write",
+            target="file:///reports",
+            scope=frozenset({"file:///reports"}),
+            expiry=float("inf"),
+            nonce="restrictive-ceil",
+        ),
+    )
+    broker.register_task(restrictive_task)
+
+    broker.grant_root(
+        _capability(USER, USER, "write", "file:///reports",
+                    frozenset({"file:///reports"}), 100, "r-write")
+    )
+    broker.attenuate("r-write", AGENT, "write", "file:///reports",
+                     frozenset({"file:///reports"}), 100)
+
+    effect = Effect(
+        etype="write",
+        target="file:///reports",
+        metadata={},
+        provenance=(Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        capability_nonce="r-write:Agent",
+        delegation_chain=CHAIN,
+        known_targets=EffectTarget(
+            primary="file:///reports",
+            additional=frozenset({"file:///../../etc/password"}),
+        ),
+    )
+    allow, evidence = broker.commit(
+        broker._make_commit(effect, task_id="t-restrict")
+    )
+    assert not allow
+    assert evidence["primary_blocker"] in ("Auth", "NoAmp")
+
+
+def test_normal_path_legitimate_write_allowed(broker: EffectBroker) -> None:
+    """Legitimate path (no traversal) within authorized scope is allowed."""
+    broker.grant_root(
+        _capability(USER, USER, "write", "file:///reports",
+                    frozenset({"file:///reports"}), 100, "r-write")
+    )
+    broker.attenuate("r-write", AGENT, "write", "file:///reports",
+                     frozenset({"file:///reports"}), 100)
+
+    effect = Effect(
+        "write",
+        "file:///reports",
+        {},
+        (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        "r-write:Agent",
+        CHAIN,
+    )
+    allow, evidence = broker.commit_effect(effect)
+    assert allow
+    assert evidence["primary_blocker"] is None
+    assert len(broker.store.effects_log) == 1
 
 
 # ---- T6: validated declass on explicit User policy is allowed ----
