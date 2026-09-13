@@ -16,7 +16,7 @@ from __future__ import annotations
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from effect_broker.model import Capability, Data, Effect, Task
+from effect_broker.model import Capability, Commit, Data, Effect, Task
 from effect_broker.traces import build
 
 
@@ -209,9 +209,6 @@ class TestConcurrentReplayPrevention:
         assert "replay" in ev2["predicates"]["Fresh"]
 
 
-class TestContentHashDeterminism:
-    """Content hash must be stable regardless of provenance tuple order."""
-
     def test_provenance_order_does_not_affect_hash(self) -> None:
         """Two effects with same provenance elements in different order
         produce the SAME content_hash after sorting."""
@@ -296,4 +293,275 @@ class TestContentHashDeterminism:
 
         assert stored.content_hash != stored2.content_hash, (
             "Modified content should produce a different hash"
+        )
+
+
+class TestConcurrentCrossTask:
+    """Cross-task concurrent commit behavior.
+
+    Fresh is per-task: task-A and task-B have separate sessions, so the same
+    nonce can be used in both tasks sequentially without replay detection
+    within the tasks themselves. However, approval bindings (if used) catch
+    cross-task use — an approval is scoped to a specific task_id.
+
+    Key behaviors tested:
+      - Same capability nonce in different tasks: Fresh allows both (separate
+        per-task sessions). This is intentional — capabilities are task-scoped
+        via task_id on the Capability, not enforced by Fresh.
+      - Approval nonce in wrong task: ApprovalBinding blocks (task_id mismatch).
+      - Concurrent commits in different tasks with different nonces: both succeed.
+      - Concurrent commits in SAME task with different nonces: both succeed
+        (no serialization — only same-nonce same-task is serialized).
+      - Concurrent commits in SAME task with same nonce: exactly 1 succeeds
+        (atomic Fresh check, proven in TestConcurrentReplayPrevention).
+    """
+
+    def test_same_cap_nonce_different_tasks_both_succeed(self) -> None:
+        """Same capability nonce in two different tasks: both allow (separate sessions).
+
+        Capabilities are task-scoped via task_id field, not enforced by Fresh.
+        The Fresh check uses task.session.used, which is per-task. So the same
+        nonce is tracked separately in each task's session. This is intentional:
+        a capability can be used in task-A and task-B independently. If tighter
+        cross-task tracking is needed, use task_id on the Capability.
+        """
+        broker = build()
+        t1 = _make_task("t1")
+        t2 = _make_task("t2")
+        broker.register_task(t1)
+        broker.register_task(t2)
+
+        # Same nonce in both tasks
+        nonce = f"shared-cap"
+        for task in (t1, t2):
+            cap = Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"internal"}),
+                expiry=float("inf"),
+                nonce=nonce,
+                derives_from=None,
+            )
+            broker.capabilities[nonce] = cap
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce=nonce,
+            delegation_chain=(),
+        )
+
+        allow1, ev1 = broker.commit(broker._make_commit(effect, task_id="t1"))
+        assert allow1 is True, f"Task 1 should ALLOW: {ev1}"
+
+        allow2, ev2 = broker.commit(broker._make_commit(effect, task_id="t2"))
+        assert allow2 is True, f"Task 2 (same nonce, different task) should ALLOW: {ev2}"
+
+        # Each session tracks the nonce independently
+        assert nonce in t1.session.used
+        assert nonce in t2.session.used
+        assert len(t1.session.used) == 1
+        assert len(t2.session.used) == 1
+
+    def test_same_approval_nonce_cross_task_blocked_by_approval_binding(self) -> None:
+        """Same approval nonce used in wrong task: blocked by ApprovalBinding.
+
+        Approvals are one-shot and task-scoped. Using an approval in a different
+        task than the one it was granted for is blocked by the approval binding
+        check in gate().
+        """
+        broker = build()
+        t1 = _make_task("t1")
+        t2 = _make_task("t2")
+        broker.register_task(t1)
+        broker.register_task(t2)
+
+        # Grant approval in task 1
+        cap = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="approval-cap-t1",
+            task_id="t1",
+            derives_from=None,
+        )
+        broker.capabilities["approval-cap-t1"] = cap
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce="approval-cap-t1",
+            delegation_chain=(),
+        )
+        approval_nonce = broker.grant_approval(effect, expiry=100.0, task_id="t1")
+        stored = broker._approved_requests[approval_nonce]
+
+        # Commit in task 1: succeeds
+        e1 = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce=approval_nonce,
+            delegation_chain=(),
+        )
+        allow1, ev1 = broker.commit(Commit(e1, t1, approved_request=stored))
+        assert allow1 is True, f"Task 1 should ALLOW: {ev1}"
+
+        # Same approval nonce in task 2: blocked by ApprovalBinding
+        e2 = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce=approval_nonce,
+            delegation_chain=(),
+        )
+        allow2, ev2 = broker.commit(Commit(e2, t2, approved_request=stored))
+        assert allow2 is False
+        assert ev2["primary_blocker"] == "ApprovalBinding"
+        assert "cross-task" in ev2["approval_binding"]
+
+    def test_concurrent_different_nonces_different_tasks_all_succeed(self) -> None:
+        """Concurrent commits in different tasks with different nonces: all succeed.
+
+        Per-task locks mean same-nonce-same-task commits are serialized.
+        But different-nonce-different-task commits are fully parallel — no lock.
+        This test verifies that under concurrent load, all succeed.
+        """
+        broker = build()
+        results: list[tuple[int, bool, str | None]] = []
+        barrier = threading.Barrier(10)
+
+        def commit_in_task(task_num: int) -> None:
+            barrier.wait()
+            task = _make_task(f"ct-task-{task_num}")
+            broker.register_task(task)
+            nonce = _grant(broker, task)
+            effect = Effect(
+                etype="send",
+                target="internal@corp.com",
+                metadata={},
+                provenance=_provenance(f"ct-task-{task_num}"),
+                capability_nonce=nonce,
+                delegation_chain=(),
+            )
+            commit = broker._make_commit(effect, task_id=f"ct-task-{task_num}")
+            allow, evidence = broker.commit(commit)
+            results.append((task_num, allow, evidence.get("primary_blocker")))
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(commit_in_task, i) for i in range(10)]
+            for f in as_completed(futures):
+                f.result()
+
+        allow_count = sum(1 for _, allow, _ in results if allow)
+        assert allow_count == 10, (
+            f"Expected 10 ALLOWs (all different nonces, different tasks), "
+            f"got {allow_count}. Results: {results}"
+        )
+
+    def test_concurrent_same_nonce_same_task_only_one_succeeds(self) -> None:
+        """Concurrent commits in same task with same nonce: exactly 1 succeeds.
+
+        Verifies that the per-task lock correctly serializes same-nonce commits
+        within a task even under high concurrency. This is the cross-task mirror
+        of TestConcurrentReplayPrevention.test_concurrent_same_nonce_only_one_succeeds.
+        """
+        broker = build()
+        task = _make_task("singleton-task")
+        broker.register_task(task)
+        nonce = _grant(broker, task)
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("singleton-msg"),
+            capability_nonce=nonce,
+            delegation_chain=(),
+        )
+
+        results: list[tuple[int, bool, str | None]] = []
+        barrier = threading.Barrier(5)
+
+        def commit_same_nonce(thread_num: int) -> None:
+            barrier.wait()
+            commit = broker._make_commit(effect, task_id="singleton-task")
+            allow, evidence = broker.commit(commit)
+            results.append((thread_num, allow, evidence.get("primary_blocker")))
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(commit_same_nonce, i) for i in range(5)]
+            for f in as_completed(futures):
+                f.result()
+
+        allow_count = sum(1 for _, allow, _ in results if allow)
+        assert allow_count == 1, (
+            f"Expected exactly 1 ALLOW (same task, same nonce), got {allow_count}. "
+            f"Results: {results}"
+        )
+        fresh_blocked = sum(1 for _, allow, b in results if not allow and b == "Fresh")
+        assert fresh_blocked == 4, f"Expected 4 Fresh blocks, got {fresh_blocked}"
+
+    def test_concurrent_same_nonce_different_tasks_both_succeed(self) -> None:
+        """Concurrent commits in different tasks with same nonce: all succeed.
+
+        Fresh is per-task (separate session.used sets), so same nonce in
+        different tasks is NOT a replay within either task. This is the
+        concurrent version of test_same_cap_nonce_different_tasks_both_succeed.
+        """
+        broker = build()
+        results: list[tuple[int, bool, str | None]] = []
+        barrier = threading.Barrier(4)
+
+        def commit_in_task(task_num: int) -> None:
+            barrier.wait()
+            task = _make_task(f"ct-different-{task_num}")
+            broker.register_task(task)
+            # All threads share the same nonce but use different tasks.
+            # Per-task locks serialize within each task; different tasks are
+            # fully parallel. With 4 tasks, we expect 4 ALLOWs.
+            cap = Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"internal"}),
+                expiry=float("inf"),
+                nonce="shared-cross-task-nonce",
+                derives_from=None,
+            )
+            broker.capabilities["shared-cross-task-nonce"] = cap
+            effect = Effect(
+                etype="send",
+                target="internal@corp.com",
+                metadata={},
+                provenance=_provenance(f"ct-different-{task_num}"),
+                capability_nonce="shared-cross-task-nonce",
+                delegation_chain=(),
+            )
+            commit = broker._make_commit(effect, task_id=f"ct-different-{task_num}")
+            allow, evidence = broker.commit(commit)
+            results.append((task_num, allow, evidence.get("primary_blocker")))
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(commit_in_task, i) for i in range(4)]
+            for f in as_completed(futures):
+                f.result()
+
+        # 4 different tasks, same nonce → all 4 succeed (Fresh is per-task)
+        allow_count = sum(1 for _, allow, _ in results if allow)
+        assert allow_count == 4, (
+            f"Expected 4 ALLOWs (4 different tasks, same nonce), got {allow_count}. "
+            f"Results: {results}"
         )
