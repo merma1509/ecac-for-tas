@@ -20,10 +20,7 @@ from effect_broker.model import (
     Data,
     Domain,
     Effect,
-    Email,
-    File,
     LabelException,
-    Mailbox,
 )
 from effect_broker.traces import build
 
@@ -46,15 +43,17 @@ def _capability(
 @pytest.fixture
 def broker() -> Iterator[EffectBroker]:
     broker_instance = EffectBroker()
-    # external resources: R = F ∪ E ∪ M
-    broker_instance.store.files["file:///reports"] = File(
+    # external resources: R = F ∪ E ∪ M — bootstrap via restricted store API
+    broker_instance.store._unsafe_bootstrap_file(
         "file:///reports", Confidentiality.INTERNAL
     )
-    broker_instance.store.files["file:///secrets"] = File(
+    broker_instance.store._unsafe_bootstrap_file(
         "file:///secrets", Confidentiality.CONFIDENTIAL
     )
-    broker_instance.store.emails["internal@corp.com"] = Email("internal@corp.com", Domain.INTERNAL)
-    broker_instance.store.mailboxes["alice"] = Mailbox("alice")
+    broker_instance.store._unsafe_bootstrap_email(
+        "internal@corp.com", Domain.INTERNAL
+    )
+    broker_instance.store._unsafe_bootstrap_mailbox("alice")
     broker_instance.grant_root(
         _capability(USER, USER, "send", "internal@corp.com", frozenset({"internal"}), 100, "r-send")
     )
@@ -524,8 +523,8 @@ def test_sender_provenance_different_from_owner() -> None:
     # (e.g. a sensitive executive message). bob's mailbox owner is "bob" (low)
     # The send provenance (sender account = alice@corp.com) drives FlowOK
     # Use alice's address as the target (sender = bob, so sender != owner)
-    broker.store.emails["bob@corp.com"] = Email("bob@corp.com", Domain.INTERNAL)
-    broker.store.emails["alice@corp.com"] = Email("alice@corp.com", Domain.INTERNAL)
+    broker.store._unsafe_bootstrap_email("bob@corp.com", Domain.INTERNAL)
+    broker.store._unsafe_bootstrap_email("alice@corp.com", Domain.INTERNAL)
     # grant a send capability for bob@corp.com
     broker.grant_root(
         _capability(USER, USER, "send", "bob@corp.com", frozenset({"internal"}), 100, "r-send-bob")

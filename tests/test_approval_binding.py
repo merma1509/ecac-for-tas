@@ -1,11 +1,14 @@
-"""Regression: Approval binding — nonce bound to exact (right, target)
+"""Regression: Approval binding — exact immutable request binding.
 
-These tests verify that an approval grants a capability scoped to a SPECIFIC
-(right, target) pair, not a class of effects. Reusing the same approval nonce
-for a different target is blocked as a replay (Fresh) or as Auth failure
-(target mismatch).
+Tests verify that an approval grants a capability scoped to a SPECIFIC
+(right, target, content, task_id) tuple, not a class of effects.
 
-This is the "Approval-binding regression" requirement.
+Two binding mechanisms:
+  1. Fresh: approval nonce is one-shot — second use is replay-blocked
+     (the original path, always active regardless of approved_request)
+  2. Exact immutable binding: Commit.approved_request must exactly match
+     the stored ApprovedRequest — etype, targets, content_hash, task_id
+     (the new path, active only when Commit.approved_request is set)
 
 Kill-criterion #5: "exact immutable request binding."
 The approval nonce is a one-shot token: it can only authorize the effect
@@ -15,13 +18,27 @@ it was granted for. Any deviation is blocked.
 from __future__ import annotations
 
 from effect_broker.lattice import Confidentiality, Integrity
-from effect_broker.model import Capability, Data, Effect, Task
+from effect_broker.model import (
+    APPROVER,
+    BROKER,
+    USER,
+    ApprovedRequest,
+    Capability,
+    Commit,
+    Data,
+    Effect,
+    EffectTarget,
+    Task,
+)
 from effect_broker.traces import build
 
 
-def _provenance(name: str) -> tuple[Data, ...]:
-    """Create a minimal provenance tuple for test effects."""
-    return (Data(name, Confidentiality.INTERNAL, Integrity.USER),)
+def _provenance(name: str, content: str = "") -> tuple[Data, ...]:
+    """Create a provenance tuple for test effects.
+
+    The `content` parameter is included in the hash for immutable request binding.
+    """
+    return (Data(name, Confidentiality.INTERNAL, Integrity.USER, content=content),)
 
 
 def _make_task(task_id: str = "default") -> Task:
@@ -32,7 +49,7 @@ def _make_task(task_id: str = "default") -> Task:
         target="*",
         scope=frozenset({"*"}),
         expiry=float("inf"),
-        nonce="ceiling-default",
+        nonce=f"ceiling-{task_id}",
     )
     return Task(task_id=task_id, owner="User", ceiling=ceiling)
 
@@ -260,6 +277,353 @@ class TestApprovalReplayBlocks:
         cap = broker.capabilities[nonce]
         assert cap.right == "send"
         assert cap.target == "internal@corp.com"
+
+
+class TestApprovalExactBinding:
+    """Exact immutable request matching via Commit.approved_request.
+
+    Kill-criterion #5: approved_request on Commit must exactly match the stored
+    ApprovedRequest — etype, targets, content_hash, task_id.
+    Any deviation is blocked as ApprovalBinding.
+    """
+
+    def test_approval_blocks_on_content_modification_after_approval(self) -> None:
+        """Modified provenance content after approval → ApprovalBinding blocks."""
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+
+        original_provenance = _provenance("msg", content="original message body")
+        request_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=original_provenance,
+            capability_nonce="r-send:Agent:EffectBroker",
+            delegation_chain=("Approver",),
+        )
+        nonce = broker.grant_approval(request_effect, expiry=100.0, task_id="default")
+        stored_approved = broker._approved_requests.get(nonce)
+        assert stored_approved is not None
+
+        # Modified content: same name but different body
+        modified_provenance = _provenance("msg", content="attacker modified body")
+        modified_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=modified_provenance,
+            capability_nonce=nonce,
+            delegation_chain=("Approver",),
+        )
+        commit = Commit(effect=modified_effect, task=task, approved_request=stored_approved)
+        allow, evidence = broker.commit(commit)
+
+        assert allow is False, "Modified content after approval should BLOCK"
+        assert evidence["primary_blocker"] == "ApprovalBinding"
+        assert "content-modified-after-approval" in evidence["approval_binding"]
+        assert len(broker.store.effects_log) == 0
+
+    def test_approval_blocks_on_extra_bcc_not_in_approved_targets(self) -> None:
+        """BCC to unapproved recipient → ApprovalBinding blocks (or NoAmp)."""
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+
+        request_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("request"),
+            capability_nonce="r-send:Agent:EffectBroker",
+            delegation_chain=("Approver",),
+        )
+        nonce = broker.grant_approval(request_effect, expiry=100.0, task_id="default")
+        stored_approved = broker._approved_requests.get(nonce)
+        assert stored_approved is not None
+
+        extra_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={"extra_resources": ["attacker@external.com"]},
+            provenance=_provenance("request"),
+            capability_nonce=nonce,
+            delegation_chain=("Approver",),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset({"attacker@external.com"}),
+            ),
+        )
+        commit = Commit(effect=extra_effect, task=task, approved_request=stored_approved)
+        allow, evidence = broker.commit(commit)
+
+        assert allow is False, "Extra BCC target not in approved set should BLOCK"
+        assert evidence["primary_blocker"] in ("NoAmp", "ApprovalBinding")
+
+    def test_approval_blocks_on_cross_task_use(self) -> None:
+        """Same approval nonce used in different task → ApprovalBinding blocks."""
+        broker = build()
+        task_a = _make_task("task-a")
+        task_b = _make_task("task-b")
+        broker.register_task(task_a)
+        broker.register_task(task_b)
+
+        request_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("task-a-request"),
+            capability_nonce="r-send:Agent:EffectBroker",
+            delegation_chain=("Approver",),
+        )
+        nonce = broker.grant_approval(request_effect, expiry=100.0, task_id="task-a")
+        stored_approved = broker._approved_requests.get(nonce)
+
+        cross_task_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("task-a-request"),
+            capability_nonce=nonce,
+            delegation_chain=("Approver",),
+        )
+        commit = Commit(effect=cross_task_effect, task=task_b, approved_request=stored_approved)
+        allow, evidence = broker.commit(commit)
+
+        assert allow is False, "Cross-task use of approval should BLOCK"
+        assert evidence["primary_blocker"] == "ApprovalBinding"
+        assert "cross-task-use" in evidence["approval_binding"]
+
+    def test_approval_content_hash_includes_data_content_field(self) -> None:
+        """Content hash includes Data.content, not just names."""
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+
+        original_provenance = _provenance("msg", content="original message body")
+        request_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=original_provenance,
+            capability_nonce="r-send:Agent:EffectBroker",
+            delegation_chain=("Approver",),
+        )
+        nonce = broker.grant_approval(request_effect, expiry=100.0, task_id="default")
+        stored_approved = broker._approved_requests.get(nonce)
+
+        import hashlib
+        expected_hash = hashlib.sha256(
+            b"msg:INTERNAL:USER:original message body"
+        ).hexdigest()[:16]
+        assert stored_approved.content_hash == expected_hash
+
+        modified_provenance = _provenance("msg", content="ATTACKER INJECTED MESSAGE")
+        modified_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=modified_provenance,
+            capability_nonce=nonce,
+            delegation_chain=("Approver",),
+        )
+        commit = Commit(effect=modified_effect, task=task, approved_request=stored_approved)
+        allow, evidence = broker.commit(commit)
+
+        assert allow is False
+        assert evidence["primary_blocker"] == "ApprovalBinding"
+        assert "content-modified-after-approval" in evidence["approval_binding"]
+
+    def test_approval_allows_with_exact_binding_match(self) -> None:
+        """Exact match: etype + target + content_hash + task_id → ALLOW."""
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+
+        original_provenance = _provenance("approved-content")
+        request_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=original_provenance,
+            capability_nonce="r-send:Agent:EffectBroker",
+            delegation_chain=("Approver",),
+        )
+        nonce = broker.grant_approval(request_effect, expiry=100.0, task_id="default")
+        stored_approved = broker._approved_requests.get(nonce)
+
+        exact_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=original_provenance,
+            capability_nonce=nonce,
+            delegation_chain=("Approver",),
+        )
+        commit = Commit(effect=exact_effect, task=task, approved_request=stored_approved)
+        allow, evidence = broker.commit(commit)
+
+        assert allow is True, f"Exact binding match should ALLOW. Evidence: {evidence}"
+        assert evidence["primary_blocker"] is None
+        assert evidence["approval_binding"] == ""
+        assert len(broker.store.effects_log) == 1
+
+    def test_approval_blocks_on_forged_approval_nonce(self) -> None:
+        """Forged nonce (not in _approved_requests) → ApprovalBinding blocks."""
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+
+        # Initialize _approved_requests
+        broker.grant_approval(
+            Effect("send", "internal@corp.com", {}, _provenance("dummy"), "dummy-cap", ()),
+            expiry=100.0,
+            task_id="default",
+        )
+
+        broker.capabilities["forged-approval-nonce"] = Capability(
+            owner=USER,
+            holder=BROKER,
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="forged-approval-nonce",
+            derives_from=None,
+        )
+
+        fake_approved = ApprovedRequest(
+            nonce="forged-approval-nonce",
+            etype="send",
+            targets=EffectTarget(primary="internal@corp.com", additional=frozenset()),
+            content_hash="fakehash123456",
+            expiry=100.0,
+            task_id="default",
+            granted_by=APPROVER,
+        )
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("forged"),
+            capability_nonce="forged-approval-nonce",
+            delegation_chain=("Approver",),
+        )
+        commit = Commit(effect=effect, task=task, approved_request=fake_approved)
+        allow, evidence = broker.commit(commit)
+
+        assert allow is False
+        assert evidence["primary_blocker"] == "ApprovalBinding"
+        assert "approval-nonce-unknown" in evidence["approval_binding"]
+
+    def test_approval_without_binding_field_passes_predicates_only(self) -> None:
+        """Commit without approved_request: predicates run, no binding check."""
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+
+        broker.capabilities["regular-cap"] = Capability(
+            owner=USER,
+            holder=BROKER,
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="regular-cap",
+            derives_from=None,
+        )
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("regular"),
+            capability_nonce="regular-cap",
+            delegation_chain=(USER,),
+        )
+        commit = broker._make_commit(effect, task_id="default")
+        assert commit.approved_request is None
+
+        allow, evidence = broker.commit(commit)
+        assert allow is True
+        assert evidence["primary_blocker"] is None
+        assert evidence["approval_binding"] is None
+
+
+class TestApprovalBCCScope:
+    """BCC within capability scope → ALLOW. BCC outside scope → BLOCK."""
+
+    def test_bcc_to_another_internal_recipient_is_allowed(self) -> None:
+        """BCC to another internal recipient (in scope) → ALLOW."""
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+
+        broker.capabilities["internal-send-cap"] = Capability(
+            owner=USER,
+            holder=BROKER,
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="internal-send-cap",
+            derives_from=None,
+        )
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("to-team"),
+            capability_nonce="internal-send-cap",
+            delegation_chain=(USER,),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset({"another-internal@corp.com"}),
+            ),
+        )
+        commit = Commit(effect=effect, task=task, approved_request=None)
+        allow, evidence = broker.commit(commit)
+        assert allow is True, (
+            f"BCC to another internal (in scope) should ALLOW. Evidence: {evidence}"
+        )
+        assert evidence["primary_blocker"] is None
+
+    def test_bcc_to_external_recipient_outside_scope_is_blocked(self) -> None:
+        """BCC to external recipient (outside scope) → NoAmp blocks."""
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+
+        broker.capabilities["internal-send-cap"] = Capability(
+            owner=USER,
+            holder=BROKER,
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="internal-send-cap",
+            derives_from=None,
+        )
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={"extra_resources": ["external@attacker.com"]},
+            provenance=_provenance("attacker-bcc"),
+            capability_nonce="internal-send-cap",
+            delegation_chain=(USER,),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset({"external@attacker.com"}),
+            ),
+        )
+        commit = Commit(effect=effect, task=task, approved_request=None)
+        allow, evidence = broker.commit(commit)
+
+        assert allow is False, f"BCC to external (outside scope) should BLOCK. Evidence: {evidence}"
+        assert evidence["primary_blocker"] in ("NoAmp", "Auth", "ApprovalBinding")
 
 
 class TestApprovalGlobalRevocation:

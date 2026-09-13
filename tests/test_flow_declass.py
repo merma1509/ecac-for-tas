@@ -103,11 +103,11 @@ class TestFlowDeclassRegression:
 
         declass = LabelException(
             kind="declass",
-            nonce="declass-secrets",
             match_target="file:///secrets",
             from_label=Confidentiality.CONFIDENTIAL.name,
             to_label=Confidentiality.INTERNAL.name,
             granted_by="User",
+            nonce="declass-secrets",
         )
         broker.grant_label_exception(declass)
 
@@ -133,8 +133,8 @@ class TestFlowDeclassRegression:
         # LLM builds a request but broker does NOT record it
         declass_request = LabelException(
             kind="declass",
-            nonce="declass-unrecorded",
             match_target="file:///secrets",
+            nonce="declass-unrecorded",
             from_label=Confidentiality.CONFIDENTIAL.name,
             to_label=Confidentiality.INTERNAL.name,
             granted_by="User",
@@ -157,8 +157,8 @@ class TestFlowDeclassRegression:
         broker = build()
         declass = LabelException(
             kind="declass",
-            nonce="unique-declass",
             match_target="*",
+            nonce="unique-declass",
             from_label=Confidentiality.CONFIDENTIAL.name,
             to_label=Confidentiality.INTERNAL.name,
             granted_by="User",
@@ -196,8 +196,8 @@ class TestFlowEndorseRegression:
 
         endorse = LabelException(
             kind="endorse",
-            nonce="endorse-web",
             match_target="*",
+            nonce="endorse-web",
             from_label=Integrity.UNTRUSTED.name,
             to_label=Integrity.USER.name,
             granted_by="User",
@@ -225,8 +225,8 @@ class TestFlowEndorseRegression:
 
         declass = LabelException(
             kind="declass",
-            nonce="declass-both",
             match_target="internal@corp.com",
+            nonce="declass-both",
             from_label=Confidentiality.CONFIDENTIAL.name,
             to_label=Confidentiality.INTERNAL.name,
             granted_by="User",
@@ -245,6 +245,186 @@ class TestFlowEndorseRegression:
 
         assert allow is False, "Declass alone does not cover integrity violation"
         assert "low-integrity" in evidence["predicates"]["FlowOK"]
+
+
+class TestFlowDeclassExactIdentity:
+    """Declass/endorse grants use exact effect identity matching.
+
+    A grant for (target=A) does NOT authorize (target=A, BCC=B) unless
+    additional_targets explicitly includes B. A grant for send does NOT
+    authorize write unless etype matches.
+    """
+
+    def test_declass_for_primary_only_does_not_cover_bcc(self) -> None:
+        """Grant for 'send to internal' does NOT cover 'send to internal + BCC external'."""
+        broker = build()
+        nonce, task = _grant_for(broker, "send", "internal@corp.com")
+
+        # Grant for PRIMARY target only (no additional_targets)
+        declass = LabelException(
+            kind="declass",
+            match_target="internal@corp.com",
+            from_label=Confidentiality.CONFIDENTIAL.name,
+            to_label=Confidentiality.INTERNAL.name,
+            granted_by="User",
+            nonce="declass-primary-only",
+        )
+        broker.grant_label_exception(declass)
+
+        # Effect with BCC to external domain — NOT covered by grant
+        effect = _effect(
+            etype="send",
+            target="internal@corp.com",
+            nonce=nonce,
+            provenance=(
+                Data("secret", Confidentiality.CONFIDENTIAL, Integrity.USER),
+            ),
+            label_exceptions=(declass,),
+        )
+        # Simulate BCC via known_targets
+        from effect_broker.model import EffectTarget
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=(Data("secret", Confidentiality.CONFIDENTIAL, Integrity.USER),),
+            capability_nonce=nonce,
+            delegation_chain=(),
+            label_exceptions=(declass,),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset({"external@attacker.com"}),
+            ),
+        )
+        commit = Commit(effect, task)
+        allow, evidence = broker.commit(commit)
+
+        # Should BLOCK: grant covers only primary, NOT the extra BCC target
+        assert allow is False
+        assert evidence["primary_blocker"] == "FlowOK"
+        assert "conf-leak" in evidence["predicates"]["FlowOK"]
+
+    def test_declass_for_target_plus_bcc_covers_bcc(self) -> None:
+        """Grant with additional_targets explicitly includes BCC → covers FlowOK.
+
+        Uses an INTERNAL domain BCC so NoAmp passes (capability scope = internal).
+        """
+        broker = build()
+        nonce, task = _grant_for(broker, "send", "internal@corp.com")
+
+        # Grant for primary + the BCC recipient (same internal domain → passes NoAmp)
+        declass = LabelException(
+            kind="declass",
+            match_target="internal@corp.com",
+            additional_targets=frozenset({"team@internal.corp.com"}),
+            from_label=Confidentiality.CONFIDENTIAL.name,
+            to_label=Confidentiality.INTERNAL.name,
+            granted_by="User",
+            nonce="declass-with-bcc",
+        )
+        broker.grant_label_exception(declass)
+
+        from effect_broker.model import EffectTarget
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=(Data("secret", Confidentiality.CONFIDENTIAL, Integrity.USER),),
+            capability_nonce=nonce,
+            delegation_chain=(),
+            label_exceptions=(declass,),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset({"team@internal.corp.com"}),
+            ),
+        )
+        commit = Commit(effect, task)
+        allow, evidence = broker.commit(commit)
+
+        # Should ALLOW: additional_targets explicitly includes BCC,
+        # BCC is same domain (passes NoAmp), FlowOK covered by grant
+        assert allow is True, (
+            f"Grant with additional_targets should ALLOW. Evidence: {evidence}"
+        )
+
+    def test_declass_with_etype_matching(self) -> None:
+        """Grant with etype='send' does NOT cover etype='write'."""
+        broker = build()
+        nonce_write, task_write = _grant_for(broker, "write", "file:///logs")
+        nonce_send, task_send = _grant_for(broker, "send", "internal@corp.com")
+
+        # Grant for CONFIDENTIAL data in SENDING only
+        declass = LabelException(
+            kind="declass",
+            match_target="*",
+            etype="send",  # Only applies to send effects
+            from_label=Confidentiality.CONFIDENTIAL.name,
+            to_label=Confidentiality.INTERNAL.name,
+            granted_by="User",
+            nonce="declass-send-only",
+        )
+        broker.grant_label_exception(declass)
+
+        # Try to write CONFIDENTIAL data to a file (should BLOCK)
+        write_effect = _effect(
+            etype="write",
+            target="file:///logs",
+            nonce=nonce_write,
+            provenance=(Data("secret", Confidentiality.CONFIDENTIAL, Integrity.USER),),
+            label_exceptions=(declass,),
+        )
+        allow_write, ev_write = broker.commit(Commit(write_effect, task_write))
+        assert allow_write is False, "Declass with etype='send' should NOT cover write"
+        assert ev_write["primary_blocker"] == "FlowOK"
+
+        # Send CONFIDENTIAL data (should ALLOW — etype matches)
+        send_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=(Data("secret", Confidentiality.CONFIDENTIAL, Integrity.USER),),
+            capability_nonce=nonce_send,
+            delegation_chain=(),
+            label_exceptions=(declass,),
+        )
+        allow_send, ev_send = broker.commit(Commit(send_effect, task_send))
+        assert allow_send is True, (
+            f"Declass with etype='send' should cover send. Evidence: {ev_send}"
+        )
+
+    def test_matches_effect_wildcard_target(self) -> None:
+        """match_target='*' matches any effect's complete_targets()."""
+        from effect_broker.model import EffectTarget
+
+        grant = LabelException(
+            kind="declass",
+            match_target="*",
+            from_label=Confidentiality.CONFIDENTIAL.name,
+            to_label=Confidentiality.INTERNAL.name,
+            granted_by="User",
+            nonce="any-target",
+        )
+
+        # Simple target
+        e1 = _effect("send", "internal@corp.com", "any", ())
+        assert grant.matches_effect(e1)
+
+        # With additional BCC
+        e2 = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=(),
+            capability_nonce="any",
+            delegation_chain=(),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset({"bcc@corp.com"}),
+            ),
+        )
+        assert grant.matches_effect(e2)
 
 
 class TestFlowBoundaryTaskScoped:

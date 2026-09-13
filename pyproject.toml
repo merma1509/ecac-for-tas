@@ -26,7 +26,7 @@ packages = ["effect_broker"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -W ignore::UserWarning"
 
 [tool.mypy]
 python_version = "3.11"
