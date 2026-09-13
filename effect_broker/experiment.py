@@ -17,6 +17,7 @@ Real adversarial tool workload — M1–M5 + H1–H3"""
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 
 from .broker import EffectBroker
@@ -520,3 +521,22 @@ def print_results(results: dict[str, ExperimentResult]) -> None:
             f"{'complete' if r.mediation_complete else 'INCOMPLETE':<12} "
             f"{status}"
         )
+    sys.stdout.flush()  # ensure output is visible in make/non-interactive contexts
+
+
+# ---- CLI entry point ----
+# Allows: $ python -m effect_broker.experiment
+def _main() -> None:
+    """CLI entry point. Run all experiments and exit with appropriate code."""
+    import warnings
+
+    warnings.filterwarnings("ignore", message="SAME-PROCESS", category=UserWarning)
+    results = run_all_experiments()
+    print_results(results)
+    sys.stdout.flush()
+    all_passed = all(r.mediation_complete for r in results.values())
+    sys.exit(0 if all_passed else 1)
+
+
+if __name__ == "__main__":
+    _main()
