@@ -25,7 +25,9 @@ from __future__ import annotations
 from collections.abc import Callable  # noqa: UP035  # used in type annotations
 
 from .broker import EffectBroker
+from .ipc import LocalLedgerBackend  # noqa: F401  # used as broker argument
 from .lattice import Confidentiality, Integrity
+from .ledger import IndependentEffectLedger
 from .mediation import Mediator, ToolSpec
 from .model import (
     AGENT,
@@ -36,11 +38,13 @@ from .model import (
     Data,
     Domain,
     Effect,
-    Email,
-    File,
     LabelException,
-    Mailbox,
 )
+
+
+def _mk(name: str, conf: Confidentiality, integ: Integrity, content: str = "") -> Data:
+    return Data(name, conf, integ, content=content)
+
 
 # Delegation chain: User (root) delegates to Agent, which delegates to Broker
 CHAIN = (USER, AGENT, BROKER)
@@ -60,16 +64,19 @@ def _capability(
 
 
 def build() -> EffectBroker:
-    broker = EffectBroker()
+    # Create an EXTERNAL independent ledger — the single source of truth
+    # This ledger is passed to the broker. Both broker.commit() (direct) and
+    # executor.execute() (via-shim) record to this same ledger
+    ledger = IndependentEffectLedger()
+    broker = EffectBroker(ledger=ledger)
 
     # ---- external resources: R = F ∪ E ∪ M (files, emails, mailboxes) ----
-    broker.store.files["file:///reports"] = File("file:///reports", Confidentiality.INTERNAL)
-    broker.store.files["file:///secrets"] = File("file:///secrets", Confidentiality.CONFIDENTIAL)
-    broker.store.files["file:///trusted"] = File("file:///trusted", Confidentiality.INTERNAL)
-    broker.store.files["file:///reports"] = File("file:///reports", Confidentiality.INTERNAL)
-    broker.store.emails["internal@corp.com"] = Email("internal@corp.com", Domain.INTERNAL)
-    broker.store.emails["external@elsewhere.com"] = Email("external@elsewhere.com", Domain.EXTERNAL)
-    broker.store.mailboxes["alice"] = Mailbox("alice")
+    broker.store._unsafe_bootstrap_file("file:///reports", Confidentiality.INTERNAL)
+    broker.store._unsafe_bootstrap_file("file:///secrets", Confidentiality.CONFIDENTIAL)
+    broker.store._unsafe_bootstrap_file("file:///trusted", Confidentiality.INTERNAL)
+    broker.store._unsafe_bootstrap_email("internal@corp.com", Domain.INTERNAL)
+    broker.store._unsafe_bootstrap_email("external@elsewhere.com", Domain.EXTERNAL)
+    broker.store._unsafe_bootstrap_mailbox("alice")
 
     # ---- root grants (User is the sole trusted root) ----
     broker.grant_root(
@@ -278,7 +285,7 @@ def _clean_effect() -> Effect:
         "send",
         "internal@corp.com",
         {},
-        (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        (_mk("user_query", Confidentiality.INTERNAL, Integrity.USER),),
         "r-send:Agent:EffectBroker",
         CHAIN,
     )
@@ -327,7 +334,7 @@ def run_boundary_experiment() -> EffectBroker:
         "write",
         "file:///secrets",
         {},
-        (Data("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
+        (_mk("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
         "r-write-secrets",
         CHAIN,
     )
@@ -363,7 +370,7 @@ def run_boundary_experiment() -> EffectBroker:
         "read",
         "file:///trusted",
         {},
-        (Data("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
+        (_mk("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
         "r-read:Agent:EffectBroker",
         CHAIN,
     )
@@ -393,7 +400,7 @@ def run_boundary_experiment() -> EffectBroker:
         "read",
         "file:///trusted",
         {},
-        (Data("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
+        (_mk("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
         "r-read:Agent:EffectBroker",
         CHAIN,
     )
@@ -431,7 +438,7 @@ def run_boundary_experiment() -> EffectBroker:
         "write",
         "file:///reports",
         {},
-        (Data("benign_data", Confidentiality.INTERNAL, Integrity.USER),),
+        (_mk("benign_data", Confidentiality.INTERNAL, Integrity.USER),),
         "r-write-reports",
         CHAIN,
     )
@@ -474,7 +481,7 @@ def run_all() -> EffectBroker:
                 "send",
                 "internal@corp.com",
                 {},
-                (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+                (_mk("user_query", Confidentiality.INTERNAL, Integrity.USER),),
                 "r-send:Agent:EffectBroker",
                 CHAIN,
             ),
@@ -487,7 +494,7 @@ def run_all() -> EffectBroker:
                 "send",
                 "internal@corp.com",
                 {},
-                (Data("web_page", Confidentiality.PUBLIC, Integrity.UNTRUSTED),),
+                (_mk("web_page", Confidentiality.PUBLIC, Integrity.UNTRUSTED),),
                 "r-send:Agent:EffectBroker",
                 CHAIN,
             ),
@@ -500,7 +507,7 @@ def run_all() -> EffectBroker:
                 "delete",
                 "file:///secrets",
                 {},
-                (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+                (_mk("user_query", Confidentiality.INTERNAL, Integrity.USER),),
                 "r-del:Agent:EffectBroker",
                 CHAIN,
             ),
@@ -515,7 +522,7 @@ def run_all() -> EffectBroker:
                 "network",
                 "http://internal-ssrf",
                 {},
-                (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+                (_mk("user_query", Confidentiality.INTERNAL, Integrity.USER),),
                 "forged-net",
                 CHAIN,
             ),
@@ -530,7 +537,7 @@ def run_all() -> EffectBroker:
                 "network",
                 "http://external-attacker.com",
                 {},
-                (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+                (_mk("user_query", Confidentiality.INTERNAL, Integrity.USER),),
                 "r-net-external",
                 CHAIN,
             ),
@@ -544,7 +551,7 @@ def run_all() -> EffectBroker:
                 "send",
                 "internal@corp.com",
                 {},
-                (Data("laundered_file", Confidentiality.INTERNAL, Integrity.UNTRUSTED),),
+                (_mk("laundered_file", Confidentiality.INTERNAL, Integrity.UNTRUSTED),),
                 "r-send2:Agent:EffectBroker",
                 CHAIN,
             ),
@@ -560,7 +567,7 @@ def run_all() -> EffectBroker:
                 "delete",
                 "file:///secrets",
                 {},
-                (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+                (_mk("user_query", Confidentiality.INTERNAL, Integrity.USER),),
                 "r-del:Agent:EffectBroker:wide",
                 CHAIN,
             ),
@@ -573,7 +580,7 @@ def run_all() -> EffectBroker:
                 "send",
                 "internal@corp.com",
                 {},
-                (Data("secret_report", Confidentiality.CONFIDENTIAL, Integrity.USER),),
+                (_mk("secret_report", Confidentiality.CONFIDENTIAL, Integrity.USER),),
                 "r-send:Agent:EffectBroker",
                 CHAIN,
             ),
@@ -586,7 +593,7 @@ def run_all() -> EffectBroker:
                 "write",
                 "file:///reports",
                 {},
-                (Data("web_page", Confidentiality.PUBLIC, Integrity.UNTRUSTED),),
+                (_mk("web_page", Confidentiality.PUBLIC, Integrity.UNTRUSTED),),
                 "r-write:Agent:EffectBroker",
                 CHAIN,
             ),
@@ -599,7 +606,7 @@ def run_all() -> EffectBroker:
                 "send",
                 "internal@corp.com",
                 {},
-                (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+                (_mk("user_query", Confidentiality.INTERNAL, Integrity.USER),),
                 "r-send-short:Agent:EffectBroker",
                 CHAIN,
             ),
@@ -614,7 +621,7 @@ def run_all() -> EffectBroker:
                 "send",
                 "internal@corp.com",
                 {},
-                (Data("secret_report", Confidentiality.CONFIDENTIAL, Integrity.USER),),
+                (_mk("secret_report", Confidentiality.CONFIDENTIAL, Integrity.USER),),
                 "r-send:Agent:EffectBroker",
                 CHAIN,
                 (
@@ -647,7 +654,7 @@ def run_all() -> EffectBroker:
                 "send",
                 "internal@corp.com",
                 {},
-                (Data("secret_report", Confidentiality.CONFIDENTIAL, Integrity.USER),),
+                (_mk("secret_report", Confidentiality.CONFIDENTIAL, Integrity.USER),),
                 "r-send:Agent:EffectBroker",
                 CHAIN,
                 (
@@ -665,7 +672,7 @@ def run_all() -> EffectBroker:
                 "send",
                 "internal@corp.com",
                 {},
-                (Data("web_page", Confidentiality.PUBLIC, Integrity.UNTRUSTED),),
+                (_mk("web_page", Confidentiality.PUBLIC, Integrity.UNTRUSTED),),
                 "r-send:Agent:EffectBroker",
                 CHAIN,
                 (
@@ -686,7 +693,7 @@ def run_all() -> EffectBroker:
                 "write",
                 "file:///secrets",
                 {},
-                (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+                (_mk("user_query", Confidentiality.INTERNAL, Integrity.USER),),
                 "forged-write",
                 CHAIN,
             ),
@@ -699,7 +706,7 @@ def run_all() -> EffectBroker:
                 "write",
                 "file:///../../etc/password",
                 {},
-                (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+                (_mk("user_query", Confidentiality.INTERNAL, Integrity.USER),),
                 "r-write:Agent:EffectBroker",
                 CHAIN,
             ),
@@ -712,7 +719,7 @@ def run_all() -> EffectBroker:
                 "send",
                 "internal@corp.com",
                 {},
-                (Data("bcc_field", Confidentiality.PUBLIC, Integrity.UNTRUSTED),),
+                (_mk("bcc_field", Confidentiality.PUBLIC, Integrity.UNTRUSTED),),
                 "r-send:Agent:EffectBroker",
                 CHAIN,
             ),
@@ -725,7 +732,7 @@ def run_all() -> EffectBroker:
                 "send",
                 "internal@corp.com",
                 {},
-                (Data("poisoned_memory", Confidentiality.PUBLIC, Integrity.UNTRUSTED),),
+                (_mk("poisoned_memory", Confidentiality.PUBLIC, Integrity.UNTRUSTED),),
                 "r-send:Agent:EffectBroker",
                 CHAIN,
             ),
@@ -739,7 +746,7 @@ def run_all() -> EffectBroker:
                 "delete",
                 "file:///secrets",
                 {},
-                (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+                (_mk("user_query", Confidentiality.INTERNAL, Integrity.USER),),
                 "forged-wide",
                 CHAIN,
             ),
@@ -749,9 +756,7 @@ def run_all() -> EffectBroker:
 
     for entry in single_commit_traces:
         trace_name, effect, expected_allow = entry[0], entry[1], entry[2]
-        setup_hook: Callable[[EffectBroker], None] | None = (
-            entry[3] if len(entry) == 4 else None
-        )
+        setup_hook: Callable[[EffectBroker], None] | None = entry[3] if len(entry) == 4 else None
         broker = build()
         if trace_name.startswith("T9"):
             broker.logical_time = 10.0  # make the short-expiry capability stale
@@ -801,7 +806,7 @@ def run_all() -> EffectBroker:
         "send",
         "internal@corp.com",
         {},
-        (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        (_mk("user_query", Confidentiality.INTERNAL, Integrity.USER),),
         "r-send:Agent:EffectBroker",
         CHAIN,
     )
@@ -814,7 +819,7 @@ def run_all() -> EffectBroker:
         "send",
         "internal@corp.com",
         {},
-        (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+        (_mk("user_query", Confidentiality.INTERNAL, Integrity.USER),),
         approved_nonce,
         CHAIN,
     )
