@@ -644,17 +644,29 @@ class EffectBroker:
 
         # Extra-target scope check for BCC/CC recipients
         # The capability scope defines which domains (scopes) the capability covers.
-        # BCC recipients outside this scope are not authorized.
+        # Extra targets outside this scope are not authorized — for both email
+        # (domain label check) AND non-email targets (scope inclusion check).
         if effect.known_targets is not None and effect.known_targets.additional:
             for extra_target in effect.known_targets.additional:
-                extra_domain = self._domain_for_email(extra_target)
-                # If extra_domain is not in capability.scope, block it
-                if extra_domain is not None and extra_domain not in capability.scope:
-                    return False, (
-                        f"extra-target-outside-scope("
-                        f"{extra_target} (domain={extra_domain}) "
-                        f"not in cap-scope={capability.scope})"
-                    )
+                if "@" in extra_target:
+                    # Email extra target: check domain label against cap scope
+                    extra_domain = self._domain_for_email(extra_target)
+                    if extra_domain is not None and extra_domain not in capability.scope:
+                        return False, (
+                            f"extra-target-outside-scope("
+                            f"{extra_target} (domain={extra_domain}) "
+                            f"not in cap-scope={capability.scope})"
+                        )
+                else:
+                    # Non-email extra target: check if target is in cap scope
+                    # (e.g. "file:///../../etc/password" must be in scope)
+                    target_label = self._scope_label_for_target(extra_target)
+                    if target_label not in capability.scope:
+                        return False, (
+                            f"extra-target-outside-scope("
+                            f"{extra_target} (scope-label={target_label}) "
+                            f"not in cap-scope={capability.scope})"
+                        )
 
         # SSRF containment for network effects
         if effect.etype == "network":
