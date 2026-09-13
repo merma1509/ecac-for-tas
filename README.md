@@ -193,8 +193,15 @@ run_traces.py    entry point
                               ↓
                    IndependentEffectLedger
 
-Both paths (direct broker.commit + via IsolatedExecutor) record to the
-same ledger. verify_complete_mediation() works from BOTH paths.
+Both paths (direct `broker.commit()` + via `IsolatedExecutor`) record to the
+same ledger. `verify_complete_mediation()` works from BOTH paths.
+
+`broker.commit()` is the direct path — used by callers that bypass the shim
+(e.g., a REPL, a test, or a wrapper). `executor.execute()` is the via-shim path
+— used by tool-motivated effects. Both are equally mediated: both call
+`broker.gate()` first, then `broker._apply_effect()`. The executor is the
+_isolation mechanism_ for tool/shim calls, not the sole caller of `_apply_effect`.
+
 UNKNOWN = "unknown, not safe" — an effect not observed by the ledger
 could be a bypass. In a multi-process deployment, the ledger would live
 in an isolated enclave where only the broker's apply_effect primitive
