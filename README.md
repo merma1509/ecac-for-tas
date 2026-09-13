@@ -145,23 +145,60 @@ broker's store
 
 ```bash
 effect_broker/
-  lattice.py     Confidentiality / Integrity lattices
-  model.py       pure model types: principals + resources (File, Email, Mailbox,
-                 Domain) + Data, Capability, Effect(prepared), Commit,
-                 LabelException
-  resources.py   mutable ResourceStore (F ∪ E ∪ M) — the broker's external state;
-                 mailbox send->outbox / read->inbox semantics + address->mailbox
-                 resolution (mailbox_for)
-  mediation.py   tool-boundary / MCP-semantics-honesty mediation (T13/T14/T15):
-                 MediationVerdict / mediate, decided via the broker's commit gate
-                 (remote-boundary mode)
-  broker.py      EffectBroker (the only committer) + four predicates
-                 + commit primitive + declass/endorse grants (broker-only)
-                 + attempt_wide (honest, non-monotonic widening) + risk-evaluation
-                 / approval (R1 one-shot) + static Auth / Fresh-owned revocation
-  traces.py      adversarial trace suite (20 predicate/gate traces plus the R1
-                 escalation trace); T13/T14/T15 wired through the mediation module
+  lattice.py      Confidentiality / Integrity lattices
+  model.py        pure model types: principals + resources (File, Email, Mailbox,
+                  Domain) + Data, Capability, Effect(prepared), Commit,
+                  LabelException, ApprovedRequest
+  restricted_store.py  mutable ResourceStore (F ∪ E ∪ M) — read-only views,
+                  append-only logs, apply_effect() as SOLE mutation point
+  ledger.py       IndependentEffectLedger — external, append-only log of
+                  authorizations + observations; PeriodicAuditor for on-demand
+                  and scheduled audits; makes UNAMBIGUOUS verdicts:
+                  CONFIRMED_COMMITTED / CONFIRMED_BLOCKED / UNKNOWN
+  mediation.py    tool-boundary / MCP-semantics-honesty mediation (T13/T14/T15):
+                  MediationVerdict / mediate, decided via the broker's commit gate
+                  (remote-boundary mode)
+  broker.py       EffectBroker (the only committer) + four predicates
+                  + commit primitive + declass/endorse grants (broker-only)
+                  + attempt_wide (honest, non-monotonic widening) + risk-evaluation
+                  / approval (R1 one-shot) + static Auth / Fresh-owned revocation
+  executor.py     IsolatedExecutor — sole path to broker._apply_effect();
+                  shares the same IndependentEffectLedger with broker.commit
+  shim.py         BrokerShim — constructs Effect objects from tool calls;
+                  derives provenance labels from data content (MaliciousReadTool)
+  traces.py       adversarial trace suite (20 predicate/gate traces plus the R1
+                  escalation trace); T13/T14/T15 wired through the mediation module
+  experiment.py   standalone adversarial experiments (M1–M8), independent ledger
+                  verification, concurrent/replay safety tests
 run_traces.py    entry point
+```
+
+## Architecture
+
+```bash
+┌──────────────────────────────────────────────────────────────────┐
+│ IndependentEffectLedger (EXTERNAL, not owned by broker/executor) │
+│  - Created OUTSIDE broker + executor                             │
+│  - Passed to both components                                     │
+│  - Records authorization events (from broker.gate / executor)    │
+│  - Records observation events (from executor + store)            │
+│  - Makes UNAMBIGUOUS verdicts: CONFIRMED_COMMITTED /             │
+│    CONFIRMED_BLOCKED / UNKNOWN                                   │
+│  - PeriodicAuditor: on-demand + scheduled audit snapshots        │
+└───────────────────────────────────────────────────────────────-──┘
+                       ↑                    ↑
+              broker.gate()          executor.execute()
+                   │                        │
+                   └──────────┬─────────────┘
+                              ↓
+                   IndependentEffectLedger
+
+Both paths (direct broker.commit + via IsolatedExecutor) record to the
+same ledger. verify_complete_mediation() works from BOTH paths.
+UNKNOWN = "unknown, not safe" — an effect not observed by the ledger
+could be a bypass. In a multi-process deployment, the ledger would live
+in an isolated enclave where only the broker's apply_effect primitive
+can write.
 ```
 
 ## Run (make / dev.sh)
