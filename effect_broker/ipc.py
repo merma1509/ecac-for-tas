@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
