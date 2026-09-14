@@ -47,7 +47,7 @@ class LedgerVerdict(Enum):
     """Verdict of the independent effect ledger.
 
     The ledger is the ONLY entity that can make mediation verdicts.
-    Key invariant: auth > 0, obs = 0 → UNKNOWN (never "safe").
+    Key invariant: auth > 0, obs = 0 -> UNKNOWN (never "safe").
     """
 
     CONFIRMED_COMMITTED = auto()  # effect reached state, authorized, observed
@@ -86,17 +86,17 @@ class IndependentEffectLedger:
       3. VERDICT: ledger.verify() determines if mediation is complete
 
     Two-phase observation:
-      Phase 1 (Authorization): broker.gate() allows effect → record authorization
+      Phase 1 (Authorization): broker.gate() allows effect -> record authorization
         - The effect is prepared for commit, predicates passed
         - Ledger records: (task_id, nonce, authorized_targets, observed=None)
-      Phase 2 (Observation): executor.apply() mutates store → store writes to ledger
-        - Store writes to effects_log + identity_log → store.ledger() records
+      Phase 2 (Observation): executor.apply() mutates store -> store writes to ledger
+        - Store writes to effects_log + identity_log -> store.ledger() records
         - Ledger records: (task_id, nonce, authorized_targets=None, observed=targets)
-        - Or: store rejects write → store.ledger() records empty observation
+        - Or: store rejects write -> store.ledger() records empty observation
       Phase 3 (Verification): ledger.verify() compares phase 1 vs phase 2
-        - authorized ⊆ observed → CONFIRMED_COMMITTED (if observed > 0)
-        - authorized ⊆ observed AND observed empty → CONFIRMED_BLOCKED
-        - authorized without observation → UNKNOWN (possible bypass)
+        - authorized ⊆ observed -> CONFIRMED_COMMITTED (if observed > 0)
+        - authorized ⊆ observed AND observed empty -> CONFIRMED_BLOCKED
+        - authorized without observation -> UNKNOWN (possible bypass)
     """
 
     _authorizations: dict[tuple[str, str], list[LedgerEntry]] = field(default_factory=dict)
@@ -179,11 +179,18 @@ class IndependentEffectLedger:
         """Verify mediation for a single (task_id, nonce).
 
         Returns:
-          - CONFIRMED_COMMITTED: authorized AND observed (targets ⊆ authorized)
-          - CONFIRMED_BLOCKED: authorized, observed empty targets (gate blocked it)
-          - UNKNOWN: cannot determine outcome (possible bypass)
+          - CONFIRMED_COMMITTED: authorized AND observed (targets ⊆ authorized), no
+            BLOCKED entries present. The effect was applied and no gate rejections occurred.
+          - CONFIRMED_BLOCKED: at least one BLOCKED observation exists. This proves the
+            gate rejected at least one attempt — even if earlier attempts were allowed.
+            Used for: Fresh replay prevention (effect committed once, then blocked on retry).
+          - UNKNOWN: cannot determine outcome (possible bypass or ambiguous).
+            Examples: auth without obs (possible bypass), obs without auth (unauthorized),
+            obs_count > auth_count (over-observed — possible crash or bypass).
 
-        Key invariant: authorized without observation → UNKNOWN (never "safe").
+        Key invariant: authorized without observation -> UNKNOWN (never "safe").
+        BLOCKED entries take precedence over committed entries: if Fresh blocked a retry,
+        CONFIRMED_BLOCKED is the honest verdict — the second attempt was rejected, not applied.
         """
         key = (task_id, nonce)
         auth_entries = self._authorizations.get(key, [])
@@ -205,63 +212,59 @@ class IndependentEffectLedger:
             authorized_targets |= entry.authorized_targets
 
         if not obs_entries:
-            # Authorized but no observation → possible direct bypass
+            # Authorized but no observation -> possible direct bypass
             return UnknownLedgerResult(
                 reason=f"authorized_not_observed(task={task_id},nonce={nonce},"
                 f"possible_bypass)"
             )
 
-        # Check for confirmed-blocked: auth exists + exactly 1 obs with empty
-        # targets AND source indicates the effect was BLOCKED at the gate.
-        # This uses the source field to distinguish gate-blocked effects
-        # from normal commits that happen to record empty observed_targets.
-        #
-        # CONFIRMED_BLOCKED sources: "broker.commit:BLOCKED" or "executor.execute:BLOCKED"
-        # These are recorded when gate() returns allow=False — the broker/executor
-        # explicitly records the blocked attempt.
-        #
-        # CONFIRMED_COMMITTED sources: "broker.commit", "executor.apply",
-        # "store.ledger". These are recorded when _apply_effect() committed
-        # an effect — even if observed_targets is empty (no-op effect).
-        #
-        # The old EffectObserver (pre-review) used the simpler heuristic:
-        # (1 auth, 1 obs, empty targets) → CONFIRMED_BLOCKED.
-        # This was wrong for effects with no-op targets (e.g., delete on
-        # non-existent file). The source-based check fixes this.
+        # Classify observations: committed (effect was applied) vs blocked (gate rejected)
         BLOCKED_SOURCES = frozenset({"broker.commit:BLOCKED", "executor.execute:BLOCKED"})
-        if len(auth_entries) == 1 and len(obs_entries) == 1:
-            first_obs = obs_entries[0]
-            obs_targets = first_obs.observed_targets or frozenset()
-            if len(obs_targets) == 0 and first_obs.source in BLOCKED_SOURCES:
-                return LedgerVerdict.CONFIRMED_BLOCKED
-
-        # Check all observations
+        committed_entries: list[LedgerEntry] = []
+        blocked_entries: list[LedgerEntry] = []
         for entry in obs_entries:
-            obs_targets = entry.observed_targets or frozenset()
-            if not (obs_targets <= authorized_targets):
-                extra = obs_targets - authorized_targets
+            if entry.source in BLOCKED_SOURCES:
+                blocked_entries.append(entry)
+            else:
+                committed_entries.append(entry)
+
+        # Key ordering: blocked > committed. If Fresh blocked a retry, the second
+        # attempt did NOT apply to external state — even though the first one did.
+        # Return CONFIRMED_BLOCKED (the block proves the gate worked on the retry).
+        if blocked_entries:
+            return LedgerVerdict.CONFIRMED_BLOCKED
+
+        if committed_entries:
+            # There ARE committed observations — verify they are within authorization
+            for entry in committed_entries:
+                obs_targets = entry.observed_targets or frozenset()
+                if not (obs_targets <= authorized_targets):
+                    extra = obs_targets - authorized_targets
+                    return UnknownLedgerResult(
+                        reason=f"extra_observed(task={task_id},nonce={nonce},"
+                        f"extra={extra},authorized={authorized_targets})"
+                    )
+            # Check occurrence count: cannot observe more than authorized.
+            # obs_count > auth_count -> UNKNOWN (possible bypass or lost auth record).
+            # This implements the "unknown, not safe" guarantee: the ledger must not
+            # claim CONFIRMED_COMMITTED when observation count exceeds authorization count.
+            if len(obs_entries) > len(auth_entries):
                 return UnknownLedgerResult(
-                    reason=f"extra_observed(task={task_id},nonce={nonce},"
-                    f"extra={extra},authorized={authorized_targets})"
+                    reason=f"over-observed(task={task_id},nonce={nonce},"
+                    f"auth_count={len(auth_entries)},obs_count={len(obs_entries)})"
                 )
+            return LedgerVerdict.CONFIRMED_COMMITTED
 
-        # Check occurrence count: 1 authorization → 0 or 1 observation max
-        # More than 1 observation means over-observed (same nonce used twice)
-        # This is the "replay" case: same nonce authorized once, used twice
-        if len(auth_entries) < len(obs_entries):
-            return UnknownLedgerResult(
-                reason=f"over-observed(task={task_id},nonce={nonce},"
-                f"auth_count={len(auth_entries)},obs_count={len(obs_entries)})"
-            )
-
-        # All observations are within authorization → confirmed committed
-        return LedgerVerdict.CONFIRMED_COMMITTED
+        # No committed, no blocked — shouldn't happen with non-empty obs_entries
+        return UnknownLedgerResult(
+            reason=f"unknown_observation_type(task={task_id},nonce={nonce})"
+        )
 
     def verify_all(self, authorized_records: dict[tuple[str, str], frozenset[str]]) -> list[str]:
         """Verify complete mediation across all records.
 
         Args:
-            authorized_records: dict mapping (task_id, nonce) → authorized_targets
+            authorized_records: dict mapping (task_id, nonce) -> authorized_targets
                 This is the authoritative record built from broker.gate() calls,
                 independent of whatever ledger recorded during execution.
 
