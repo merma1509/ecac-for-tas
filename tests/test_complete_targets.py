@@ -350,3 +350,532 @@ class TestCanonicalCompleteTargets:
         assert ev2["primary_blocker"] == "ApprovalBinding"
         assert "extra-targets-not-approved" in ev2["approval_binding"]
         assert "other-internal@corp.com" in ev2["approval_binding"]
+
+
+class TestLedgerObservationRecorded:
+    """Regression: ledger.record_observation must be called after every ALLOW.
+
+    Before the fix, the observation recording call was dedented outside its
+    `if identity_entries:` block, silently discarding the observation.
+    Without a ledger entry, verify() returns UNKNOWN instead of CONFIRMED_COMMITTED.
+    """
+
+    def test_allowed_commit_records_observation(self) -> None:
+        """ALLOW commit: record_observation must be called (not discarded)."""
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+
+        broker.capabilities["obs-cap"] = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="write",
+            target="file:///reports",
+            scope=frozenset({"file:///reports"}),
+            expiry=float("inf"),
+            nonce="obs-cap",
+            derives_from=None,
+        )
+
+        effect = Effect(
+            etype="write",
+            target="file:///reports",
+            metadata={},
+            provenance=_provenance("obs-test"),
+            capability_nonce="obs-cap",
+            delegation_chain=(),
+        )
+
+        # Clear any prior ledger state
+        broker._local_ledger.reset()
+        allow, _ = broker.commit(broker._make_commit(effect, task_id="default"))
+        assert allow is True
+
+        # Observation must be recorded — verify() should return CONFIRMED_COMMITTED
+        ledger_key = (task.task_id, effect.capability_nonce)
+        obs_entries = broker._local_ledger._observations.get(ledger_key, [])
+        assert len(obs_entries) >= 1, (
+            "BUG: record_observation was NOT called — observation call was dedented "
+            "outside its if-block, silently discarded. "
+            "This causes verify() to return UNKNOWN instead of CONFIRMED_COMMITTED."
+        )
+
+        verdict = broker._local_ledger.verify(task.task_id, effect.capability_nonce)
+        from effect_broker.ledger import LedgerVerdict
+        assert verdict == LedgerVerdict.CONFIRMED_COMMITTED, (
+            f"Expected CONFIRMED_COMMITTED, got {verdict}. "
+            "Observation recording may have been silently dropped."
+        )
+
+    def test_blocked_commit_records_blocked_observation(self) -> None:
+        """BLOCKed commit: record_observation(task_id, nonce, None) must be called."""
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+
+        # Capability for send, but effect is write -> BLOCK
+        broker.capabilities["obs-block-cap"] = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="obs-block-cap",
+            derives_from=None,
+        )
+
+        effect = Effect(
+            etype="write",  # mismatched: cap has right="send"
+            target="file:///reports",
+            metadata={},
+            provenance=_provenance("obs-block-test"),
+            capability_nonce="obs-block-cap",
+            delegation_chain=(),
+        )
+
+        broker._local_ledger.reset()
+        allow, ev = broker.commit(broker._make_commit(effect, task_id="default"))
+        assert not allow
+        assert ev["primary_blocker"] == "Auth"
+
+        # Blocked observation must be recorded (None = explicit blocked)
+        ledger_key = (task.task_id, effect.capability_nonce)
+        obs_entries = broker._local_ledger._observations.get(ledger_key, [])
+        assert len(obs_entries) >= 1, (
+            "BUG: blocked observation was NOT recorded. "
+            "CONFIRMED_BLOCKED requires auth > 0 + obs = empty set with BLOCKED source."
+        )
+        assert obs_entries[0].source == "broker.commit:BLOCKED"
+
+
+class TestApprovalExpiry:
+    """Approval expiry must be checked in gate() (ApprovalBinding)."""
+
+    def test_approval_expired_by_logical_time_blocked(self) -> None:
+        """Approval with expiry=10 invalid at session time 15: Fresh BLOCKs.
+
+        grant_approval() creates a backing capability with cap.expiry=same as approval
+        expiry, so Fresh fires first. This is the correct, intended behavior — expired
+        approvals are rejected at the Fresh predicate, same as expired capabilities.
+        ApprovalBinding expiry check is present for edge cases where ApproveRequest
+        is stored without grant_approval() (e.g., manual injection).
+        """
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+
+        broker.capabilities["exp-cap"] = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="exp-cap",
+            derives_from=None,
+        )
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("approved-msg"),
+            capability_nonce="exp-cap",
+            delegation_chain=(),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset(),
+            ),
+        )
+        nonce = broker.grant_approval(effect, expiry=10.0, task_id="default")
+        stored = broker._approved_requests[nonce]
+
+        # Verify grant_approval syncs cap.expiry to approval expiry
+        assert broker.capabilities[nonce].expiry == 10.0
+
+        # Advance session time to 15 (past expiry=10)
+        broker.advance_time("default", 15.0)
+
+        approved_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("approved-msg"),
+            capability_nonce=nonce,
+            delegation_chain=(),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset(),
+            ),
+        )
+        from effect_broker.model import Commit
+
+        commit = Commit(
+            effect=approved_effect,
+            task=task,
+            approved_request=stored,
+        )
+        allow, ev = broker.commit(commit)
+        assert not allow
+        # grant_approval syncs cap.expiry = approval expiry → Fresh fires first
+        assert ev["primary_blocker"] == "Fresh"
+        assert "expired" in ev["predicates"]["Fresh"]
+
+    def test_approval_valid_before_expiry_allows(self) -> None:
+        """Approval valid at session time 5 with expiry=10: ALLOWs."""
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+
+        broker.capabilities["valid-exp-cap"] = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="valid-exp-cap",
+            derives_from=None,
+        )
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("valid-msg"),
+            capability_nonce="valid-exp-cap",
+            delegation_chain=(),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset(),
+            ),
+        )
+        nonce = broker.grant_approval(effect, expiry=10.0, task_id="default")
+        stored = broker._approved_requests[nonce]
+
+        # At session time 5: within expiry window
+        broker.advance_time("default", 5.0)
+
+        from effect_broker.model import Commit
+
+        approved_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("valid-msg"),
+            capability_nonce=nonce,
+            delegation_chain=(),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset(),
+            ),
+        )
+        commit = Commit(
+            effect=approved_effect,
+            task=task,
+            approved_request=stored,
+        )
+        allow, ev = broker.commit(commit)
+        assert allow is True
+        assert ev["primary_blocker"] is None
+
+
+class TestCapabilityTaskScope:
+    """Capability.task_id must be enforced for reusable (non-approval) capabilities."""
+
+    def test_reusable_cap_task_scoped_to_wrong_task_blocked(self) -> None:
+        """Reusable cap with task_id=A used in task=B: Auth BLOCKs (task-scope-mismatch).
+
+        This prevents a reusable capability from being used across task boundaries.
+        Approval capabilities use ApprovalBinding instead.
+        """
+        broker = build()
+        task_a = _make_task("task-a")
+        task_b = _make_task("task-b")
+        broker.register_task(task_a)
+        broker.register_task(task_b)
+
+        # Reusable cap scoped to task-a
+        cap = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="reusable-cap",
+            task_id="task-a",  # ← scoped to task-a
+            derives_from=None,
+        )
+        broker.capabilities["reusable-cap"] = cap
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce="reusable-cap",
+            delegation_chain=(),
+        )
+
+        # In task-a: ALLOW (correct task)
+        allow_a, ev_a = broker.commit(broker._make_commit(effect, task_id="task-a"))
+        assert allow_a is True, f"task-a should ALLOW: {ev_a}"
+
+        # In task-b: BLOCK (wrong task — task-scope-mismatch)
+        allow_b, ev_b = broker.commit(broker._make_commit(effect, task_id="task-b"))
+        assert not allow_b
+        assert ev_b["primary_blocker"] == "Auth"
+        assert "task-scope-mismatch" in ev_b["predicates"]["Auth"]
+
+    def test_reusable_cap_no_task_id_unrestricted(self) -> None:
+        """Reusable cap with task_id=None can be used in any task."""
+        broker = build()
+        task_a = _make_task("task-a")
+        task_b = _make_task("task-b")
+        broker.register_task(task_a)
+        broker.register_task(task_b)
+
+        cap = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="unrestricted-cap",
+            task_id=None,  # ← no task restriction
+            derives_from=None,
+        )
+        broker.capabilities["unrestricted-cap"] = cap
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce="unrestricted-cap",
+            delegation_chain=(),
+        )
+
+        allow_a, _ = broker.commit(broker._make_commit(effect, task_id="task-a"))
+        allow_b, _ = broker.commit(broker._make_commit(effect, task_id="task-b"))
+        assert allow_a is True
+        assert allow_b is True
+
+    def test_approval_nonce_task_checked_by_approval_binding(self) -> None:
+        """Approval nonces use ApprovalBinding (not task-scope sub-check) for task check.
+
+        This verifies that approval task_id is checked in ApprovalBinding, not Auth.
+        The Auth sub-check skips task_id for approval: prefixed nonces.
+        """
+        broker = build()
+        task_a = _make_task("task-a")
+        task_b = _make_task("task-b")
+        broker.register_task(task_a)
+        broker.register_task(task_b)
+
+        broker.capabilities["task-scoped-cap"] = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="task-scoped-cap",
+            derives_from=None,
+        )
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("approved"),
+            capability_nonce="task-scoped-cap",
+            delegation_chain=(),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset(),
+            ),
+        )
+        nonce = broker.grant_approval(effect, expiry=100.0, task_id="task-a")
+        stored = broker._approved_requests[nonce]
+
+        from effect_broker.model import Commit
+
+        # In task-a: ALLOW (ApprovalBinding passes: task_id matches)
+        approved_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("approved"),
+            capability_nonce=nonce,
+            delegation_chain=(),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset(),
+            ),
+        )
+        commit_a = Commit(effect=approved_effect, task=task_a, approved_request=stored)
+        allow_a, ev_a = broker.commit(commit_a)
+        assert allow_a is True, f"task-a should ALLOW: {ev_a}"
+
+        # In task-b: BLOCK via ApprovalBinding (not Auth task-scope sub-check)
+        commit_b = Commit(effect=approved_effect, task=task_b, approved_request=stored)
+        allow_b, ev_b = broker.commit(commit_b)
+        assert not allow_b
+        assert ev_b["primary_blocker"] == "ApprovalBinding"
+        assert "cross-task-use" in ev_b["approval_binding"]
+        # Auth should pass (cap is task-unscoped, right matches)
+        assert "task-scope-mismatch" not in ev_b["predicates"]["Auth"]
+
+
+class TestLedgerVerdictUnknownAfterCrash:
+    """Regression: ledger must return UNKNOWN, not SAFE, for effects
+    that were authorized but whose observation is lost (e.g., crash).
+
+    In the same-process model, a "crash" means the broker process restarts
+    with a fresh session (session.used = ∅). Fresh cannot block the retry
+    (nonce lost), but the ledger must return UNKNOWN — not false SAFE.
+    This is the "unknown, not safe" guarantee.
+    """
+
+    def test_verify_confirmed_blocked_after_session_preserved(self) -> None:
+        """Session preserved: Fresh blocks retry. Ledger returns CONFIRMED_BLOCKED."""
+        from effect_broker.ledger import LedgerVerdict
+
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+        broker.store._unsafe_bootstrap_file("file:///reports", None)
+
+        broker.capabilities["retry-block-cap"] = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="write",
+            target="file:///reports",
+            scope=frozenset({"file:///reports"}),
+            expiry=float("inf"),
+            nonce="retry-block-cap",
+            derives_from=None,
+        )
+
+        effect = Effect(
+            etype="write",
+            target="file:///reports",
+            metadata={},
+            provenance=_provenance("retry-test"),
+            capability_nonce="retry-block-cap",
+            delegation_chain=(),
+        )
+
+        # First commit: ALLOW → auth + committed obs
+        allow1, _ = broker.commit(broker._make_commit(effect, task_id="default"))
+        assert allow1 is True
+
+        # Session preserved: Fresh blocks retry
+        allow2, ev2 = broker.commit(broker._make_commit(effect, task_id="default"))
+        assert not allow2
+        assert ev2["primary_blocker"] == "Fresh"
+        assert "replay" in ev2["predicates"]["Fresh"]
+
+        # Ledger: committed obs + BLOCKED obs → CONFIRMED_BLOCKED
+        verdict = broker._local_ledger.verify(task.task_id, effect.capability_nonce)
+        assert verdict == LedgerVerdict.CONFIRMED_BLOCKED, (
+            f"Expected CONFIRMED_BLOCKED after Fresh replay, got {verdict}"
+        )
+
+    def test_verify_unknown_when_obs_exceeds_auth(self) -> None:
+        """Ledger returns UNKNOWN when observation count exceeds authorization count.
+
+        This is the "unknown, not safe" guarantee: if we observe an effect more
+        times than we authorized it, the ledger cannot determine if this is a bypass
+        (unauthorized commit) or a crash-recovery with lost auth records.
+        """
+        from effect_broker.ledger import LedgerVerdict
+
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+        broker.store._unsafe_bootstrap_file("file:///reports", None)
+
+        broker.capabilities["over-obs-cap"] = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="write",
+            target="file:///reports",
+            scope=frozenset({"file:///reports"}),
+            expiry=float("inf"),
+            nonce="over-obs-cap",
+            derives_from=None,
+        )
+
+        effect = Effect(
+            etype="write",
+            target="file:///reports",
+            metadata={},
+            provenance=_provenance("over-obs"),
+            capability_nonce="over-obs-cap",
+            delegation_chain=(),
+        )
+
+        # Commit: ALLOW → auth + obs
+        broker.commit(broker._make_commit(effect, task_id="default"))
+
+        # Inject extra observation to simulate over-observation (auth_count=1, obs_count=2)
+        from effect_broker.ledger import LedgerEntry
+
+        extra_obs = LedgerEntry(
+            task_id="default",
+            nonce="over-obs-cap",
+            authorized_targets=frozenset(),
+            observed_targets=frozenset({"file:///reports"}),
+            timestamp=3.0,
+            source="unknown-source",
+        )
+        broker._local_ledger._observations[
+            ("default", "over-obs-cap")
+        ].append(extra_obs)
+
+        verdict = broker._local_ledger.verify("default", "over-obs-cap")
+        assert verdict == LedgerVerdict.UNKNOWN or (
+            hasattr(verdict, "reason") and "over-observed" in verdict.reason
+        ), (
+            f"Expected UNKNOWN when obs_count > auth_count, got {verdict}. "
+            f"SAFE would be a false positive."
+        )
+
+    def test_verify_unknown_when_auth_record_lost(self) -> None:
+        """Effect observed but auth record lost (crash after obs, before auth write).
+        Ledger returns UNKNOWN — cannot determine if the effect was authorized."""
+        from effect_broker.ledger import LedgerVerdict
+
+        broker = build()
+        task = _make_task("default")
+        broker.register_task(task)
+        broker.store._unsafe_bootstrap_file("file:///reports", None)
+
+        # Inject obs directly (no commit): simulates crash after obs, before auth record
+        from effect_broker.ledger import LedgerEntry
+
+        obs_entry = LedgerEntry(
+            task_id="default",
+            nonce="lost-auth-cap",
+            authorized_targets=frozenset(),
+            observed_targets=frozenset({"file:///reports"}),
+            timestamp=1.0,
+            source="broker.commit",
+        )
+        key = ("default", "lost-auth-cap")
+        if key not in broker._local_ledger._observations:
+            broker._local_ledger._observations[key] = []
+        broker._local_ledger._observations[key].append(obs_entry)
+
+        verdict = broker._local_ledger.verify("default", "lost-auth-cap")
+        assert verdict == LedgerVerdict.UNKNOWN or (
+            hasattr(verdict, "reason") and "observed_without_authorization" in verdict.reason
+        ), (
+            f"Expected UNKNOWN when obs exists but no auth record, got {verdict}. "
+            f"SAFE would be a false positive."
+        )
