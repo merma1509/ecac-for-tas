@@ -152,20 +152,23 @@ effect_broker/
   restricted_store.py  mutable ResourceStore (F ∪ E ∪ M) — read-only views,
                   append-only logs, apply_effect() as SOLE mutation point
   ledger.py       IndependentEffectLedger — external, append-only log of
-                  authorizations + observations; PeriodicAuditor for on-demand
-                  and scheduled audits; makes UNAMBIGUOUS verdicts:
+                  authorizations + observations; makes UNAMBIGUOUS verdicts:
                   CONFIRMED_COMMITTED / CONFIRMED_BLOCKED / UNKNOWN
   mediation.py    tool-boundary / MCP-semantics-honesty mediation (T13/T14/T15):
                   MediationVerdict / mediate, decided via the broker's commit gate
-                  (remote-boundary mode)
   broker.py       EffectBroker (the only committer) + four predicates
                   + commit primitive + declass/endorse grants (broker-only)
                   + attempt_wide (honest, non-monotonic widening) + risk-evaluation
                   / approval (R1 one-shot) + static Auth / Fresh-owned revocation
-  executor.py     IsolatedExecutor — sole path to broker._apply_effect();
+  executor.py     IsolatedExecutor — isolation mechanism for tool/shim effects;
+                  both executor.execute() and broker.commit() call _apply_effect()
                   shares the same IndependentEffectLedger with broker.commit
-  shim.py         BrokerShim — constructs Effect objects from tool calls;
-                  derives provenance labels from data content (MaliciousReadTool)
+  shim.py         BrokerShim / FileShim — constructs Effect objects from tool calls;
+                  derives provenance labels from data content; is the ONLY path
+                  to the ResourceStore (the enforcement shim)
+  ipc.py          LedgerBackend + ProcessLedgerClient + LedgerProcessServer —
+                  multi-process ledger isolation for production deployment
+  ledger_process.py  Standalone process entry point for the ledger server
   traces.py       adversarial trace suite (20 predicate/gate traces plus the R1
                   escalation trace); T13/T14/T15 wired through the mediation module
   experiment.py   standalone adversarial experiments (M1–M8), independent ledger
@@ -243,20 +246,20 @@ make all              # full CI gate: lint + typecheck + test + verify
 
 ### Available targets
 
-| `make` / `./dev.sh`      | What it does                                             |
-| ------------------------ | -------------------------------------------------------- |
-| `setup`                  | Ensure `uv` is installed (idempotent)                    |
-| `install` (alias `sync`) | venv + locked deps via `uv sync`                         |
-| `lint`                   | ruff check                                               |
-| `format`                 | ruff format + `--fix`                                    |
-| `typecheck`              | mypy (strict) on `effect_broker`                         |
-| `test`                   | pytest (regression suite encoding T1–T20 + mediation)    |
-| `run`                    | `python run_traces.py` (the trace suite, with evidence)  |
-| `verify`                 | assert the machine-checkable trace outcomes (same as CI) |
-| `all`                    | setup → lint → typecheck → test → verify (full gate)     |
-| `doctor`                 | show env + dependency status                             |
-| `clean`                  | remove caches/build                                      |
-| `shell` _(dev.sh only)_  | drop into a venv-activated shell                         |
+| `make` / `./dev.sh`      | What it does                                         |
+| ------------------------ | ---------------------------------------------------- |
+| `setup`                  | Ensure `uv` is installed (idempotent)                |
+| `install` (alias `sync`) | venv + locked deps via `uv sync`                     |
+| `lint`                   | ruff check (all checks pass)                         |
+| `format`                 | ruff format + `--fix`                                |
+| `typecheck`              | mypy (strict) on `effect_broker`                     |
+| `test`                   | 161 pytest tests across 14 files                     |
+| `run`                    | `python run_traces.py` (22 traces with evidence)     |
+| `verify`                 | assert trace outcomes (same as CI)                   |
+| `all`                    | setup → lint → typecheck → test → verify (full gate) |
+| `doctor`                 | show env + dependency status                         |
+| `clean`                  | remove caches/build                                  |
+| `shell` _(dev.sh only)_  | drop into a venv-activated shell                     |
 
 `make all` is exactly what CI (`./.github/workflows/ci.yml`) runs on every push.
 
@@ -321,15 +324,34 @@ classes and are asserted in `tests/test_broker.py`.
 
 ## Honest limitations
 
-- Resource labels (file sensitivity, email domain) are minimal — a full
-  metadata repository (R = F ∪ E ∪ M with rich policies) is Week-3 work, but
-  the resource + `commit_effect` primitive mechanics are now modeled.
-- Provenance lists are hand-assigned, not extracted from a real LLM/tool layer
-  (real taint propagation is Week-3 work).
-- Tool-boundary / MCP-semantics-honesty mediation (T13/T14/T15) is implemented as
-  a MediationVerdict/mediate module (effect_broker/mediation.py), invoked through
-  EffectBroker.commit(..., mediation=...): the effect never reaches the remote tool.
-  Not yet modeled are the real tool adapters and the mechanized checker ↔ semantics
-  consistency proof — the next steps and the two sharpest differentiators.
-- The TCB-expansion trade-off (effect mediation pulls small primitives into the
-  trusted core) must be argued explicitly in Week 2; this model does not decide it.
+- **161 tests ≠ real confinement.** Passing tests are regression evidence for the
+  implemented predicates. They do not establish genuine protected-effect confinement
+  — that requires isolation, independent observation, and formal guarantees. The
+  current model is a specification and executable invariant, not a verified secure
+  system. The full suite (14 test files, 161 tests) exercises all four predicates,
+  concurrent replay, approval binding, closed sessions, and IPC.
+- **Same-process isolation is advisory.** The broker, executor, store, and ledger
+  all run in the same Python process. Direct store mutation (`store._files._data[...]`
+  = X) bypasses the ledger and returns "unknown" — not "safe" — but the broker
+  cannot prevent it. Real isolation requires a separate process or enclave.
+- **Ledger observation is based on log inspection, not true side-channel detection.**
+  `identity_log` records what `apply_effect()` writes; it does not observe actual
+  I/O. A bypass of `apply_effect()` that touches resources directly would not appear
+  in `identity_log` and would produce `UNKNOWN`, not a false `CONFIRMED_COMMITTED`.
+- **Exactly-once external semantics are not claimed.** The ledger confirms that
+  each authorized effect is applied at most once (Fresh + occurrence count in
+  `verify()`). Whether external providers (SMTP, filesystem) deliver/process
+  exactly-once is outside this model's scope — no provider contract or recovery
+  protocol is modeled.
+- **Provenance lists are hand-assigned.** Labels are assigned by `BrokerShim`,
+  not extracted from real LLM/tool dataflow. Real taint propagation is Week-3 work.
+- **Resource labels are minimal.** File sensitivity and email domain are the only
+  resource classifications; a full policy repository is not modeled.
+- **TCB expansion is unquantified.** Effect mediation pulls small primitives into
+  the trusted core. The size and correctness of the TCB are not formally argued.
+- **No performance, latency, or approval-burden metrics.** Experiments measure
+  correctness only. Approval latency, broker throughput, and the cost of
+  human-in-the-loop escalation are not measured or reported.
+- **No external baseline comparison.** The report does not yet compare ECAC
+  against a genuine baseline under matched assumptions. Week 2 requires evidence
+  beyond ECAC's own test regressions.
