@@ -581,6 +581,18 @@ class EffectBroker:
         if capability.target != effect.target:
             return False, f"target-mismatch(cap_target={capability.target}!={effect.target})"
 
+        # Sub-check 6: task-scoping (only for reusable capabilities with task_id).
+        # Approval capabilities (identified by "approval:" prefix) use ApprovalBinding
+        # in gate() instead, which already checks task_id exactly. Reusable capabilities
+        # that declare a task_id must be used only in that task — this prevents a
+        # reusable cap scoped to task-A from being used in task-B.
+        if capability.task_id is not None and not effect.capability_nonce.startswith("approval:"):
+            if capability.task_id != task.task_id:
+                return False, (
+                    f"task-scope-mismatch("
+                    f"cap-task_id={capability.task_id}!=commit-task_id={task.task_id})"
+                )
+
         return True, f"auth-ok(derivation={legit_evidence},task={task.task_id})"
 
     def check_flow(self, effect: Effect, task: Task) -> PredicateResult:
@@ -859,8 +871,8 @@ class EffectBroker:
             if identity_entries:
                 last_entry = identity_entries[-1]
                 self._ledger_backend.record_observation(
-                task_id, nonce, last_entry, source="broker.commit"
-            )
+                    task_id, nonce, last_entry, source="broker.commit"
+                )
         else:
             # BLOCKed effect: record explicit blocked observation.
             # auth > 0, obs = frozenset() -> CONFIRMED_BLOCKED (observer saw attempt)
