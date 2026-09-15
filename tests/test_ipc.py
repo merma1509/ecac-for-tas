@@ -1,4 +1,4 @@
-"""Tests for the IPC layer (multi-process ledger isolation).
+"""Tests for the IPC layer (multi-process ledger isolation)
 
 These tests verify the LedgerBackend abstraction, LocalLedgerBackend,
 ProcessLedgerClient, and LedgerProcessServer.
@@ -313,15 +313,16 @@ class TestProcessLedgerClientIntegration:
     """
 
     def test_record_and_verify_over_socket(self, tmp_path: Path) -> None:
-        """End-to-end socket transport test using real Unix domain sockets.
+        """End-to-end socket transport: ProcessLedgerClient <-> LedgerProcessServer.
 
-        Tests the complete IPC pipeline: ProcessLedgerClient serializes requests
-        -> Unix socket transport -> LedgerProcessServer dispatches -> response.
-        Runs the server in a non-daemon thread (same process, real socket I/O).
-        The non-daemon thread is joined before exiting, so threading's cleanup
-        is deterministic — no race conditions.
+        Runs the server in a daemon thread with a ready_event for synchronization.
+        After all I/O completes, calls server.stop() to cleanly shut down the loop
+        (no signal required, no join-timeout). The server thread exits immediately.
         """
-        import json, socket, threading, time, uuid
+        import json
+        import socket
+        import threading
+        import uuid
 
         socket_path = Path(f"/tmp/ledger-test-{uuid.uuid4().hex[:8]}.sock")
         if socket_path.exists():
@@ -330,104 +331,74 @@ class TestProcessLedgerClientIntegration:
         ready = threading.Event()
         server = LedgerProcessServer(socket_path=socket_path, ready_event=ready)
 
-        def run_server():
+        def run_server() -> None:
             server.run()
 
-        server_thread = threading.Thread(target=run_server)
+        server_thread = threading.Thread(target=run_server, daemon=True)
         server_thread.start()
 
         try:
-            # wait for server to be bound + listening
+            # Wait for server to be bound + listening
             if not ready.wait(timeout=5.0):
                 pytest.fail("Server did not become ready within 5s")
 
-            # ---- Raw socket protocol validation ----
+            # ---- Phase 1: Raw socket protocol (length-prefixed JSON) ----
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(5.0)
             try:
                 sock.connect(str(socket_path))
 
-                # Record authorization via raw socket (length-prefixed format)
-                req = json.dumps({
-                    "kind": "RECORD_AUTHORIZATION",
-                    "payload": {
-                        "task_id": "t1", "nonce": "n1",
-                        "authorized_targets": ["file:///a"], "source": "test",
-                    },
-                }).encode()
-                sock.sendall(str(len(req)).encode() + b"\n" + req)
-                header = b""
-                while b"\n" not in header:
-                    chunk = sock.recv(1)
-                    if not chunk:
-                        pytest.fail("Server closed connection during auth")
-                    header += chunk
-                length = int(header.strip().decode())
-                raw = b""
-                while len(raw) < length:
-                    chunk = sock.recv(length - len(raw))
-                    if not chunk:
-                        pytest.fail("Server closed connection mid-response")
-                    raw += chunk
-                resp = json.loads(raw.decode())
-                assert resp["ok"] is True, f"auth error: {resp.get('error')}"
-
-                # Record observation via raw socket (length-prefixed format)
-                req = json.dumps({
-                    "kind": "RECORD_OBSERVATION",
-                    "payload": {
-                        "task_id": "t1", "nonce": "n1",
-                        "observed_targets": ["file:///a"], "source": "test",
-                    },
-                }).encode()
-                sock.sendall(str(len(req)).encode() + b"\n" + req)
-                header = b""
-                while b"\n" not in header:
-                    chunk = sock.recv(1)
-                    if not chunk:
-                        pytest.fail("Server closed connection during obs")
-                    header += chunk
-                length = int(header.strip().decode())
-                raw = b""
-                while len(raw) < length:
-                    chunk = sock.recv(length - len(raw))
-                    if not chunk:
-                        pytest.fail("Server closed connection mid-response")
-                    raw += chunk
-                resp = json.loads(raw.decode())
-                assert resp["ok"] is True
-
-                # Verify via raw socket (length-prefixed format)
-                req = json.dumps({
-                    "kind": "VERIFY",
-                    "payload": {"task_id": "t1", "nonce": "n1"},
-                }).encode()
-                sock.sendall(str(len(req)).encode() + b"\n" + req)
-                header = b""
-                while b"\n" not in header:
-                    chunk = sock.recv(1)
-                    if not chunk:
-                        pytest.fail("Server closed connection during verify")
-                    header += chunk
-                length = int(header.strip().decode())
-                raw = b""
-                while len(raw) < length:
-                    chunk = sock.recv(length - len(raw))
-                    if not chunk:
-                        pytest.fail("Server closed connection mid-response")
-                    raw += chunk
-                resp = json.loads(raw.decode())
-                assert resp["ok"] is True
-                assert resp["result"] == "CONFIRMED_COMMITTED"
+                for kind, payload in [
+                    (
+                        "RECORD_AUTHORIZATION",
+                        {
+                            "task_id": "t1",
+                            "nonce": "n1",
+                            "authorized_targets": ["file:///a"],
+                            "source": "test",
+                        },
+                    ),
+                    (
+                        "RECORD_OBSERVATION",
+                        {
+                            "task_id": "t1",
+                            "nonce": "n1",
+                            "observed_targets": ["file:///a"],
+                            "source": "test",
+                        },
+                    ),
+                    (
+                        "VERIFY",
+                        {"task_id": "t1", "nonce": "n1"},
+                    ),
+                ]:
+                    req = json.dumps({"kind": kind, "payload": payload}).encode()
+                    sock.sendall(str(len(req)).encode() + b"\n" + req)
+                    header = b""
+                    while b"\n" not in header:
+                        chunk = sock.recv(1)
+                        if not chunk:
+                            pytest.fail("Server closed connection")
+                        header += chunk
+                    length = int(header.strip().decode())
+                    raw = b""
+                    while len(raw) < length:
+                        chunk = sock.recv(length - len(raw))
+                        if not chunk:
+                            pytest.fail("Server closed connection mid-response")
+                        raw += chunk
+                    resp = json.loads(raw.decode())
+                    assert resp["ok"] is True, f"{kind} failed: {resp.get('error')}"
+                    if kind == "VERIFY":
+                        assert resp["result"] == "CONFIRMED_COMMITTED"
             finally:
                 sock.close()
 
-            # ---- ProcessLedgerClient high-level API ----
+            # ---- Phase 2: ProcessLedgerClient high-level API ----
             client = ProcessLedgerClient(socket_path=socket_path)
             assert client.authorization_count() == 1
             assert client.observation_count() == 1
 
-            # Add second entry via ProcessLedgerClient
             client.record_authorization(
                 "task2", "nonce2", frozenset({"file:///b"}), source="test"
             )
@@ -439,9 +410,10 @@ class TestProcessLedgerClientIntegration:
             assert client.verify("task2", "nonce2") == LedgerVerdict.CONFIRMED_COMMITTED
 
         finally:
-            # Signal shutdown and wait for server thread
-            import signal
-            server_thread.join(timeout=5.0)
+            # Stop server cleanly — sets shutdown flag + closes socket.
+            # No signal needed; no join-timeout; daemon thread exits immediately.
+            server.stop()
+            server_thread.join(timeout=2.0)
             if socket_path.exists():
                 socket_path.unlink(missing_ok=True)
 
