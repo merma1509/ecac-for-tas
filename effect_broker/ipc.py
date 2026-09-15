@@ -387,15 +387,27 @@ class LedgerProcessServer:
         self._ledger: IndependentEffectLedger | None = None  # set in run()
         # Optional event to signal after bind/listen are complete (for test sync)
         self._ready_event = ready_event
+        self._shutdown = threading.Event()
+        self._server: socket.socket | None = None
+
+    def stop(self) -> None:
+        """Stop the server loop from any thread. Works via socket close + shutdown flag."""
+        self._shutdown.set()
+        if self._server is not None:
+            try:
+                self._server.close()
+            except OSError:
+                pass
 
     def run(self) -> None:
-        """Main server loop. Blocks until shutdown signal."""
+        """Main server loop. Blocks until stop() is called or a signal is received."""
         import signal
 
         from .ledger import IndependentEffectLedger
 
         ledger: IndependentEffectLedger = IndependentEffectLedger()
         self._ledger = ledger
+        self._shutdown.clear()
 
         # Clean up any existing socket
         if self._path.exists():
@@ -405,14 +417,15 @@ class LedgerProcessServer:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(str(self._path))
         server.listen(10)
+        self._server = server
 
         def shutdown_handler(_sig: Any, _frame: Any) -> None:
-            server.close()
-            raise SystemExit(0)
+            self._shutdown.set()
+            try:
+                server.close()
+            except OSError:
+                pass
 
-        # FIXED: set ready event AFTER bind+listen so callers know socket is
-        # listening. Must be before signal.signal() since it raises ValueError
-        # in non-main threads and would crash this thread before set() is called.
         if self._ready_event is not None:
             self._ready_event.set()
 
@@ -420,18 +433,23 @@ class LedgerProcessServer:
             signal.signal(signal.SIGINT, shutdown_handler)
             signal.signal(signal.SIGTERM, shutdown_handler)
         except (ValueError, OSError):
-            # signal.signal() only works in main thread; ignore elsewhere.
-            # Also ignore on platforms where signals aren't fully supported.
             pass
 
         while True:
+            if self._shutdown.is_set():
+                break
+            server.settimeout(1.0)
             try:
                 conn, _ = server.accept()
-                threading.Thread(
-                    target=self._handle, args=(conn,), daemon=True
-                ).start()
+            except TimeoutError:
+                continue
             except OSError:
-                break  # socket closed by shutdown
+                break
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+        self._server = None
+        if self._path.exists():
+            self._path.unlink(missing_ok=True)
 
     def _handle(self, conn: socket.socket) -> None:
         """Handle a single IPC connection."""
