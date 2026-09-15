@@ -18,6 +18,7 @@ class Evidence(TypedDict):
     boundary_stop: str | None
     approval_binding: str | None
 
+
 # Principals
 USER = "User"  # sole root of authority
 AGENT = "Agent"  # untrusted LLM proposer

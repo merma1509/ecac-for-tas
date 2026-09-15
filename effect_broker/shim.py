@@ -226,9 +226,7 @@ class FileShim:
                     Integrity.USER,
                 ),
             ),
-            capability_nonce=self._find_capability(
-                op.operation, op.resource, op.extra_resources
-            ),
+            capability_nonce=self._find_capability(op.operation, op.resource, op.extra_resources),
             delegation_chain=(self.tool_name, "broker-shim"),
             known_targets=known_targets,
         )

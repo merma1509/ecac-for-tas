@@ -51,8 +51,8 @@ class LedgerVerdict(Enum):
     """
 
     CONFIRMED_COMMITTED = auto()  # effect reached state, authorized, observed
-    CONFIRMED_BLOCKED = auto()    # effect attempted, authorization revoked, observed 0-state
-    UNKNOWN = auto()              # cannot verify outcome (possible bypass)
+    CONFIRMED_BLOCKED = auto()  # effect attempted, authorization revoked, observed 0-state
+    UNKNOWN = auto()  # cannot verify outcome (possible bypass)
 
 
 @dataclass(frozen=True)
@@ -202,9 +202,7 @@ class IndependentEffectLedger:
                 return UnknownLedgerResult(
                     reason=f"observed_without_authorization(task={task_id},nonce={nonce})"
                 )
-            return UnknownLedgerResult(
-                reason=f"no_record(nonce={nonce})"
-            )
+            return UnknownLedgerResult(reason=f"no_record(nonce={nonce})")
 
         # Get the complete authorized target set (merge all auth entries)
         authorized_targets: frozenset[str] = frozenset()
@@ -214,8 +212,7 @@ class IndependentEffectLedger:
         if not obs_entries:
             # Authorized but no observation -> possible direct bypass
             return UnknownLedgerResult(
-                reason=f"authorized_not_observed(task={task_id},nonce={nonce},"
-                f"possible_bypass)"
+                reason=f"authorized_not_observed(task={task_id},nonce={nonce},possible_bypass)"
             )
 
         # Classify observations: committed (effect was applied) vs blocked (gate rejected)
@@ -256,9 +253,7 @@ class IndependentEffectLedger:
             return LedgerVerdict.CONFIRMED_COMMITTED
 
         # No committed, no blocked — shouldn't happen with non-empty obs_entries
-        return UnknownLedgerResult(
-            reason=f"unknown_observation_type(task={task_id},nonce={nonce})"
-        )
+        return UnknownLedgerResult(reason=f"unknown_observation_type(task={task_id},nonce={nonce})")
 
     def verify_all(self, authorized_records: dict[tuple[str, str], frozenset[str]]) -> list[str]:
         """Verify complete mediation across all records.
@@ -287,7 +282,9 @@ class IndependentEffectLedger:
         unauthorized_observed = observed_keys - authorized_keys
         for key in unauthorized_observed:
             task_id, nonce = key
-            failures.append(f"UNKNOWN(observed_without_authorization(task={task_id},nonce={nonce}))")
+            failures.append(
+                f"UNKNOWN(observed_without_authorization(task={task_id},nonce={nonce}))"
+            )
 
         for key, authorized_targets in authorized_records.items():
             task_id, nonce = key
@@ -310,14 +307,9 @@ class IndependentEffectLedger:
                 # Only then is this NOT a failure. If the verdict is CONFIRMED_BLOCKED
                 # without explicit source, treat as UNKNOWN.
                 obs_entries = self._observations.get(key, [])
-                is_explicit_blocked = any(
-                    "BLOCKED" in entry.source
-                    for entry in obs_entries
-                )
+                is_explicit_blocked = any("BLOCKED" in entry.source for entry in obs_entries)
                 if not is_explicit_blocked:
-                    failures.append(
-                        f"BLOCKED_BUT_NOT_EXPLICIT(task={task_id},nonce={nonce})"
-                    )
+                    failures.append(f"BLOCKED_BUT_NOT_EXPLICIT(task={task_id},nonce={nonce})")
 
         return failures
 
@@ -381,6 +373,7 @@ class UnknownLedgerResult:
 # Mechanism for regular ledger verification (on-demand AND scheduled).
 # A PeriodicAuditor can be registered with broker or an external orchestrator
 # to periodically verify that all authorized effects have been observed.
+
 
 @dataclass
 class AuditSnapshot:
@@ -523,8 +516,8 @@ class PeriodicAuditor:
         self._previous_snapshot = None
 
     def last_snapshot(self) -> AuditSnapshot | None:
-            """Return the snapshot from the last audit, or None if never audited."""
-            return self._previous_snapshot
+        """Return the snapshot from the last audit, or None if never audited."""
+        return self._previous_snapshot
 
 
 EffectObserver = IndependentEffectLedger

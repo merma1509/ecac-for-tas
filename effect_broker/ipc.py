@@ -108,9 +108,7 @@ class LedgerBackend(ABC):
         """Verify the outcome of a single effect."""
 
     @abstractmethod
-    def verify_all(
-        self, authorized_records: dict[tuple[str, str], frozenset[str]]
-    ) -> list[str]:
+    def verify_all(self, authorized_records: dict[tuple[str, str], frozenset[str]]) -> list[str]:
         """Verify multiple nonces at once. Returns list of failure nonces."""
 
     @abstractmethod
@@ -167,9 +165,7 @@ class LocalLedgerBackend(LedgerBackend):
     def verify(self, task_id: str, nonce: str) -> LedgerVerdict | UnknownLedgerResult:
         return self._ledger.verify(task_id, nonce)
 
-    def verify_all(
-        self, authorized_records: dict[tuple[str, str], frozenset[str]]
-    ) -> list[str]:
+    def verify_all(self, authorized_records: dict[tuple[str, str], frozenset[str]]) -> list[str]:
         return self._ledger.verify_all(authorized_records)
 
     def get_entries(
@@ -194,9 +190,7 @@ class LocalLedgerBackend(LedgerBackend):
 
 
 # ---- IPC wire format ----
-def _serialize_request(
-    kind: LedgerRequest, payload: dict[str, Any]
-) -> bytes:
+def _serialize_request(kind: LedgerRequest, payload: dict[str, Any]) -> bytes:
     # Length-prefixed format: "<length>\n<json>" — matches LedgerProcessServer._handle
     body = json.dumps({"kind": kind.name, "payload": payload}).encode()
     return str(len(body)).encode() + b"\n" + body
@@ -243,8 +237,7 @@ class ProcessLedgerClient(LedgerBackend):
                     resp = _parse_response(raw)
             except OSError as e:
                 raise RuntimeError(
-                    f"Ledger IPC failed ({req.name}): {e}. "
-                    "Ensure the ledger process is running."
+                    f"Ledger IPC failed ({req.name}): {e}. Ensure the ledger process is running."
                 ) from e
 
         if not resp.ok:
@@ -297,12 +290,9 @@ class ProcessLedgerClient(LedgerBackend):
             return UnknownLedgerResult(reason=result["reason"])
         return LedgerVerdict[result]
 
-    def verify_all(
-        self, authorized_records: dict[tuple[str, str], frozenset[str]]
-    ) -> list[str]:
+    def verify_all(self, authorized_records: dict[tuple[str, str], frozenset[str]]) -> list[str]:
         serialized = {
-            f"{tid}${nonce}": list(targets)
-            for (tid, nonce), targets in authorized_records.items()
+            f"{tid}${nonce}": list(targets) for (tid, nonce), targets in authorized_records.items()
         }
         return self._send(LedgerRequest.VERIFY_ALL, {"records": serialized})  # type: ignore[no-any-return]
 
@@ -312,18 +302,14 @@ class ProcessLedgerClient(LedgerBackend):
         from .ledger import LedgerEntry
 
         # Raw dict entries — reconstruct LedgerEntry objects
-        raw = self._send(
-            LedgerRequest.GET_ENTRIES, {"task_id": task_id, "nonce": nonce}
-        )
+        raw = self._send(LedgerRequest.GET_ENTRIES, {"task_id": task_id, "nonce": nonce})
         return [
             LedgerEntry(
                 task_id=e["task_id"],
                 nonce=e["nonce"],
                 authorized_targets=frozenset(e["authorized_targets"]),
                 observed_targets=(
-                    frozenset(e["observed_targets"])
-                    if e["observed_targets"] is not None
-                    else None
+                    frozenset(e["observed_targets"]) if e["observed_targets"] is not None else None
                 ),
                 timestamp=e["timestamp"],
                 source=e["source"],
@@ -515,9 +501,7 @@ class LedgerProcessServer:
 
                 case LedgerRequest.RECORD_OBSERVATION:
                     targets_raw = payload["observed_targets"]
-                    obs: frozenset[str] | None = (
-                        frozenset(targets_raw) if targets_raw else None
-                    )
+                    obs: frozenset[str] | None = frozenset(targets_raw) if targets_raw else None
                     ledger.record_observation(
                         payload["task_id"], payload["nonce"], obs, payload["source"]
                     )
@@ -537,9 +521,7 @@ class LedgerProcessServer:
                     return {"ok": True, "result": failures}
 
                 case LedgerRequest.GET_ENTRIES:
-                    entries = ledger.get_entries(
-                        payload.get("task_id"), payload.get("nonce")
-                    )
+                    entries = ledger.get_entries(payload.get("task_id"), payload.get("nonce"))
                     return {
                         "ok": True,
                         "result": [
@@ -636,9 +618,7 @@ class LedgerProcessHandle:
         start = time.monotonic()
         while (time.monotonic() - start) < timeout:
             if self._proc.poll() is not None:
-                raise RuntimeError(
-                    f"Ledger process exited early: {self._proc.returncode}"
-                )
+                raise RuntimeError(f"Ledger process exited early: {self._proc.returncode}")
             if self._socket_path.exists():
                 break
             time.sleep(0.05)
@@ -646,14 +626,14 @@ class LedgerProcessHandle:
             self._proc.terminate()
             self._proc.wait(timeout=2)
             raise RuntimeError(
-                f"Ledger socket never created within {timeout}s "
-                f"(socket: {self._socket_path})"
+                f"Ledger socket never created within {timeout}s (socket: {self._socket_path})"
             )
         time.sleep(0.5)  # Let accept loop fully start
 
     def stop(self, timeout: float = 2.0) -> None:
         """Terminate the ledger subprocess."""
         import subprocess
+
         if self._proc is None:
             return
         self._proc.terminate()
