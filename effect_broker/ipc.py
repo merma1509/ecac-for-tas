@@ -343,7 +343,7 @@ class ProcessLedgerClient(LedgerBackend):
     def get_authorization_entries(
         self,
     ) -> dict[tuple[str, str], list[LedgerEntry]]:
-        raw = self._send(LedgerRequest.GET_AUTHORIZATION_ENTRIES, {})  # type: ignore[no-any-return]
+        raw = self._send(LedgerRequest.GET_AUTHORIZATION_ENTRIES, {})
         result: dict[tuple[str, str], list[LedgerEntry]] = {}
         for key_str, entries in raw.items():
             tid, nonce = key_str.split("$", 1)
