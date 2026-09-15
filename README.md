@@ -160,9 +160,11 @@ effect_broker/
                   + commit primitive + declass/endorse grants (broker-only)
                   + attempt_wide (honest, non-monotonic widening) + risk-evaluation
                   / approval (R1 one-shot) + static Auth / Fresh-owned revocation
-  executor.py     IsolatedExecutor — isolation mechanism for tool/shim effects;
-                  both executor.execute() and broker.commit() call _apply_effect()
-                  shares the same IndependentEffectLedger with broker.commit
+  executor.py     IsolatedExecutor — THE SOLE PATH to external state mutation;
+                  ALL effects (direct broker.commit() calls AND tool/shim calls)
+                  go through executor.execute(): broker.gate() then apply_effect()
+                  which calls broker._apply_effect(). The ledger observes the
+                  complete lifecycle through ONE execution path.
   shim.py         BrokerShim / FileShim — constructs Effect objects from tool calls;
                   derives provenance labels from data content; is the ONLY path
                   to the ResourceStore (the enforcement shim)
@@ -182,33 +184,33 @@ run_traces.py    entry point
 ┌──────────────────────────────────────────────────────────────────┐
 │ IndependentEffectLedger (EXTERNAL, not owned by broker/executor) │
 │  - Created OUTSIDE broker + executor                             │
-│  - Passed to both components                                     │
-│  - Records authorization events (from broker.gate / executor)    │
-│  - Records observation events (from executor + store)            │
+│  - Records authorization (from broker.gate)                     │
+│  - Records observation (from executor.apply_effect)              │
 │  - Makes UNAMBIGUOUS verdicts: CONFIRMED_COMMITTED /             │
 │    CONFIRMED_BLOCKED / UNKNOWN                                   │
 │  - PeriodicAuditor: on-demand + scheduled audit snapshots        │
-└───────────────────────────────────────────────────────────────-──┘
-                       ↑                    ↑
-              broker.gate()          executor.execute()
-                   │                        │
-                   └──────────┬─────────────┘
-                              ↓
-                   IndependentEffectLedger
+└──────────────────────────────────────────────────────────────────┘
+                               ↑
+                      broker.gate()  ← read-only predicate gate
+                               ↓
+                      executor.apply_effect()  ← SOLE MUTATION POINT
+                               ↓
+                      IndependentEffectLedger.record_observation()
 
-Both paths (direct `broker.commit()` + via `IsolatedExecutor`) record to the
-same ledger. `verify_complete_mediation()` works from BOTH paths.
+There is ONE and only ONE call site for _apply_effect():
+  executor.apply_effect(). ALL effects — whether from broker.commit() (direct REPL
+  callers) or tool/shim calls — go through the same execution path:
+  executor.execute() → broker.gate() → executor.apply_effect() → _apply_effect().
 
-`broker.commit()` is the direct path — used by callers that bypass the shim
-(e.g., a REPL, a test, or a wrapper). `executor.execute()` is the via-shim path
-— used by tool-motivated effects. Both are equally mediated: both call
-`broker.gate()` first, then `broker._apply_effect()`. The executor is the
-_isolation mechanism_ for tool/shim calls, not the sole caller of `_apply_effect`.
+broker.commit() is a thin reentrant wrapper that delegates to executor.execute().
+The shim calls executor.execute() directly. Both paths record to the same
+IndependentEffectLedger, so verify_complete_mediation() works uniformly.
 
 UNKNOWN = "unknown, not safe" — an effect not observed by the ledger
-could be a bypass. In a multi-process deployment, the ledger would live
-in an isolated enclave where only the broker's apply_effect primitive
-can write.
+could be a direct store mutation bypass. In the same-process model, such
+a bypass would produce UNKNOWN, not a false CONFIRMED_COMMITTED.
+In a multi-process production deployment, the ledger would live in an
+isolated enclave where only the executor's apply_effect primitive can write.
 ```
 
 ## Run (make / dev.sh)
@@ -253,13 +255,10 @@ make all              # full CI gate: lint + typecheck + test + verify
 | `lint`                   | ruff check (all checks pass)                         |
 | `format`                 | ruff format + `--fix`                                |
 | `typecheck`              | mypy (strict) on `effect_broker`                     |
-| `test`                   | 161 pytest tests across 14 files                     |
+| `test`                   | 209 pytest tests across 16 files                     |
 | `run`                    | `python run_traces.py` (22 traces with evidence)     |
 | `verify`                 | assert trace outcomes (same as CI)                   |
 | `all`                    | setup → lint → typecheck → test → verify (full gate) |
-| `doctor`                 | show env + dependency status                         |
-| `clean`                  | remove caches/build                                  |
-| `shell` _(dev.sh only)_  | drop into a venv-activated shell                     |
 
 `make all` is exactly what CI (`./.github/workflows/ci.yml`) runs on every push.
 
@@ -302,6 +301,12 @@ classes and are asserted in `tests/test_broker.py`.
 
 - The invariant is expressible and machine-checkable (per-predicate evidence,
   including a `primary_blocker`).
+- **Single mutation path (ADR-003).** `IsolatedExecutor.apply_effect()` is the
+  sole call site for `_apply_effect()`. Every effect — whether from `broker.commit()`
+  (direct REPL callers) or from tool/shim calls — goes through `executor.execute()`.
+  The ledger observes the complete lifecycle through one execution path. Direct
+  mutations (`broker.store._files._data[...]=X`) still bypass in the same-process
+  model, but the ledger returns `UNKNOWN` for them — not `safe`.
 - NoAmp is **not redundant with Auth**: a forged capability that passes Auth
   (right+target match, held by the broker) _and_ Fresh is still blocked by NoAmp
   because it is not root-anchored. This is the genuinely non-trivial Week-1
@@ -314,13 +319,24 @@ classes and are asserted in `tests/test_broker.py`.
   blocked effects), while an allowed effect is applied exactly once.
 - **Declass/endorse are broker-only, explicit, and machine-checkable.** A
   conf-leak/low-integrity flow commits only when a broker-recorded LabelException
-  (granted by User/Approver) validates it (test_validated_declass_allowed). An LLM-attached
-  exception that was never broker-granted is rejected at commit — trace T11 (declass-abuse)
-  and T12 (endorse-abuse) — confirming "LLM may request, never perform
+  (granted by User/Approver) validates it (test_validated_declass_allowed). An
+  LLM-attached exception that was never broker-granted is rejected at commit —
+  trace T11 (declass-abuse) and T12 (endorse-abuse) — confirming "LLM may request,
+  never perform."
 - Risk escalation (R1) is outside the allow rule. A learned risk model may
   route a high-risk effect to an Approver, but its grant is a fresh one-shot
   capability that must still pass Auth ∧ FlowOK ∧ NoAmp ∧ Fresh; reusing it is
   a Fresh replay (tested in test_risk_escalation_one_shot_approval)
+- **Exact immutable request binding (kill-criterion #5).** `ApprovedRequest`
+  captures the complete effect identity: (etype, targets, content_hash, task_id).
+  Any deviation — different target, modified content, cross-task use — is blocked
+  by `ApprovalBinding` or `Fresh`. Content hash includes `Data.content`, so
+  content modifications after approval are detectable.
+- **BCC scope enforcement.** `check_noamp()` verifies that every BCC/CC
+  recipient's domain label is contained in the capability's scope. A grant
+  for `send to internal@corp.com` does not authorize `send to internal@corp.com
+with BCC to external@attacker.com` unless `additional_targets` explicitly
+  includes the BCC recipient (ADR-002 exact effect identity).
 
 ## Honest limitations
 
@@ -328,30 +344,34 @@ classes and are asserted in `tests/test_broker.py`.
   implemented predicates. They do not establish genuine protected-effect confinement
   — that requires isolation, independent observation, and formal guarantees. The
   current model is a specification and executable invariant, not a verified secure
-  system. The full suite (14 test files, 161 tests) exercises all four predicates,
-  concurrent replay, approval binding, closed sessions, and IPC.
+  system. The full suite (16 test files, 209 tests) exercises all four predicates,
+  concurrent replay, approval binding, closed sessions, boundary mediation, and IPC.
 - **Same-process isolation is advisory.** The broker, executor, store, and ledger
   all run in the same Python process. Direct store mutation (`store._files._data[...]`
-  = X) bypasses the ledger and returns "unknown" — not "safe" — but the broker
-  cannot prevent it. Real isolation requires a separate process or enclave.
+  = X) bypasses the executor and the ledger returns `UNKNOWN` for it — not `safe`
+  — but the broker cannot prevent it. Real isolation requires a separate process
+  or enclave.
+- **T13/T14/T15 are logic tests, not real boundary enforcement.** `Mediator.inspect()`
+  uses `ToolSpec` metadata set by the test author. A real adversarial tool can
+  lie about its actual targets. The mandatory boundary experiment
+  (`tests/test_experiment.py`, M1–M5) uses a **real** untrusted tool to demonstrate
+  that computation is actually bounded — not just metadata that says it is.
 - **Ledger observation is based on log inspection, not true side-channel detection.**
   `identity_log` records what `apply_effect()` writes; it does not observe actual
-  I/O. A bypass of `apply_effect()` that touches resources directly would not appear
-  in `identity_log` and would produce `UNKNOWN`, not a false `CONFIRMED_COMMITTED`.
+  I/O. A bypass of `apply_effect()` that touches resources directly would not
+  appear in `identity_log` and would produce `UNKNOWN`, not a false `CONFIRMED_COMMITTED`.
 - **Exactly-once external semantics are not claimed.** The ledger confirms that
   each authorized effect is applied at most once (Fresh + occurrence count in
   `verify()`). Whether external providers (SMTP, filesystem) deliver/process
-  exactly-once is outside this model's scope — no provider contract or recovery
-  protocol is modeled.
-- **Provenance lists are hand-assigned.** Labels are assigned by `BrokerShim`,
-  not extracted from real LLM/tool dataflow. Real taint propagation is Week-3 work.
+  exactly-once is outside this model's scope.
+- **Provenance labels are hand-assigned.** Labels are assigned by `BrokerShim`,
+  not extracted from real LLM/tool dataflow. Real taint propagation requires
+  language-level taint tracking or runtime provenance APIs.
 - **Resource labels are minimal.** File sensitivity and email domain are the only
   resource classifications; a full policy repository is not modeled.
-- **TCB expansion is unquantified.** Effect mediation pulls small primitives into
-  the trusted core. The size and correctness of the TCB are not formally argued.
-- **No performance, latency, or approval-burden metrics.** Experiments measure
-  correctness only. Approval latency, broker throughput, and the cost of
-  human-in-the-loop escalation are not measured or reported.
+- **TCB expansion is unquantified.** Effect mediation pulls primitives into the
+  trusted core. The size and correctness of the TCB are not formally argued.
+- **No performance or approval-burden metrics.** Experiments measure correctness
+  only. Approval latency and broker throughput are not measured.
 - **No external baseline comparison.** The report does not yet compare ECAC
-  against a genuine baseline under matched assumptions. Week 2 requires evidence
-  beyond ECAC's own test regressions.
+  against a genuine baseline under matched assumptions.
