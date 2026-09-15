@@ -1,50 +1,44 @@
-"""The EffectBroker: the only principal that can commit an effect.
+"""The EffectBroker: policy evaluation engine.
 
-Evaluates the four predicates at commit time and returns machine-checkable
-evidence for every allow/deny decision.
+The broker evaluates the four-predicate gate (Auth, FlowOK, NoAmp, Fresh) and
+issues machine-checkable evidence for every commit decision.
 
-The four-predicate gate (Auth and FlowOK and NoAmp and Fresh) is the ONLY path to
-external state mutation. Each predicate has a single, explicit responsibility:
+IMPORTANT — Architecture change (ADR-003):
+  The broker NO LONGER calls _apply_effect() directly. ALL effects — direct
+  broker.commit() calls AND tool/shim calls — go through IsolatedExecutor,
+  which is the sole mutation point. broker.commit() is a reentrant wrapper
+  that routes through executor.execute(). The executor records authorization
+  and observation to the ledger, so the ledger observes the complete lifecycle
+  through one path.
 
-  Auth    : complete static-and-dynamic judgment
-            (root-anchored + monotonic + bottom-scoped + task-bounded + matches)
-  FlowOK  : IFC over provenance labels, bounded by task's flow_boundary
-  NoAmp   : path-based composition safety (root-anchoring/monotonicity are in Auth)
-  Fresh   : task-scoped lifetime/revocation/replay (Session clock)
+  OLD (removed):
+    broker.commit() → gate() → _apply_effect()         ← TWO mutation paths
+    executor.execute() → broker.gate() → apply_effect() ↗
 
-This split directly addresses the critique: "forged capabilities
-pass a deliberately weak Auth" — Auth is now the complete gate, and NoAmp
-covers only composition safety.
+  NEW (single-path):
+    broker.commit() → executor.execute() → broker.gate() → executor.apply_effect() → _apply_effect()
+    shim calls executor.execute() → broker.gate() → executor.apply_effect() → _apply_effect()
+                                              ↑                                ↑
+                                        read-only gate                  SOLE MUTATION POINT
 
-ARCHITECTURE:
-  ┌──────────────────────────────────────────────────────────┐
-  │  IndependentEffectLedger (EXTERNAL, not owned by broker) │
-  │  - Created outside broker + executor                     │
-  │  - Passed to both components                             │
-  │  - Records authorization (from broker.gate)              │
-  │  - Records observation (from executor + store)           │
-  │  - Makes UNAMBIGUOUS verdicts: COMMITTED/BLOCKED/UNKNOWN │
-  └──────────────────────────────────────────────────────────┘
-                       ↑                    ↑
-              broker.gate()          executor.apply()
-                   │                        │
-                   └──────────┬─────────────┘
-                              ↓
-                   IndependentEffectLedger
+  There is ONE and only ONE call site for _apply_effect(): executor.apply_effect().
+  Direct mutations (broker.store._files._data[...]=X) still bypass in same-process
+  mode, but the ledger returns "unknown" for them — NOT "safe."
 
-DELEGATION: broker.commit() handles gate() + _apply_effect() for direct callers
-For the shim/executor path, the executor calls broker.gate() then applies
-via broker._apply_effect() — the observer records from both paths.
+FOUR-PREDICATE GATE (Auth ∧ FlowOK ∧ NoAmp ∧ Fresh):
 
-THREAD SAFETY: Fresh replay-check + nonce-reservation is atomic (locked)
-If gate() fails after the nonce is reserved, the nonce is RELEASED (so a
-blocked effect does not consume a valid one-shot capability)
+  Auth    : static authorization — root-anchored + monotonic + bottom-scoped
+            + task-bounded + exact (right, target, holder) match
+  FlowOK  : IFC — provenance labels must not exceed task's flow_boundary
+  NoAmp   : composition safety — effect authority within task ceiling scope,
+            plus extra-target scope check for BCC/CC recipients
+  Fresh   : dynamic authorization — unexpired, unrevoked, not replayed
+            (task-scoped logical clock; per-task used-nonce set)
 
-KNOWN LIMITATIONS:
-  - Provenance labels are assigned by the shim, not derived from real dataflow
-  - Direct ResourceStore mutation is untracked (same-process assumption)
-  - Declass/endorse grants are matched by kind+target+from_label without
-    exact effect identity verification (only ApprovedRequest enforces full binding)
+SAME-PROCESS LIMITATION: The broker, executor, store, and ledger all share
+a Python process. Direct store mutation (broker.store._files._data[...] = X)
+bypasses the executor and the ledger returns "unknown" — not "safe."
+Real isolation requires a separate process/enclave (production target).
 """
 
 from __future__ import annotations
@@ -52,6 +46,7 @@ from __future__ import annotations
 import threading
 from typing import cast
 
+from .executor import IsolatedExecutor
 from .ipc import LedgerBackend, LocalLedgerBackend
 from .ledger import IndependentEffectLedger
 from .mediation import MediationVerdict, Mediator
@@ -91,16 +86,19 @@ def _wrap_ledger(
 
 
 __all__ = [
-    "EffectBroker", "Evidence", "CommitGateResult",
-    "LabelException",  "Task", "TaskId",
+    "EffectBroker",
+    "Evidence",
+    "CommitGateResult",
+    "LabelException",
+    "Task",
+    "TaskId",
     "ApprovedRequest",
     "Capability",
     "Effect",
     "Commit",
 ]
 
-# Trusted roots: only these principals may seed NEW authority. Everything else
-# must attenuate an existing root-anchored capability (monotonic, no widening)
+# Trusted roots: only these principals may seed NEW authority.
 TRUSTED_ROOTS: frozenset[str] = frozenset({USER})
 
 # Type aliases
@@ -114,15 +112,9 @@ def _provides(auth_capability: Capability, right: str, target: str) -> bool:
 
 class EffectBroker:
     def __init__(self, ledger: LedgerSource = None) -> None:
-        # Ledger backend (local or remote IPC).
-        # Both broker.commit() (direct) and executor.execute() (via-shim)
-        # record to THIS ledger. This is the key to "unknown, not safe":
-        # the ledger observes independently from both paths, with equal
-        # authority to verify. Neither broker nor executor owns the ledger.
-        # Supports:
-        #   - None: creates LocalLedgerBackend + IndependentEffectLedger (same-process)
-        #   - IndependentEffectLedger: wraps it in LocalLedgerBackend
-        #   - ProcessLedgerClient: forwards over IPC to a separate ledger process
+        # Ledger backend (local or remote IPC). The ledger is the single
+        # source of truth for mediation verdicts. Neither broker nor
+        # executor can modify ledger entries after recording.
         self._ledger_backend, self._local_ledger = _wrap_ledger(ledger)
         # Capability store: nonce -> Capability
         self.capabilities: dict[str, Capability] = {}
@@ -130,35 +122,40 @@ class EffectBroker:
         self.label_exceptions: dict[str, LabelException] = {}
         # One-shot approvals from Approver (nonce -> expiry)
         self.approvals: dict[str, float] = {}
-        # External state (R = F ∪ E ∪ M) — only apply_effect() may mutate it
-        # RestrictedResourceStore uses read-only proxies for files/emails/mailboxes
-        # Direct mutation attempts (store.files[key] = X) raise TypeError
-        # In a real deployment, store lives in an isolated process with only
-        # the apply_effect primitive as its write path
+        # External state (R = F ∪ E ∪ M) — only executor.apply_effect()
+        # may mutate it via _apply_effect(). In production, the store lives
+        # in an isolated process/enclave with apply_effect as its sole write path.
         self.store: ResourceStore = ResourceStore()
-        # Registered tasks: task_id -> Task (provides ceiling + session)
+        # Registered tasks: task_id -> Task
         self.tasks: dict[TaskId, Task] = {}
-        # Risk model stub: may route to Approver but is NOT part of allow rule
-        self.risk_override: float = 0.0  # > 0 triggers escalation for testing
-        # Nonces revoked without a task_id (global revocation, affects all sessions)
+        # Risk model stub (NOT part of the allow rule)
+        self.risk_override: float = 0.0
+        # Nonces revoked without a task_id (global revocation)
         self.global_revoked: set[str] = set()
         self.logical_time: float = 0.0
-        # Mediator: the enforcement shim that detects declared-vs-actual
-        # mismatches (T13/T14/T15). None = boundary mediation disabled
+        # Mediator: enforcement shim for tool boundary (T13/T14/T15)
         self._mediator: Mediator | None = None
-        # Per-task locks for atomic replay-check + nonce-reservation.
-        # Each task gets its own lock so concurrent commits in DIFFERENT tasks
-        # are not serialized unnecessarily. This closes the race:
-        #   Thread 1: gate() reads used=∅ -> Fresh PASS
-        #   Thread 2: gate() reads used=∅ -> Fresh PASS
-        #   Thread 1: _apply_effect() adds nonce -> used={nonce}
-        #   Thread 2: _apply_effect() adds nonce -> used={nonce}  <- DOUBLE COMMIT!
-        # With per-task locks, only one thread can check-and-reserve at a time.
+        # Per-task locks for atomic Fresh check + nonce reservation
         self._task_locks: dict[TaskId, threading.Lock] = {}
+
+        # THE SOLE EXECUTOR for all effects (ADR-003).
+        # ALL commit operations route through this executor.
+        # broker.commit() is a reentrant wrapper that calls self._executor.execute().
+        # There is NO other path to _apply_effect().
+        self._executor: IsolatedExecutor = IsolatedExecutor(broker=self)
+        # Inject the ledger into the executor so both share the same records.
+        # This is the key to "one path, one ledger": authorization and observation
+        # are recorded from the same execution context.
+        self._executor._set_ledger(self.ledger)
 
     def set_mediator(self, mediator: Mediator) -> None:
         """Attach a Mediator (the enforcement shim) to this broker"""
         self._mediator = mediator
+
+    @property
+    def executor(self) -> IsolatedExecutor:
+        """The sole executor for this broker. All effects go through it."""
+        return self._executor
 
     # ---- capability management (monotonic, root-anchored) ----
     def grant_root(self, capability: Capability) -> None:
@@ -423,9 +420,7 @@ class EffectBroker:
         approved_req = ApprovedRequest(
             nonce=nonce,
             etype=effect.etype,
-            targets=EffectTarget(
-                primary=effect.target, additional=all_targets - {effect.target}
-            ),
+            targets=EffectTarget(primary=effect.target, additional=all_targets - {effect.target}),
             content_hash=content_hash,
             expiry=expiry,
             task_id=task_id,
@@ -561,8 +556,7 @@ class EffectBroker:
         is_wildcard = "*" in task.ceiling.scope
         target_for_scope_check = self._scope_label_for_target(effect.target)
         scope_ok = is_wildcard or (
-            capability.scope <= task.ceiling.scope
-            and target_for_scope_check in task.ceiling.scope
+            capability.scope <= task.ceiling.scope and target_for_scope_check in task.ceiling.scope
         )
         if not scope_ok:
             return (
@@ -815,78 +809,31 @@ class EffectBroker:
         commit: Commit,
         mediation: MediationVerdict | None = None,
     ) -> tuple[bool, Evidence]:
-        """Evaluate the four-predicate gate and return result.
+        """Commit an effect — routes through the sole executor.
 
-        This is the DIRECT path (no executor). It records to broker._observer
-        so that verify_complete_mediation() works from BOTH direct commits
-        and shim/executor commits.
+        This is a thin reentrant wrapper: it calls executor.execute(), which
+        calls broker.gate() and (on allow) executor.apply_effect() — which is
+        the ONLY call site for _apply_effect(). ALL effects — direct broker.commit()
+        calls and tool/shim calls — go through the SAME execution path.
 
-        The two-phase pattern:
-          1. gate() evaluates predicates (read-only)
-          2. _apply_effect() applies state mutation (only on can_apply=True)
+        The executor records authorization (from gate) and observation (from
+        apply_effect) to the shared ledger, so the ledger sees the complete
+        lifecycle through one path.
+
+        Args:
+            commit: the prepared effect with commit metadata
+            mediation: optional pre-built boundary mediation verdict
+
+        Returns:
+            (allow, evidence) — same as gate() but with state applied on allow
         """
-        effect = commit.effect
-        task = commit.task
-
-        # Get or create task (same logic as gate())
-        if task is None:
-            task = self.tasks.get("default")
-            if task is None:
-                default_ceiling = Capability(
-                    owner=USER,
-                    holder=BROKER,
-                    right="*",
-                    target="*",
-                    scope=frozenset({"*"}),
-                    expiry=float("inf"),
-                    nonce="default-ceiling",
-                )
-                task = Task(task_id="default", owner=USER, ceiling=default_ceiling)
-                self.tasks[task.task_id] = task
-
-        # Determine authorized targets for observer record.
-        # CRITICAL: use canonical complete_targets() — same source as executor
-        # and grant_approval. Never re-extract from metadata independently.
-        authorized_targets = effect.complete_targets()
-
-        # Phase 1: gate evaluation (read-only)
-        gate_result = self.gate(commit, mediation)
-        allow = gate_result.allow
-        evidence = gate_result.evidence
-
-        # Record authorization in the independent ledger
-        # task_id comes from gate_result.task, not the raw commit.task
-        task_id = gate_result.task.task_id
-        nonce = effect.capability_nonce
-        self._ledger_backend.record_authorization(
-            task_id, nonce, authorized_targets, source="broker.gate"
-        )
-
-        if allow:
-            # Phase 2: apply state mutation (sole mutation point)
-            self._apply_effect(gate_result.effect, gate_result.task)
-
-            # Record observation: read the complete target set from identity_log
-            identity_entries = self.store.identity_log
-            if identity_entries:
-                last_entry = identity_entries[-1]
-                self._ledger_backend.record_observation(
-                    task_id, nonce, last_entry, source="broker.commit"
-                )
-        else:
-            # BLOCKed effect: record explicit blocked observation.
-            # auth > 0, obs = frozenset() -> CONFIRMED_BLOCKED (observer saw attempt)
-            # This is distinct from no observation record -> UNKNOWN (possible bypass).
-            self._ledger_backend.record_observation(
-                task_id, nonce, None, source="broker.commit:BLOCKED"
-            )
-
-        return allow, evidence
+        return self._executor.execute(commit, mediation=mediation)
 
     def commit_effect(self, effect: Effect, task: Task | None = None) -> tuple[bool, Evidence]:
         """Stage and commit an effect within task `task`.
 
         If task is None, a permissive default task is created (same as commit()).
+        All commit operations go through the sole executor.
         """
         return self.commit(Commit(effect, task))
 
@@ -998,7 +945,7 @@ class EffectBroker:
                 if effect.etype != stored.etype:
                     approval_binding_ok = False
                     approval_binding_msg = (
-                   f"etype-mismatch(approved={stored.etype},got={effect.etype})"
+                        f"etype-mismatch(approved={stored.etype},got={effect.etype})"
                     )
                 elif effect.target != stored.targets.primary:
                     approval_binding_ok = False
@@ -1081,19 +1028,15 @@ class EffectBroker:
     def apply_effect(self, commit_or_effect: Commit | Effect, task: Task | None = None) -> None:
         """Apply an effect to external state. CALLER must verify gate first.
 
-        This is the SECOND phase of commit, called by the IsolatedExecutor
-        AFTER gate() returns can_apply=True. It:
-          1. Marks the nonce as used (replay prevention)
-          2. Applies the effect to the store (identity_log + effects_log)
+        DEPRECATED: This is the SECOND phase of commit, called by the IsolatedExecutor
+        AFTER gate() returns can_apply=True. Call broker.commit() instead —
+        it routes through the sole executor automatically. Direct calls to
+        apply_effect() bypass the gate and the ledger.
+
+        If called directly (backwards compat), it applies without ledger observation.
 
         IMPORTANT: This method does NOT check predicates. The caller is
         responsible for calling gate() first and checking can_apply=True.
-        This separation enables independent observer verification.
-
-        Args:
-            commit_or_effect: Either a Commit (for backwards compat) or a raw
-                Effect. If Commit, task is ignored (taken from commit.task).
-                If Effect, task must be provided.
         """
         if isinstance(commit_or_effect, Commit):
             effect = commit_or_effect.effect
