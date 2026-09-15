@@ -298,7 +298,7 @@ classes and are asserted in `tests/test_broker.py`.
 > remote tool because the broker either blocks it or the guarantee stops at the
 > broker->tool boundary (per "Tool/MCP semantics honesty" in the brief).
 
-## Findings (Week 1)
+## Findings
 
 - The invariant is expressible and machine-checkable (per-predicate evidence,
   including a `primary_blocker`).
