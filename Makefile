@@ -19,8 +19,6 @@ help:
 
 # ---- CI gate ----
 # Full CI gate: lint + typecheck + test + experiment verification.
-# Excludes test_ipc.py and test_periodic_audit.py (require real socket/subprocess setup).
-# Run them manually with: uv run pytest tests/test_ipc.py tests/test_periodic_audit.py
 all: lint typecheck test experiment ## Full CI gate (lint, typecheck, test, experiment)
 
 ## Install uv itself (idempotent), in case the machine does not have it
@@ -49,9 +47,9 @@ format: ## Auto-format effect_broker in place with ruff
 typecheck: ## Type-check effect_broker with mypy (strict)
 	uv run mypy effect_broker/
 
-## Run the pytest suite (161 tests, 14 files; skips IPC + periodic audit which require socket/subprocess setup)
-test: ## Run the pytest suite
-	PYTHONPATH=. uv run pytest tests/ --ignore=tests/test_ipc.py --ignore=tests/test_periodic_audit.py
+## Run the full pytest suite (209 tests, 16 files)
+test: ## Run the full pytest suite (all test files)
+	PYTHONPATH=. uv run pytest tests/
 
 ## Run the adversarial trace suite (the tiny executable model, 22 traces)
 run: ## Run the adversarial trace suite (22 traces: T1-T20 + benign)
