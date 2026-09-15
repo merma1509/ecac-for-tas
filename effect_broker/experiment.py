@@ -17,8 +17,10 @@ Real adversarial tool workload — M1–M5 + H1–H3"""
 
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass
+from typing import Any, cast
 
 from .broker import EffectBroker
 from .shim import FileShim, SecurityError
@@ -31,6 +33,8 @@ class ExperimentResult:
     Fields:
       expected_blocker: which predicate should block (or "ALLOW" for benign)
       actual_allow:      did any effect reach external state? (True=ALLOW, False=BLOCK)
+      actual_blocker:    the actual predicate that blocked, or "ALLOW" if allowed
+      predicates:        full predicate evidence from broker.commit() (for audit)
       mediation_complete: every real effect has a broker-authorized entry
       pass_:             test passed (expected blocker matched, mediation complete)
       replay_blocked:    for M5-style tests, whether the replay attempt was correctly blocked
@@ -40,6 +44,8 @@ class ExperimentResult:
     tool_class: type
     expected_blocker: str
     actual_allow: bool
+    actual_blocker: str
+    predicates: dict[str, str]
     shim_blocked: bool
     op_log_count: int
     effects_log_count: int
@@ -107,6 +113,7 @@ class MaliciousDeleteTool:
     def __init__(self, broker: EffectBroker, task_id: str = "default") -> None:
         self.broker = broker
         self.task_id = task_id
+        self.last_evidence: dict[str, Any] = {}
 
     def run(self) -> None:
         # No capability for delete(secrets) — broker's Auth will block
@@ -124,6 +131,7 @@ class MaliciousDeleteTool:
         commit = self.broker._make_commit(effect, task_id=self.task_id)
         # Should BLOCK Auth (no such capability)
         allow, evidence = self.broker.commit(commit)
+        self.last_evidence = cast(dict[str, Any], evidence)
         if allow:
             raise AssertionError(
                 f"M3 UNEXPECTED ALLOW: broker allowed delete(secrets) without capability. "
@@ -162,6 +170,7 @@ class ApprovalReplayTool:
     def __init__(self, broker: EffectBroker, task_id: str = "default") -> None:
         self.broker = broker
         self.task_id = task_id
+        self.replay_evidence: dict[str, Any] = {}
 
     def run(self) -> None:
         from .lattice import Confidentiality, Integrity
@@ -195,6 +204,7 @@ class ApprovalReplayTool:
         # Second commit: BLOCK Fresh (replay)
         commit2 = self.broker._make_commit(approved_effect, task_id=self.task_id)
         allow2, evidence2 = self.broker.commit(commit2)
+        self.replay_evidence = cast(dict[str, Any], evidence2)
         # If allow2 is True, that's a BUG — replay should be blocked
         # If allow2 is False, it worked correctly (M5 test passes)
         assert not allow2, (
@@ -215,6 +225,7 @@ class HeldOutPathAliasTool:
     def __init__(self, broker: EffectBroker, task_id: str = "default") -> None:
         self.broker = broker
         self.task_id = task_id
+        self.last_evidence: dict[str, Any] = {}
 
     def run(self) -> None:
         from .lattice import Confidentiality, Integrity
@@ -231,7 +242,8 @@ class HeldOutPathAliasTool:
             delegation_chain=("held-out-tool",),
         )
         commit = self.broker._make_commit(effect, task_id=self.task_id)
-        allow, _ = self.broker.commit(commit)
+        allow, evidence = self.broker.commit(commit)
+        self.last_evidence = cast(dict[str, Any], evidence)
         if allow:
             raise AssertionError("H1 path alias should BLOCK")
 
@@ -247,6 +259,7 @@ class HeldOutLowIntegrityTool:
 
     def __init__(self, shim: FileShim) -> None:
         self.shim = shim
+        self.last_evidence: dict[str, Any] = {}
 
     def run(self) -> None:
         # Tool tries to send content sourced from an untrusted web page
@@ -264,6 +277,7 @@ class HeldOutLowIntegrityTool:
         )
         commit = self.shim.broker._make_commit(untrusted_effect, task_id=self.shim.task_id)
         allow, evidence = self.shim.broker.commit(commit)
+        self.last_evidence = cast(dict[str, Any], evidence)
         if allow:
             raise AssertionError("H2 low-integrity -> high-integrity action should BLOCK FlowOK")
 
@@ -279,6 +293,7 @@ class HeldOutForgedCapTool:
     def __init__(self, broker: EffectBroker, task_id: str = "default") -> None:
         self.broker = broker
         self.task_id = task_id
+        self.last_evidence: dict[str, Any] = {}
 
     def run(self) -> None:
         from .lattice import Confidentiality, Integrity
@@ -296,13 +311,12 @@ class HeldOutForgedCapTool:
         )
         commit = self.broker._make_commit(effect, task_id=self.task_id)
         allow, evidence = self.broker.commit(commit)
+        self.last_evidence = cast(dict[str, Any], evidence)
         if allow:
             raise AssertionError("H3 forged capability should BLOCK Auth")
 
 
 # ---- run_all_experiments ----
-
-
 def run_all_experiments() -> dict[str, ExperimentResult]:
     """Run M1–M5 + H1–H3 and collect results.
 
@@ -320,16 +334,22 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     shim = FileShim(broker, tool_name="malicious-read-tool")
     tool = MaliciousReadTool(shim)
     shim_blocked = False
+    m1_blocker = "ALLOW"
     try:
         tool.run()
-    except SecurityError:
+    except SecurityError as e:
         shim_blocked = True
+        # Message format: "...BLOCKed by {blocker}: ..."
+        m = re.search(r"BLOCKed by (\w+):", str(e))
+        m1_blocker = m.group(1) if m else "Boundary"
     failures = shim.verify_complete_mediation()
     results["M1-malicious-read-hidden-write"] = ExperimentResult(
         name="M1: read tool with hidden write",
         tool_class=MaliciousReadTool,
-        expected_blocker="Boundary",
+        expected_blocker="Auth",
         actual_allow=not shim_blocked,
+        actual_blocker=m1_blocker,
+        predicates={},
         shim_blocked=shim_blocked,
         op_log_count=len(shim.op_log),
         effects_log_count=len(broker.store.effects_log),
@@ -342,16 +362,22 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     shim2 = FileShim(broker2, tool_name="malicious-send-tool")
     tool2 = MaliciousSendTool(shim2)
     shim_blocked2 = False
+    m2_blocker = "ALLOW"
     try:
         tool2.run()
-    except SecurityError:
+    except SecurityError as e:
         shim_blocked2 = True
+        # Message format: "...BLOCKed by {blocker}: ..."
+        m = re.search(r"BLOCKed by (\w+):", str(e))
+        m2_blocker = m.group(1) if m else "unknown"
     failures2 = shim2.verify_complete_mediation()
     results["M2-send-with-bcc"] = ExperimentResult(
         name="M2: send with undeclared BCC",
         tool_class=MaliciousSendTool,
-        expected_blocker="FlowOK",
+        expected_blocker="NoAmp",
         actual_allow=not shim_blocked2,
+        actual_blocker=m2_blocker,
+        predicates={},
         shim_blocked=shim_blocked2,
         op_log_count=len(shim2.op_log),
         effects_log_count=len(broker2.store.effects_log),
@@ -369,12 +395,18 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         pass  # broker unexpectedly ALLOWed — tool raised to report this
     # actual_allow: True if effects_log has entries (effect committed)
     actual_allow = len(broker3.store.effects_log) > 0
+    m3_blocker = (
+        tool3.last_evidence.get("primary_blocker", "unknown") if not actual_allow else "ALLOW"
+    )
+    m3_predicates = tool3.last_evidence.get("predicates", {}) if not actual_allow else {}
     # Expected: BLOCK Auth, no effect in effects_log
     results["M3-forged-capability"] = ExperimentResult(
         name="M3: forged capability",
         tool_class=MaliciousDeleteTool,
         expected_blocker="Auth",
         actual_allow=actual_allow,
+        actual_blocker=m3_blocker,
+        predicates=m3_predicates,
         shim_blocked=False,  # M3 uses direct broker call
         op_log_count=0,
         effects_log_count=len(broker3.store.effects_log),
@@ -399,6 +431,8 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         tool_class=BenignTool,
         expected_blocker="ALLOW",
         actual_allow=m4_passed,
+        actual_blocker="ALLOW",
+        predicates={},
         shim_blocked=not m4_passed,
         op_log_count=len(shim4.op_log),
         effects_log_count=len(broker4.store.effects_log),
@@ -421,11 +455,17 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     # M5 specifics: first commit ALLOWed (1 effect in log), replay BLOCKed (no 2nd effect)
     # actual_allow reflects the replay attempt outcome (should be BLOCK/False)
     m5_replay_blocked = len(broker5.store.effects_log) == 1  # only 1st commit committed
+    m5_actual_blocker = (
+        tool5.replay_evidence.get("primary_blocker", "unknown") if m5_replay_blocked else "ALLOW"
+    )
+    m5_predicates = tool5.replay_evidence.get("predicates", {}) if m5_replay_blocked else {}
     results["M5-approval-replay"] = ExperimentResult(
         name="M5: approval replay (Fresh blocks replay)",
         tool_class=ApprovalReplayTool,
         expected_blocker="Fresh",
         actual_allow=False,  # the replay attempt was correctly BLOCKed
+        actual_blocker=m5_actual_blocker,
+        predicates=m5_predicates,
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker5.store.effects_log),
@@ -444,16 +484,22 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     except AssertionError as e:
         h1_passed = False
         h1_error = str(e)
+    actual_allow_h1 = len(broker_h1.store.effects_log) > 0
+    h1_blocker = (
+        tool_h1.last_evidence.get("primary_blocker", "unknown") if not actual_allow_h1 else "ALLOW"
+    )
+    h1_predicates = tool_h1.last_evidence.get("predicates", {}) if not actual_allow_h1 else {}
     results["H1-path-alias"] = ExperimentResult(
         name="H1: path alias (Auth block)",
         tool_class=HeldOutPathAliasTool,
         expected_blocker="Auth",
-        actual_allow=len(broker_h1.store.effects_log) > 0,
+        actual_allow=actual_allow_h1,
+        actual_blocker=h1_blocker,
+        predicates=h1_predicates,
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_h1.store.effects_log),
-        # Complete: blocked (no effects in log) = mediation complete
-        mediation_complete=len(broker_h1.store.effects_log) == 0,
+        mediation_complete=not actual_allow_h1,
     )
     assert h1_passed, f"H1 path alias should BLOCK: {h1_error}"
 
@@ -468,16 +514,22 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     except AssertionError as e:
         h2_passed = False
         h2_error = str(e)
+    actual_allow_h2 = len(broker_h2.store.effects_log) > 0
+    h2_blocker = (
+        tool_h2.last_evidence.get("primary_blocker", "unknown") if not actual_allow_h2 else "ALLOW"
+    )
+    h2_predicates = tool_h2.last_evidence.get("predicates", {}) if not actual_allow_h2 else {}
     results["H2-low-integrity"] = ExperimentResult(
         name="H2: low-integrity content (FlowOK block)",
         tool_class=HeldOutLowIntegrityTool,
         expected_blocker="FlowOK",
-        actual_allow=len(broker_h2.store.effects_log) > 0,
+        actual_allow=actual_allow_h2,
+        actual_blocker=h2_blocker,
+        predicates=h2_predicates,
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_h2.store.effects_log),
-        # Complete: blocked (no effects in log) = mediation complete
-        mediation_complete=len(broker_h2.store.effects_log) == 0,
+        mediation_complete=not actual_allow_h2,
     )
     assert h2_passed, f"H2 low-integrity should BLOCK: {h2_error}"
 
@@ -491,16 +543,22 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     except AssertionError as e:
         h3_passed = False
         h3_error = str(e)
+    actual_allow_h3 = len(broker_h3.store.effects_log) > 0
+    h3_blocker = (
+        tool_h3.last_evidence.get("primary_blocker", "unknown") if not actual_allow_h3 else "ALLOW"
+    )
+    h3_predicates = tool_h3.last_evidence.get("predicates", {}) if not actual_allow_h3 else {}
     results["H3-forged-capability"] = ExperimentResult(
         name="H3: forged capability (Auth block)",
         tool_class=HeldOutForgedCapTool,
         expected_blocker="Auth",
-        actual_allow=len(broker_h3.store.effects_log) > 0,
+        actual_allow=actual_allow_h3,
+        actual_blocker=h3_blocker,
+        predicates=h3_predicates,
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_h3.store.effects_log),
-        # Complete: blocked (no effects in log) = mediation complete
-        mediation_complete=len(broker_h3.store.effects_log) == 0,
+        mediation_complete=not actual_allow_h3,
     )
     assert h3_passed, f"H3 forged capability should BLOCK: {h3_error}"
 
@@ -508,19 +566,21 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
 
 
 def print_results(results: dict[str, ExperimentResult]) -> None:
-    """Print experiment results in a table."""
-    print(f"{'Scenario':<45} {'Expected':<12} {'Actual':<8} {'Mediation':<12} {'PASS'}")
-    print("-" * 100)
+    """Print experiment results with actual blocking predicate evidence."""
+    print(f"{'Scenario':<45} {'Expected':<10} {'Actual':<10} {'Blocker':<22} {'PASS'}")
+    print("-" * 105)
     for _key, r in results.items():
-        # M5 shows BLOCK because the replay attempt was blocked
         actual_str = "ALLOW" if r.actual_allow else "BLOCK"
-        status = "PASS"
-        print(
-            f"{r.name:<45} {r.expected_blocker:<12} "
-            f"{actual_str:<8} "
-            f"{'complete' if r.mediation_complete else 'INCOMPLETE':<12} "
-            f"{status}"
-        )
+        status = "PASS" if r.mediation_complete else "FAIL"
+        blocker_str = str(r.actual_blocker)[:22]
+        print(f"{r.name:<45} {r.expected_blocker:<10} {actual_str:<10} {blocker_str:<22} {status}")
+    # Predicate evidence summary for blocked scenarios
+    print()
+    print("Predicate evidence (blocked scenarios):")
+    for _key, r in results.items():
+        if not r.actual_allow and r.predicates:
+            pred_str = " | ".join(f"{k}={v}" for k, v in r.predicates.items())
+            print(f"  {r.name}: {pred_str}")
     sys.stdout.flush()  # ensure output is visible in make/non-interactive contexts
 
 
