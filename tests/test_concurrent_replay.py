@@ -565,3 +565,109 @@ class TestConcurrentCrossTask:
             f"Expected 4 ALLOWs (4 different tasks, same nonce), got {allow_count}. "
             f"Results: {results}"
         )
+
+
+class TestCapabilityTaskIdScoping:
+    """Task-scoped capabilities: capability.task_id restricts use to one task.
+
+    Auth sub-check 6: a Capability with task_id != None must be used ONLY
+    in the matching task. A cap scoped to task-A cannot be used in task-B.
+
+    This is distinct from Fresh (per-task session.used set) — Auth task_id check
+    is a STATIC authorization constraint, not a dynamic replay constraint.
+    """
+
+    def test_cap_with_task_id_used_in_wrong_task_blocked_by_auth(self) -> None:
+        """Capability scoped to task-A used in task-B: blocked by Auth (task-bounded).
+
+        The capability has task_id="t1". The commit is in task="t2".
+        Auth sub-check 6 detects the mismatch and blocks at Auth (not Fresh).
+        """
+        broker = build()
+        t1 = _make_task("t1")
+        t2 = _make_task("t2")
+        broker.register_task(t1)
+        broker.register_task(t2)
+
+        # Capability with task_id="t1" (scoped to task t1)
+        cap = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="task-scoped-cap",
+            task_id="t1",  # ← explicitly scoped to task "t1"
+            derives_from=None,
+        )
+        broker.capabilities["task-scoped-cap"] = cap
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce="task-scoped-cap",
+            delegation_chain=(),
+        )
+
+        # Use in task t1: ALLOW
+        commit_t1 = broker._make_commit(effect, task_id="t1")
+        allow1, ev1 = broker.commit(commit_t1)
+        assert allow1 is True, f"Task t1 should ALLOW: {ev1}"
+
+        # Use in task t2: BLOCKED by Auth (task_scope_mismatch)
+        commit_t2 = broker._make_commit(effect, task_id="t2")
+        allow2, ev2 = broker.commit(commit_t2)
+        assert allow2 is False
+        assert ev2["primary_blocker"] == "Auth"
+        assert "task-scope-mismatch" in ev2["predicates"]["Auth"]
+
+    def test_cap_without_task_id_can_be_used_in_any_task(self) -> None:
+        """Capability without task_id can be used in any task (no task scoping).
+
+        This is the complementary case: no task_id means the capability is
+        task-agnostic. Fresh still prevents reuse within the same task (replay),
+        but different tasks can each use it once (separate session.used sets).
+        """
+        broker = build()
+        t1 = _make_task("any-t1")
+        t2 = _make_task("any-t2")
+        broker.register_task(t1)
+        broker.register_task(t2)
+
+        # Capability WITHOUT task_id (task-agnostic)
+        cap = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="task-agnostic-cap",
+            # task_id=None (default) — no task scoping
+            derives_from=None,
+        )
+        broker.capabilities["task-agnostic-cap"] = cap
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce="task-agnostic-cap",
+            delegation_chain=(),
+        )
+
+        # Both tasks can use it (each has its own session.used set)
+        allow1, ev1 = broker.commit(broker._make_commit(effect, task_id="any-t1"))
+        assert allow1 is True, f"Task any-t1 should ALLOW: {ev1}"
+
+        allow2, ev2 = broker.commit(broker._make_commit(effect, task_id="any-t2"))
+        assert allow2 is True, f"Task any-t2 should ALLOW: {ev2}"
+
+        # Third use in any-t1: replay (Fresh blocks, same session.used)
+        allow3, ev3 = broker.commit(broker._make_commit(effect, task_id="any-t1"))
+        assert allow3 is False
+        assert ev3["primary_blocker"] == "Fresh"
