@@ -46,6 +46,7 @@ def _warn_once() -> None:
             stacklevel=2,
         )
 
+
 class _FilesView(Mapping[str, File]):
     """Read-only view of files — live snapshot of the store's files dict."""
 
@@ -93,6 +94,7 @@ class _MailboxesView(Mapping[str, Mailbox]):
     def __len__(self) -> int:
         return len(self._store._mailboxes._data)
 
+
 # Store initialization helper
 @dataclass
 class _FilesStore:
@@ -113,6 +115,7 @@ class _MailboxesStore:
     """Internal mutable storage for mailboxes."""
 
     _data: dict[str, Mailbox] = field(default_factory=dict)
+
 
 # RestrictedResourceStore
 @dataclass
@@ -158,9 +161,7 @@ class RestrictedResourceStore:
     # These should only be called during store initialization/setup.
     # After that, all mutations go through apply_effect().
 
-    def _unsafe_bootstrap_file(
-        self, path: str, sensitivity: Confidentiality
-    ) -> None:
+    def _unsafe_bootstrap_file(self, path: str, sensitivity: Confidentiality) -> None:
         """BOOTSTRAP ONLY: pre-populate a file resource before broker runs."""
         self._files._data[path] = File(path, sensitivity)
 
@@ -191,9 +192,7 @@ class RestrictedResourceStore:
         domain = uri.split("://", 1)[1].split("/")[0] if "://" in uri else uri
         return URL(uri=uri, scope=frozenset({domain}))
 
-    def _deliver_to_targets(
-        self, effect: Effect, all_targets: frozenset[str]
-    ) -> None:
+    def _deliver_to_targets(self, effect: Effect, all_targets: frozenset[str]) -> None:
         """Deliver a send effect to ALL targets (primary + additional recipients).
 
         Email records and mailbox entries are created HERE in apply_effect,
@@ -219,9 +218,7 @@ class RestrictedResourceStore:
 
             # Deliver to the sender's outbox
             local = addr.split("@")[0]
-            mb = self._mailboxes._data.setdefault(
-                local, Mailbox(local)
-            )
+            mb = self._mailboxes._data.setdefault(local, Mailbox(local))
             body = ""
             if effect.metadata.get("body"):
                 body = f": {effect.metadata['body']}"
@@ -302,6 +299,7 @@ class RestrictedResourceStore:
             raise ValueError(
                 f"effect type {effect.etype} not applicable to {type(resource).__name__}"
             )
+
 
 # Backwards-compat alias (for existing code that imports ResourceStore)
 ResourceStore = RestrictedResourceStore
