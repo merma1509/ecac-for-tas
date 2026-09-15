@@ -51,23 +51,23 @@ typecheck: ## Type-check effect_broker with mypy (strict)
 
 ## Run the pytest suite (161 tests, 14 files; skips IPC + periodic audit which require socket/subprocess setup)
 test: ## Run the pytest suite
-	uv run pytest tests/ --ignore=tests/test_ipc.py --ignore=tests/test_periodic_audit.py
+	PYTHONPATH=. uv run pytest tests/ --ignore=tests/test_ipc.py --ignore=tests/test_periodic_audit.py
 
 ## Run the adversarial trace suite (the tiny executable model, 22 traces)
 run: ## Run the adversarial trace suite (22 traces: T1-T20 + benign)
-	@uv run python -W ignore -c "from effect_broker.resources import _warn_same_process_once; _warn_same_process_once()" 2>/dev/null || true
-	@uv run python run_traces.py
+	@PYTHONPATH=. uv run python -W ignore -c "from effect_broker.resources import _warn_same_process_once; _warn_same_process_once()" 2>/dev/null || true
+	@PYTHONPATH=. uv run python run_traces.py
 
 ## Run the mandatory experiments (M1-M5 + H1-H3) and verify all pass
 experiment: ## Run M1-M5 + H1-H3 experiments; exit 0 only if all pass
-	@uv run python -m effect_broker.experiment 2>&1
+	@PYTHONPATH=. uv run python -m effect_broker.experiment 2>&1
 	@echo ""
 
 ## Assert machine-checkable trace outcomes (all 22 traces from run_traces.py)
 # Note: run_traces.py outputs each trace on a single line in this format:
 #   [T{N} description -> ALLOW|BLOCK] -> ALLOW|BLOCK  primary_blocker={blocker}
 verify: ## Assert machine-checkable trace outcomes (22 traces)
-	@uv run python -W ignore run_traces.py > /tmp/traces.txt 2>&1
+	@PYTHONPATH=. uv run python -W ignore run_traces.py > /tmp/traces.txt 2>&1
 	@grep -q "T1 clean benign send.*ALLOW.*primary_blocker=none" /tmp/traces.txt && echo "T1 ok"
 	@grep -q "T2 prompt-injection.*BLOCK.*primary_blocker=FlowOK" /tmp/traces.txt && echo "T2 ok"
 	@grep -q "T3 confused-deputy.*BLOCK.*primary_blocker=Auth" /tmp/traces.txt && echo "T3 ok"
