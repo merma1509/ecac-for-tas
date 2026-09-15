@@ -446,7 +446,7 @@ class TestLedgerObservationRecorded:
             "BUG: blocked observation was NOT recorded. "
             "CONFIRMED_BLOCKED requires auth > 0 + obs = empty set with BLOCKED source."
         )
-        assert obs_entries[0].source == "broker.commit:BLOCKED"
+        assert obs_entries[0].source == "executor.execute:BLOCKED"
 
 
 class TestApprovalExpiry:
