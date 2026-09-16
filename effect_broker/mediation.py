@@ -98,21 +98,31 @@ class Mediator:
         if spec.monitoring:
             return MediationVerdict(False, "monitor-bypass")
 
-        # T14: the tool performs an undeclared side effect
-        if spec.known_side_effects:
+        # T13 vs T14: check declared_targets FIRST, then side_effects
+        #
+        # T14 (ECAC philosophy): declared effect is ALLOW'd
+        #   effect.target ∈ declared_targets → broker ALLOWs the declared effect.
+        #   Side effects are outside broker scope → audit/observer concern.
+        if effect.target in spec.declared_targets:
+            return MediationVerdict(True, None)
+
+        # Effect target is NOT in declared_targets. Check if the tool actually
+        # knows about this target (in known_side_effects → T13 or actual_targets → T13).
+        if effect.target in spec.known_side_effects:
+            # T13: tool listed this target in known_side_effects but didn't declare it.
+            # The tool has actual knowledge of this resource — BLOCK as false description.
             return MediationVerdict(False, "hidden-side-effect")
 
-        # T13: declared vs. actual target mismatch
-        if effect.target not in spec.declared_targets:
-            if effect.target in spec.actual_targets:
-                return MediationVerdict(
-                    False,
-                    f"false-description(declared={spec.declared_targets},"
-                    f"actual={spec.actual_targets})",
-                )
-            return MediationVerdict(False, "unknown-tool-target")
+        if effect.target in spec.actual_targets:
+            # T13: tool's actual_targets includes this target, but not in declared_targets.
+            # Clear false description: tool claims X, broker effect is Y.
+            return MediationVerdict(
+                False,
+                f"false-description(declared={spec.declared_targets},"
+                f"actual={spec.actual_targets})",
+            )
 
-        return MediationVerdict(True, None)
+        return MediationVerdict(False, "unknown-tool-target")
 
     def register_tool(self, spec: ToolSpec) -> None:
         """Register a tool spec with this mediator."""
