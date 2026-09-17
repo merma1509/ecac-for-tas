@@ -281,3 +281,123 @@ class TestSessionLiveFalseBlocks:
         # Reopen attempt raises
         with pytest.raises(ValueError, match="cannot be reopened"):
             task.session.live = True
+
+
+class TestTaskReRegistrationReplay:
+    """REPLAY GUARD: task_id cannot be silently re-registered after use.
+
+    This prevents the attack:
+      1. Commit nonce X → session.used = {X}
+      2. Close session → session.live = False
+      3. register_task(Task(task_id="same", ...)) with fresh session
+      4. Re-use nonce X → replay (old session's used set is lost)
+
+    With the guard, step 3 raises ValueError if the existing task
+    has nonces in its used set. To restart a task, use a DIFFERENT task_id.
+    """
+
+    def test_used_task_cannot_be_reregistered(self) -> None:
+        """A task that has committed a nonce cannot be re-registered."""
+        broker = build()
+        task = _make_task("default", live=True)
+        broker.register_task(task)
+        nonce = _grant(broker, task, "send", "internal@corp.com")
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce=nonce,
+            delegation_chain=(),
+        )
+
+        # Commit: session.used = {nonce}
+        allow, _ = broker.commit(broker._make_commit(effect, task_id="default"))
+        assert allow is True
+        assert len(task.session.used) == 1, "nonce should be in used set"
+
+        # Try to re-register with same task_id → raises ValueError
+        new_task = _make_task("default", live=True)
+        with pytest.raises(ValueError, match="already registered and has been used"):
+            broker.register_task(new_task)
+
+    def test_unused_task_can_be_reregistered(self) -> None:
+        """A task that has NEVER committed can be re-registered (e.g. config change)."""
+        broker = build()
+        task = _make_task("default", live=True)
+        broker.register_task(task)
+        # No commits made — session.used is empty
+
+        # Re-registering unused task is allowed (no state to lose)
+        new_task = _make_task("default", live=True)
+        broker.register_task(new_task)  # no exception
+
+    def test_different_task_id_can_be_registered_after_use(self) -> None:
+        """After a task is used, a DIFFERENT task_id can be registered."""
+        broker = build()
+        task_a = _make_task("task-a", live=True)
+        broker.register_task(task_a)
+        nonce_a = _grant(broker, task_a, "send", "internal@corp.com")
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce=nonce_a,
+            delegation_chain=(),
+        )
+        allow, _ = broker.commit(broker._make_commit(effect, task_id="task-a"))
+        assert allow is True
+
+        # Register a DIFFERENT task_id → always allowed
+        task_b = _make_task("task-b", live=True)
+        broker.register_task(task_b)
+        nonce_b = _grant(broker, task_b, "send", "internal@corp.com")
+
+        new_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg-b"),
+            capability_nonce=nonce_b,
+            delegation_chain=(),
+        )
+        allow2, ev2 = broker.commit(broker._make_commit(new_effect, task_id="task-b"))
+        assert allow2 is True, f"Different task_id should ALLOW. Evidence: {ev2}"
+
+    def test_closed_session_reopen_via_reregister_fails(self) -> None:
+        """Closing a session then re-registering the same task_id raises ValueError.
+
+        This is the attack path: attacker tries to bypass closed-session by
+        registering a fresh Task with the same task_id.
+        """
+        broker = build()
+        task = _make_task("default", live=True)
+        broker.register_task(task)
+        nonce = _grant(broker, task, "send", "internal@corp.com")
+
+        effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce=nonce,
+            delegation_chain=(),
+        )
+        # Commit so session.used = {nonce}
+        broker.commit(broker._make_commit(effect, task_id="default"))
+
+        # Close the session
+        task.session.live = False
+
+        # Try to register a fresh Task with the same task_id → REPLAY GUARD fires
+        fresh_task = _make_task("default", live=True)
+        with pytest.raises(ValueError, match="already registered and has been used"):
+            broker.register_task(fresh_task)
+
+        # Still blocked: original task is still registered and closed
+        allow, ev = broker.commit(broker._make_commit(effect, task_id="default"))
+        assert allow is False
+        assert "session-closed" in ev["predicates"]["Fresh"]

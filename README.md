@@ -368,11 +368,11 @@ M2's single catch (T8) is because the attacker-controlled `instruction` has inte
 
 ## Honest limitations
 
-- **161 tests ≠ real confinement.** Passing tests are regression evidence for the
+- **213 tests ≠ real confinement.** Passing tests are regression evidence for the
   implemented predicates. They do not establish genuine protected-effect confinement
   — that requires isolation, independent observation, and formal guarantees. The
   current model is a specification and executable invariant, not a verified secure
-  system. The full suite (16 test files, 209 tests) exercises all four predicates,
+  system. The full suite (16 test files, 213 tests) exercises all four predicates,
   concurrent replay, approval binding, closed sessions, boundary mediation, and IPC.
 - **Same-process isolation is advisory.** The broker, executor, store, and ledger
   all run in the same Python process. Direct store mutation (`store._files._data[...]`

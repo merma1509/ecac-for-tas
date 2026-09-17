@@ -225,7 +225,25 @@ class EffectBroker:
 
     # ---- task management ----
     def register_task(self, task: Task) -> None:
-        """Register a task with the broker. Call this before any effect commit."""
+        """Register a task with the broker. Call this before any effect commit.
+
+        REPLAY GUARD: a task_id may not be re-registered after it has been
+        used (had a session with nonces in `used`). This prevents an attacker
+        from re-registering a task with a fresh session to replay a consumed
+        nonce. To restart a task, call revoke(nonce) for each capability
+        explicitly and then register with a DIFFERENT task_id.
+        """
+        existing = self.tasks.get(task.task_id)
+        if existing is not None and existing.session is not None:
+            # If the existing task ever had a committed nonce (used set non-empty),
+            # it cannot be silently replaced. This prevents replay via session-reopen.
+            if existing.session.used:
+                raise ValueError(
+                    f"task_id '{task.task_id}' is already registered and has been used "
+                    f"(session.used={existing.session.used}). To restart, use a different "
+                    f"task_id or explicitly revoke all nonces first. "
+                    f"Re-registering a used task would allow replay attacks."
+                )
         self.tasks[task.task_id] = task
 
     def get_task(self, task_id: TaskId) -> Task | None:
