@@ -389,7 +389,7 @@ def run_boundary_experiment() -> EffectBroker:
     assert t14_allow is True
     assert t14_evidence["primary_blocker"] is None
     assert broker2.store.effects_log == [("read", "file:file:///trusted")]
-    print("[T14 ECAC: declared target authorized → ALLOW] -> ALLOW")
+    print("[T14 ECAC: declared target authorized → ALLOW] -> ALLOW  primary_blocker=none")
     print(f"    effect_log: {broker2.store.effects_log}")
     print("    (hidden exfil of secrets: ledger catches, not broker gate)")
     print()
