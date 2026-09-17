@@ -14,13 +14,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from effect_broker.model import Effect, EffectTarget, Data
+    from effect_broker.model import Effect
 
 
 @dataclass
 class ToolCallCheckResult:
     allow: bool
-    evidence: dict
+    evidence: dict[str, object]
     blocker: str | None
 
 

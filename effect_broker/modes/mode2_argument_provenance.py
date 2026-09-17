@@ -17,11 +17,10 @@ Unlike Mode #3 (our approach):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from hashlib import sha256
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from effect_broker.model import Effect, EffectTarget, Data
+    from effect_broker.model import Effect
 
 
 @dataclass
@@ -48,7 +47,7 @@ class ProvenanceNode:
 @dataclass
 class Mode2Result:
     allow: bool
-    evidence: dict
+    evidence: dict[str, object]
     blocker: str | None
 
 
