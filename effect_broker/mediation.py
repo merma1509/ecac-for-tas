@@ -98,22 +98,20 @@ class Mediator:
         if spec.monitoring:
             return MediationVerdict(False, "monitor-bypass")
 
-        # T13 vs T14: check declared_targets FIRST, then side_effects
-        #
-        # T14 (ECAC philosophy): declared effect is ALLOW'd
-        #   effect.target ∈ declared_targets → broker ALLOWs the declared effect.
-        #   Side effects are outside broker scope → audit/observer concern.
-        if effect.target in spec.declared_targets:
-            return MediationVerdict(True, None)
+        # T13 vs T14: declared target mismatch first (T13 case)
+        # T14: effect target IS in declared_targets but also in known_side_effects
+        #      (hidden side effect on the same declared resource → BLOCK).
+        # T15: monitoring tool → BLOCK (checked first above).
 
-        # Effect target is NOT in declared_targets. Check if the tool actually
-        # knows about this target (in known_side_effects → T13 or actual_targets → T13).
+        # T14: side effect on the declared target → BLOCK hidden-side-effect.
+        # Only relevant when the effect target is already declared (so T13/false-description
+        # would catch if the target wasn't declared at all).
         if effect.target in spec.known_side_effects:
-            # T13: tool listed this target in known_side_effects but didn't declare it.
-            # The tool has actual knowledge of this resource — BLOCK as false description.
             return MediationVerdict(False, "hidden-side-effect")
 
-        if effect.target in spec.actual_targets:
+        # T13: declared vs. actual target mismatch → false-description.
+        # Only fires when target is in actual_targets but NOT in declared_targets.
+        if effect.target in spec.actual_targets and effect.target not in spec.declared_targets:
             # T13: tool's actual_targets includes this target, but not in declared_targets.
             # Clear false description: tool claims X, broker effect is Y.
             return MediationVerdict(
@@ -121,6 +119,11 @@ class Mediator:
                 f"false-description(declared={spec.declared_targets},"
                 f"actual={spec.actual_targets})",
             )
+
+        # T14 benign / legitimate: effect matches declared shape → ALLOW.
+        # Side effects not on the declared target are outside broker scope.
+        if effect.target in spec.declared_targets:
+            return MediationVerdict(True, None)
 
         return MediationVerdict(False, "unknown-tool-target")
 

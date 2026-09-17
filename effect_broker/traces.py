@@ -343,9 +343,8 @@ def run_boundary_experiment() -> EffectBroker:
     t13_allow, t13_evidence = broker.commit(Commit(t13_effect, tool_name="write-tool"))
 
     # The predicate gate passes (Auth/NoAmp/FlowOK/Fresh all OK), but the
-    # Mediator's ToolSpec shows the tool actually touches secrets -> T14 hidden
-    # side effect. Note: ToolSpec.known_side_effects is checked before declared
-    # target match, so T14 fires
+    # Mediator's ToolSpec shows the tool's actual_targets (secrets) doesn't
+    # match its declared_targets (reports) → T13 false-description.
     assert t13_allow is False
     assert t13_evidence["primary_blocker"] == "Boundary"
     assert t13_evidence["boundary_stop"] == "hidden-side-effect"
