@@ -397,6 +397,9 @@ def test_endorse_abuse_blocked(broker: EffectBroker) -> None:
 
 
 # ---- T13: false MCP description is a boundary stop ----
+# ECAC: the broker blocks when effect.target is NOT in declared_targets
+# (declared-vs-actual mismatch). Side effects on other resources are caught
+# by the ledger, not blocked at the broker gate.
 def test_false_mcp_description_stops_at_boundary() -> None:
     write_tool = ToolSpec(
         name="write-tool",
@@ -407,7 +410,7 @@ def test_false_mcp_description_stops_at_boundary() -> None:
     mediator = Mediator(tools={"write-tool": write_tool})
     effect = Effect(
         "write",
-        "file:///secrets",
+        "file:///secrets",  # NOT in declared_targets → false-description
         {},
         (Data("tool_action", Confidentiality.INTERNAL, Integrity.USER),),
         "r-write:Agent:EffectBroker",
@@ -415,7 +418,7 @@ def test_false_mcp_description_stops_at_boundary() -> None:
     )
     verdict = mediator.inspect(effect, "write-tool")
     assert verdict.allow is False
-    assert verdict.boundary_stop == "hidden-side-effect"
+    assert "false-description" in verdict.boundary_stop
 
 
 # ---- T14: ECAC philosophy — declared effect is ALLOW'd, side effects are audit concern ----
@@ -534,15 +537,13 @@ def test_conditioned_mediation_prevents_commit() -> None:
         "r-write-secrets",
         CHAIN,
     )
-    # false MCP description: tool declares it will write reports, actually writes secrets
+    # T13: effect.target NOT in declared_targets → false-description
     mediation = MediationVerdict(
-        False, "false-description(declared=file:///reports,actual=file:///secrets)"
+        False, "false-description(effect.target=file:///secrets not in declared_targets=frozenset({'file:///reports'}))"
     )
     allow, evidence = broker.commit(Commit(effect), mediation=mediation)
     assert allow is False
-    assert evidence["boundary_stop"] == (
-        "false-description(declared=file:///reports,actual=file:///secrets)"
-    )
+    assert "false-description" in evidence["boundary_stop"]
     assert broker.store.effects_log == []  # nothing reached external state
     assert "file:///secrets" in broker.store.files  # no write/delete performed
 

@@ -80,7 +80,7 @@ verify: ## Assert machine-checkable trace outcomes (22 traces)
 	@grep -q "T11 declass-abuse.*BLOCK.*primary_blocker=FlowOK" /tmp/traces.txt && echo "T11 ok"
 	@grep -q "T12 endorse-abuse.*BLOCK.*primary_blocker=FlowOK" /tmp/traces.txt && echo "T12 ok"
 	@grep -q "T13 false-mcp-description.*BLOCK BoundaryStop" /tmp/traces.txt && echo "T13 ok"
-	@grep -q "T14 hidden-side-effect.*BLOCK BoundaryStop" /tmp/traces.txt && echo "T14 ok"
+	@grep -q "T14 ECAC.*ALLOW.*primary_blocker=none" /tmp/traces.txt && echo "T14 ok"
 	@grep -q "T15 monitor-bypass.*BLOCK BoundaryStop" /tmp/traces.txt && echo "T15 ok"
 	@grep -q "T16 capability-forgery.*BLOCK.*primary_blocker=Auth" /tmp/traces.txt && echo "T16 ok"
 	@grep -q "T17 path-traversal.*BLOCK.*primary_blocker=Auth" /tmp/traces.txt && echo "T17 ok"

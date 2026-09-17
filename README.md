@@ -268,28 +268,28 @@ Each trace is a runnable script: initial state -> agent proposal -> broker
 decision -> expected outcome. They map 1:1 to the brief's Section-4 attack
 classes and are asserted in `tests/test_broker.py`.
 
-| #   | Attack class                         | Expected result  |
-| --- | ------------------------------------ | ---------------- |
-| T1  | clean send (benign)                  | ✅ ALLOW         |
-| T2  | prompt injection                     | ⛔ FlowOK        |
-| T3  | confused deputy                      | ⛔ Auth          |
-| T4  | attacker-controlled URL (SSRF)       | ⛔ NoAmp         |
-| T5  | capability laundering                | ⛔ FlowOK        |
-| T6  | delegation widening                  | ⛔ NoAmp         |
-| T7  | confidential-data leakage            | ⛔ FlowOK        |
-| T8  | low-integrity->privileged action     | ⛔ FlowOK        |
-| T9  | stale approval                       | ⛔ Fresh         |
-| T10 | replay                               | ⛔ Fresh         |
-| T11 | declassification abuse               | ⛔ FlowOK        |
-| T12 | endorsement abuse                    | ⛔ FlowOK        |
-| T13 | false MCP description (hidden write) | ⛔ boundary stop |
-| T14 | hidden side effect                   | ⛔ boundary stop |
-| T15 | monitor bypass                       | ⛔ boundary stop |
-| T16 | capability forgery                   | ⛔ NoAmp         |
-| T17 | path traversal                       | ⛔ Auth          |
-| T18 | recipient spoofing via BCC/CC        | ⛔ FlowOK        |
-| T19 | memory-poisoned instruction          | ⛔ FlowOK        |
-| T20 | amplification via composition        | ⛔ NoAmp         |
+| #   | Attack class                                               | Expected result  |
+| --- | ---------------------------------------------------------- | ---------------- |
+| T1  | clean send (benign)                                        | ✅ ALLOW         |
+| T2  | prompt injection                                           | ⛔ FlowOK        |
+| T3  | confused deputy                                            | ⛔ Auth          |
+| T4  | attacker-controlled URL (SSRF)                             | ⛔ NoAmp         |
+| T5  | capability laundering                                      | ⛔ FlowOK        |
+| T6  | delegation widening                                        | ⛔ NoAmp         |
+| T7  | confidential-data leakage                                  | ⛔ FlowOK        |
+| T8  | low-integrity->privileged action                           | ⛔ FlowOK        |
+| T9  | stale approval                                             | ⛔ Fresh         |
+| T10 | replay                                                     | ⛔ Fresh         |
+| T11 | declassification abuse                                     | ⛔ FlowOK        |
+| T12 | endorsement abuse                                          | ⛔ FlowOK        |
+| T13 | false MCP description (declared vs actual target mismatch) | ⛔ boundary stop |
+| T14 | hidden side effect on declared target                      | ✅ ALLOW         |
+| T15 | monitor bypass                                             | ⛔ boundary stop |
+| T16 | capability forgery                                         | ⛔ NoAmp         |
+| T17 | path traversal                                             | ⛔ Auth          |
+| T18 | recipient spoofing via BCC/CC                              | ⛔ FlowOK        |
+| T19 | memory-poisoned instruction                                | ⛔ FlowOK        |
+| T20 | amplification via composition                              | ⛔ NoAmp         |
 
 > Trace numbers here are the suite order; the code names them `T1..T20` and
 > prints the attack class. The several `BoundaryStop` outcomes (T13/T14/T15)
@@ -379,15 +379,16 @@ M2's single catch (T8) is because the attacker-controlled `instruction` has inte
   = X) bypasses the executor and the ledger returns `UNKNOWN` for it — not `safe`
   — but the broker cannot prevent it. Real isolation requires a separate process
   or enclave.
-- **T13/T14/T15 are logic tests, not real boundary enforcement.** `Mediator.inspect()`
-  uses `ToolSpec` metadata set by the test author. A real adversarial tool can
-  lie about its actual targets. The mandatory boundary experiment
-  (`tests/test_experiment.py`, M1–M5) uses a **real** untrusted tool to demonstrate
-  that computation is actually bounded — not just metadata that says it is.
-- **Ledger observation is based on log inspection, not true side-channel detection.**
-  `identity_log` records what `apply_effect()` writes; it does not observe actual
-  I/O. A bypass of `apply_effect()` that touches resources directly would not
-  appear in `identity_log` and would produce `UNKNOWN`, not a false `CONFIRMED_COMMITTED`.
+- **T13/T14/T15 use metadata, not real enforcement — but strict mode closes the bypass.** `Mediator.inspect()` uses `ToolSpec` metadata set by the test author. A real adversarial tool can lie about its actual targets. **Solution:** set `Mediator(..., strict=True)` — this requires all tools to register with the mediator. Unknown tools are blocked, not permitted. The mandatory boundary experiment (`tests/test_experiment.py`, M1–M5) uses a **real** untrusted tool to demonstrate that computation is actually bounded. **ECAC T14 philosophy:** if the declared target is authorized, the broker ALLOWs — hidden side effects on other resources are caught by the ledger/observer, not blocked at the broker gate. This reflects the scope boundary: the broker cannot see what side effects a tool performs.
+- **T14 (hidden side effect on declared target):** ECAC philosophy — a tool that
+  declares `trusted` but secretly touches `secrets` as a side effect is ALLOWED
+  by the broker. The broker cannot observe hidden side effects — it only sees
+  the declared target. The independent ledger/observer catches the discrepancy
+  in production (observed secrets write not in authorized targets). This is NOT
+  a gap: it's the scope boundary of the broker, and the ledger fills it.
+- **Unknown tool bypass (mitigated):** Without a mediator, any tool_name bypasses
+  boundary mediation. **Mitigation:** `Mediator(..., strict=True)` makes mediator
+  registration mandatory. Unknown tools are BLOCKed, not permitted.
 - **Exactly-once external semantics are not claimed.** The ledger confirms that
   each authorized effect is applied at most once (Fresh + occurrence count in
   `verify()`). Whether external providers (SMTP, filesystem) deliver/process

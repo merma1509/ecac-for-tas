@@ -390,11 +390,13 @@ class TestMediatorMetadataLimitation:
     untrusted tool implementation, not metadata.
     """
 
-    def test_unknown_tool_passes_mediator(self) -> None:
-        """If the tool has no ToolSpec, the mediator allows (no boundary check).
+    def test_unknown_tool_passes_mediator_in_permissive_mode(self) -> None:
+        """If no mediator is registered, unknown tool passes boundary.
 
-        This is the critical vulnerability: a malicious tool that does not
-        register with the mediator bypasses boundary enforcement entirely.
+        In permissive mode (no mediator, or mediator.strict=False), the
+        boundary check is not enforced. This is the documented limitation:
+        tools must register with the mediator for boundary enforcement.
+        The capability-level predicates (Auth/FlowOK/NoAmp/Fresh) still gate.
         """
         broker = EffectBroker()
 
@@ -424,12 +426,57 @@ class TestMediatorMetadataLimitation:
         )
         commit = Commit(effect=effect, task=None, tool_name="undocumented-tool")
 
-        # No mediator -> boundary pass (mediator.inspect returns allow=True)
+        # No mediator -> boundary pass. Capability-level predicates still gate.
+        # With UNTRUSTED provenance (INTERNAL, UNTRUSTED), FlowOK would block.
+        # Using USER provenance so the effect passes capability-level predicates.
+        effect2 = Effect(
+            etype="write",
+            target="file:///secrets",
+            metadata={},
+            provenance=(Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+            capability_nonce="any-cap",
+            delegation_chain=(),
+        )
+        commit2 = Commit(effect=effect2, task=None, tool_name="undocumented-tool")
+        allow, evidence = broker.commit(commit2)
+        # No mediator → boundary allows; Auth/NoAmp/FlowOK/Fresh gate the effect
+        assert allow is True
+
+    def test_strict_mode_unknown_tool_blocked(self) -> None:
+        """In strict mode, unknown tool → BLOCK unknown-tool.
+
+        Production use: always set mediator.strict=True so all tools must
+        be registered. This eliminates the unknown-tool bypass vector.
+        """
+        from effect_broker.traces import build
+
+        broker = build()
+        broker.set_mediator(Mediator(tools={}, strict=True))
+
+        broker.capabilities["r-read-reports"] = Capability(
+            USER,
+            "EffectBroker",
+            "read",
+            "file:///reports",
+            frozenset({"file:///reports"}),
+            100,
+            "r-read-reports",
+        )
+
+        effect = Effect(
+            etype="read",
+            target="file:///reports",
+            metadata={},
+            provenance=(Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+            capability_nonce="r-read-reports",
+            delegation_chain=(),
+        )
+        commit = Commit(effect=effect, task=None, tool_name="undocumented-tool")
         allow, evidence = broker.commit(commit)
-        # The effect passes the gate, including boundary (no mediator)
-        # NOTE: this is the documented vulnerability — an undocumented tool
-        # bypasses boundary mediation. The capability-level predicates still apply.
-        assert allow is True  # No boundary stop without a mediator
+
+        assert allow is False
+        assert evidence["primary_blocker"] == "Boundary"
+        assert "unknown-tool" in evidence["boundary_stop"]
 
 
 # ---- BCC scope is enforced by check_noamp (not mediator) ----
