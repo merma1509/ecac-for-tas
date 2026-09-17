@@ -53,8 +53,7 @@ test: ## Run the full pytest suite (all test files)
 
 ## Run the adversarial trace suite (the tiny executable model, 22 traces)
 run: ## Run the adversarial trace suite (22 traces: T1-T20 + benign)
-	@PYTHONPATH=. uv run python -W ignore -c "from effect_broker.resources import _warn_same_process_once; _warn_same_process_once()" 2>/dev/null || true
-	@PYTHONPATH=. uv run python run_traces.py
+	@PYTHONPATH=. uv run python -W ignore run_traces.py 2>&1
 
 ## Run the mandatory experiments (M1-M5 + H1-H3) and verify all pass
 experiment: ## Run M1-M5 + H1-H3 experiments; exit 0 only if all pass
