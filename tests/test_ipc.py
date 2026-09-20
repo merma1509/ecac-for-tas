@@ -469,3 +469,229 @@ class TestLedgerBackendInterface:
         result = backend.verify("t", "n")
         # With wrong source: obs ⊆ auth → empty ⊆ {"a"} → CONFIRMED_COMMITTED
         assert result == LedgerVerdict.CONFIRMED_COMMITTED
+
+
+# ---- IPC end-to-end: broker + ProcessLedgerClient ----
+@pytest.mark.integration
+class TestBrokerWithProcessLedgerClient:
+    """End-to-end: broker uses ProcessLedgerClient as its ledger backend.
+
+    Verifies the production-ready path: broker + executor record to a
+    separate ledger process, not a local in-process ledger.
+    """
+
+    def test_broker_commits_record_to_remote_ledger(self, tmp_path: Path) -> None:
+        """Broker.commit() records to ProcessLedgerClient — authorized + observed."""
+        import threading
+        import uuid
+
+        from effect_broker.broker import EffectBroker
+        from effect_broker.model import Capability, Commit, Effect, Task
+
+        socket_path = Path(f"/tmp/ledger-broker-test-{uuid.uuid4().hex[:8]}.sock")
+        if socket_path.exists():
+            socket_path.unlink()
+
+        ready = threading.Event()
+        server = LedgerProcessServer(socket_path=socket_path, ready_event=ready)
+
+        server_thread = threading.Thread(target=server.run, daemon=True)
+        server_thread.start()
+
+        try:
+            if not ready.wait(timeout=5.0):
+                pytest.fail("Server did not become ready within 5s")
+
+            # Broker uses ProcessLedgerClient as ledger backend
+            client = ProcessLedgerClient(socket_path=socket_path)
+            broker = EffectBroker(ledger=client)
+
+            # Register task with permissive ceiling and grant capability
+            ceiling = Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="*",
+                target="*",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="default-ceiling",
+            )
+            task = Task(task_id="remote-test", owner="User", ceiling=ceiling)
+            broker.tasks["remote-test"] = task
+
+            cap = Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="read",
+                target="file:///reports",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="cap-remote",
+            )
+            broker.capabilities["cap-remote"] = cap
+
+            # Bootstrap the target resource so apply_effect() succeeds
+            broker.store._unsafe_bootstrap_file("file:///reports", "INTERNAL")
+
+            # Commit an effect
+            effect = Effect(
+                etype="read",
+                target="file:///reports",
+                metadata={},
+                provenance=(),
+                capability_nonce="cap-remote",
+                delegation_chain=(),
+            )
+            commit = Commit(effect=effect, task=task)
+            allow, ev = broker.commit(commit)
+
+            assert allow is True, f"Commit should ALLOW: {ev}"
+
+            # Verify ledger process received both authorization and observation
+            assert client.authorization_count() == 1
+            assert client.observation_count() == 1
+
+            verdict = client.verify("remote-test", "cap-remote")
+            assert verdict == LedgerVerdict.CONFIRMED_COMMITTED
+
+        finally:
+            server.stop()
+            server_thread.join(timeout=2.0)
+            if socket_path.exists():
+                socket_path.unlink(missing_ok=True)
+
+    def test_broker_blocked_effect_records_auth_only(self, tmp_path: Path) -> None:
+        """BLOCKed effect: authorization recorded, but observation has None + BLOCKED source."""
+        import threading
+        import uuid
+
+        from effect_broker.broker import EffectBroker
+        from effect_broker.model import Capability, Commit, Effect, Task
+
+        socket_path = Path(f"/tmp/ledger-broker-blocked-{uuid.uuid4().hex[:8]}.sock")
+        if socket_path.exists():
+            socket_path.unlink()
+
+        ready = threading.Event()
+        server = LedgerProcessServer(socket_path=socket_path, ready_event=ready)
+        server_thread = threading.Thread(target=server.run, daemon=True)
+        server_thread.start()
+
+        try:
+            if not ready.wait(timeout=5.0):
+                pytest.fail("Server did not become ready within 5s")
+
+            client = ProcessLedgerClient(socket_path=socket_path)
+            broker = EffectBroker(ledger=client)
+
+            ceiling = Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="*",
+                target="*",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="default-ceiling",
+            )
+            task = Task(task_id="blocked-test", owner="User", ceiling=ceiling)
+            broker.tasks["blocked-test"] = task
+
+            # No matching capability → BLOCKed by Auth
+            effect = Effect(
+                etype="send",
+                target="internal@corp.com",
+                metadata={},
+                provenance=(),
+                capability_nonce="no-such-cap",
+                delegation_chain=(),
+            )
+            commit = Commit(effect=effect, task=task)
+            allow, ev = broker.commit(commit)
+
+            assert allow is False
+            assert ev["primary_blocker"] == "Auth"
+
+            # Authorization was recorded (gate evaluates predicates, including Auth)
+            assert client.authorization_count() == 1
+            # Observation recorded with None + BLOCKED source
+            assert client.observation_count() == 1
+
+            verdict = client.verify("blocked-test", "no-such-cap")
+            assert verdict == LedgerVerdict.CONFIRMED_BLOCKED
+
+        finally:
+            server.stop()
+            server_thread.join(timeout=2.0)
+            if socket_path.exists():
+                socket_path.unlink(missing_ok=True)
+
+    def test_verify_complete_mediation_via_process_client(self, tmp_path: Path) -> None:
+        """broker.verify_complete_mediation() works via ProcessLedgerClient."""
+        import threading
+        import uuid
+
+        from effect_broker.broker import EffectBroker
+        from effect_broker.model import Capability, Commit, Effect, Task
+
+        socket_path = Path(f"/tmp/ledger-mediation-{uuid.uuid4().hex[:8]}.sock")
+        if socket_path.exists():
+            socket_path.unlink()
+
+        ready = threading.Event()
+        server = LedgerProcessServer(socket_path=socket_path, ready_event=ready)
+        server_thread = threading.Thread(target=server.run, daemon=True)
+        server_thread.start()
+
+        try:
+            if not ready.wait(timeout=5.0):
+                pytest.fail("Server did not become ready within 5s")
+
+            client = ProcessLedgerClient(socket_path=socket_path)
+            broker = EffectBroker(ledger=client)
+
+            ceiling = Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="*",
+                target="*",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="default-ceiling",
+            )
+            task = Task(task_id="mediation-test", owner="User", ceiling=ceiling)
+            broker.tasks["mediation-test"] = task
+
+            cap = Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="read",
+                target="file:///reports",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="cap-med",
+            )
+            broker.capabilities["cap-med"] = cap
+
+            # Bootstrap the target resource
+            broker.store._unsafe_bootstrap_file("file:///reports", "INTERNAL")
+
+            effect = Effect(
+                etype="read",
+                target="file:///reports",
+                metadata={},
+                provenance=(),
+                capability_nonce="cap-med",
+                delegation_chain=(),
+            )
+            commit = Commit(effect=effect, task=task)
+            broker.commit(commit)
+
+            # verify_complete_mediation() calls client.get_authorization_entries()
+            failures = broker.verify_complete_mediation()
+            assert failures == [], f"Expected no failures, got: {failures}"
+
+        finally:
+            server.stop()
+            server_thread.join(timeout=2.0)
+            if socket_path.exists():
+                socket_path.unlink(missing_ok=True)

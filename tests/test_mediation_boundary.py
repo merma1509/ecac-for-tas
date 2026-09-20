@@ -31,6 +31,7 @@ from effect_broker.broker import EffectBroker
 from effect_broker.lattice import Confidentiality, Integrity
 from effect_broker.mediation import Mediator, ToolSpec
 from effect_broker.model import (
+    BROKER,
     Capability,
     Commit,
     Data,
@@ -539,3 +540,183 @@ class TestBCCScopeEnforcement:
         assert evidence["primary_blocker"] == "NoAmp"
         assert "extra-target-outside-scope" in evidence["predicates"]["NoAmp"]
         assert broker.store.effects_log == []
+
+# ---- Fresh-first BCC: approval for send(internal) + extra external → BLOCK ----
+class TestFreshFirstBCCExtraRecipient:
+    """Gap: approval for send(internal) must not allow extra external recipient.
+
+    An approval grant binds the COMPLETE target set. If the effect is used with
+    additional recipients not in the approval, it must be blocked. This tests
+    the Fresh-first path: the approval was granted for send(internal), but the
+    effect uses extra_resources=[external]. The approval_binding check in gate()
+    detects the mismatch and blocks with extra-targets-not-approved.
+    """
+
+    def test_approval_grant_blocks_extra_recipient(self) -> None:
+        """Approval for internal only, effect with extra external → BLOCK."""
+        broker = EffectBroker()
+        broker.logical_time = 0.0
+
+        broker.store._unsafe_bootstrap_email("internal@corp.com", Domain.INTERNAL)
+        broker.store._unsafe_bootstrap_email("external@attacker.com", Domain.EXTERNAL)
+
+        task = Task(
+            task_id="default",
+            owner=USER,
+            ceiling=Capability(
+                USER, "EffectBroker", "send", "internal@corp.com",
+                frozenset({"internal"}), float("inf"), "ceiling-send",
+            ),
+        )
+        broker.register_task(task)
+
+        # Grant approval for send(internal@corp.com) only — no BCC
+        effect = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("msg", Confidentiality.INTERNAL, Integrity.USER, "approved content"),),
+            "unused",
+            delegation_chain=(),
+            known_targets=EffectTarget(primary="internal@corp.com"),
+        )
+        broker.tasks["default"] = task
+        approval_nonce = broker.grant_approval(effect, expiry=100.0, task_id="default")
+
+        # Effect with extra BCC recipient inside cap scope but NOT in the approval.
+        # NoAmp passes (scope="internal", BCC alice@corp.com = "internal").
+        # ApprovalBinding fires (alice not in stored approval).
+        # Using alice@corp.com (same domain) so NoAmp doesn't fire first.
+        broker.store._unsafe_bootstrap_email("alice@corp.com", Domain.INTERNAL)
+        effect_with_bcc = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("msg", Confidentiality.INTERNAL, Integrity.USER, "approved content"),),
+            approval_nonce,
+            delegation_chain=(),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset({"alice@corp.com"}),
+            ),
+        )
+        commit = Commit(effect=effect_with_bcc, task=task, tool_name=None)
+        allow, evidence = broker.commit(commit)
+
+        assert allow is False
+        assert evidence["primary_blocker"] == "ApprovalBinding"
+        assert "extra-targets-not-approved" in evidence.get("approval_binding", "")
+
+    def test_approval_grant_allows_approved_recipients(self) -> None:
+        """Approval for internal + BCC(internal) → ALLOW."""
+        broker = EffectBroker()
+        broker.logical_time = 0.0
+
+        broker.store._unsafe_bootstrap_email("internal@corp.com", Domain.INTERNAL)
+
+        task = Task(
+            task_id="default",
+            owner=USER,
+            ceiling=Capability(
+                USER, "EffectBroker", "send", "internal@corp.com",
+                frozenset({"internal"}), float("inf"), "ceiling-send",
+            ),
+        )
+        broker.register_task(task)
+        broker.tasks["default"] = task
+
+        # Grant approval for send(internal) with additional BCC(internal)
+        effect = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("msg", Confidentiality.INTERNAL, Integrity.USER, "approved content"),),
+            "unused",
+            delegation_chain=(),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset({"alice@corp.com"}),
+            ),
+        )
+        approval_nonce = broker.grant_approval(effect, expiry=100.0, task_id="default")
+
+        # Effect with approved BCC recipient
+        effect_approved = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("msg", Confidentiality.INTERNAL, Integrity.USER, "approved content"),),
+            approval_nonce,
+            delegation_chain=(),
+            known_targets=EffectTarget(
+                primary="internal@corp.com",
+                additional=frozenset({"alice@corp.com"}),
+            ),
+        )
+        approval_nonce = broker.grant_approval(effect, expiry=100.0, task_id="default")
+        commit = Commit(effect=effect_approved, task=task, tool_name=None)
+        allow, evidence = broker.commit(commit)
+
+        assert allow is True
+        assert evidence["primary_blocker"] is None
+        assert broker.store.effects_log == [("send", "email:internal@corp.com")]
+
+    def test_approval_blocks_cross_task_use(self) -> None:
+        """ApprovalBinding: same nonce, wrong task_id → BLOCK."""
+        from effect_broker.broker import EffectBroker
+
+        broker = EffectBroker()
+        broker.logical_time = 0.0
+
+        broker.store._unsafe_bootstrap_email("internal@corp.com", Domain.INTERNAL)
+        task_a = Task(
+            task_id="task-a",
+            owner=USER,
+            ceiling=Capability(
+                USER, "EffectBroker", "send", "internal@corp.com",
+                frozenset({"internal"}), float("inf"), "ceiling-send",
+            ),
+        )
+        broker.register_task(task_a)
+        broker.tasks["task-a"] = task_a
+
+        # Grant approval scoped to task-a
+        grant_effect = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("msg", Confidentiality.INTERNAL, Integrity.USER),),
+            "unused",
+            delegation_chain=(),
+            known_targets=EffectTarget(primary="internal@corp.com"),
+        )
+        approval_nonce = broker.grant_approval(grant_effect, expiry=100.0, task_id="task-a")
+
+        # Commit in task-a: ALLOW
+        task_b = Task(
+            task_id="task-b",
+            owner=USER,
+            ceiling=Capability(
+                USER, "EffectBroker", "send", "internal@corp.com",
+                frozenset({"internal"}), float("inf"), "ceiling-send",
+            ),
+        )
+        broker.register_task(task_b)
+        broker.tasks["task-b"] = task_b
+
+        # Use the same approval nonce in task-b → BLOCK by ApprovalBinding
+        effect_b = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("msg", Confidentiality.INTERNAL, Integrity.USER),),
+            approval_nonce,
+            delegation_chain=(),
+            known_targets=EffectTarget(primary="internal@corp.com"),
+        )
+        commit = Commit(effect=effect_b, task=task_b, tool_name=None)
+        allow, evidence = broker.commit(commit)
+
+        assert allow is False, "Cross-task use should BLOCK"
+        assert evidence["primary_blocker"] == "ApprovalBinding"
+        assert "cross-task-use" in evidence.get("approval_binding", "")

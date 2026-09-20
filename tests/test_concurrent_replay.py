@@ -16,6 +16,7 @@ from __future__ import annotations
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from effect_broker.lattice import Confidentiality, Integrity
 from effect_broker.model import Capability, Commit, Data, Effect, Task
 from effect_broker.traces import build
 
@@ -26,7 +27,7 @@ def _provenance(name: str) -> tuple[Data, ...]:
 
 
 def _make_task(task_id: str) -> Task:
-    # FIXED: capability scope must be domain-level for email targets.
+    # capability scope must be domain-level for email targets.
     # _scope_label_for_target() extracts "internal" from "internal@corp.com".
     # So the ceiling scope must contain {"internal"}, NOT {"internal@corp.com"}.
     # This is the CORRECT structure for domain-scoped email capabilities.
@@ -209,90 +210,103 @@ class TestConcurrentReplayPrevention:
         assert "replay" in ev2["predicates"]["Fresh"]
 
 
-    def test_provenance_order_does_not_affect_hash(self) -> None:
-        """Two effects with same provenance elements in different order
-        produce the SAME content_hash after sorting."""
-        from effect_broker.broker import EffectBroker
+    def test_binding_covers_structure_not_content(self) -> None:
+        """ApprovalBinding checks etype + targets + task_id only.
+
+        Provenance/integrity is validated by FlowOK at commit time, not by binding.
+        Content_hash was removed from ApprovalRequest — binding covers structure only."""
+        from dataclasses import fields
         from effect_broker.lattice import Confidentiality, Integrity
         from effect_broker.model import Data
 
-        broker = EffectBroker()
-        from effect_broker.traces import build
+        # Verify content_hash is NOT in ApprovedRequest
+        from effect_broker.model import ApprovedRequest
+        field_names = {f.name for f in fields(ApprovedRequest)}
+        assert "content_hash" not in field_names, (
+            "content_hash must not be in ApprovedRequest binding"
+        )
+
         broker = build()
-
-        from effect_broker.model import Effect
-
-        # Create two effects with same Data elements in different order
-        provenance_a = (
-            Data("A", Confidentiality.INTERNAL, Integrity.USER, content="payload"),
-            Data("B", Confidentiality.INTERNAL, Integrity.USER, content="payload"),
-        )
-        provenance_b = (
-            Data("B", Confidentiality.INTERNAL, Integrity.USER, content="payload"),
-            Data("A", Confidentiality.INTERNAL, Integrity.USER, content="payload"),
-        )
-
-        effect_a = Effect(
+        # Trigger default task creation if needed
+        task = broker.tasks.get("default")
+        if task is None:
+            m = Effect("send", "internal@corp.com", {}, (), "r-send:Agent:EffectBroker", ())
+            broker.commit(Commit(m))
+            task = broker.tasks["default"]
+        broker.tasks["default"] = task
+        # Grant approval: effect with CONFIDENTIAL data (needs declass to send)
+        effect_conf = Effect(
             etype="send",
             target="internal@corp.com",
             metadata={},
-            provenance=provenance_a,
-            capability_nonce="any-cap",
+            provenance=(Data("secret", Confidentiality.CONFIDENTIAL, Integrity.USER),),
+            capability_nonce="r-send:Agent:EffectBroker",
             delegation_chain=(),
         )
-        effect_b = Effect(
+        nonce = broker.grant_approval(effect_conf, expiry=100.0, task_id="default")
+
+        # Same effect (no declass grant) → blocked by FlowOK (not ApprovalBinding)
+        effect2 = Effect(
             etype="send",
             target="internal@corp.com",
             metadata={},
-            provenance=provenance_b,
-            capability_nonce="any-cap-b",
+            provenance=(Data("secret", Confidentiality.CONFIDENTIAL, Integrity.USER),),
+            capability_nonce=nonce,
             delegation_chain=(),
         )
-
-        # Grant approvals for both and check that the stored content_hashes match
-        nonce_a = broker.grant_approval(effect_a, expiry=100.0, task_id="default")
-        nonce_b = broker.grant_approval(effect_b, expiry=100.0, task_id="default")
-
-        stored_a = broker._approved_requests[nonce_a]
-        stored_b = broker._approved_requests[nonce_b]
-
-        assert stored_a.content_hash == stored_b.content_hash, (
-            f"Same provenance elements in different order should produce same hash. "
-            f"Hash A={stored_a.content_hash}, Hash B={stored_b.content_hash}"
+        commit2 = Commit(effect2, task)
+        allow2, ev2 = broker.commit(commit2)
+        assert allow2 is False
+        assert ev2["primary_blocker"] == "FlowOK", (
+            f"CONFIDENTIAL→INTERNAL without declass should be blocked by FlowOK, not ApprovalBinding. Evidence: {ev2}"
         )
 
-    def test_modified_content_produces_different_hash(self) -> None:
-        """Content modification (same name, different content)  different hash."""
+    def test_wildcard_right_bypasses_auth_etype_mismatch(self) -> None:
+        """Capability with right='*' bypasses Auth's right-mismatch check for etype."""
+        from effect_broker.model import Capability
+
         broker = build()
-        from effect_broker.lattice import Confidentiality, Integrity
-        from effect_broker.model import Data, Effect
+        # Trigger default task creation if needed
+        task = broker.tasks.get("default")
+        if task is None:
+            m = Effect("send", "internal@corp.com", {}, (), "r-send:Agent:EffectBroker", ())
+            broker.commit(Commit(m))
+            task = broker.tasks["default"]
+        broker.tasks["default"] = task
 
-        effect = Effect(
-            etype="send",
+        # Grant a Capability with right="*" so Auth passes for ANY etype
+        cap = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="*",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=100.0,
+            nonce="wildcard-cap",
+        )
+        broker.grant_root(cap)
+
+        # Commit "write" effect with the wildcard-cap nonce → Auth passes (right="*")
+        effect_write = Effect(
+            etype="write",
             target="internal@corp.com",
             metadata={},
-            provenance=(Data("msg", Confidentiality.INTERNAL, Integrity.USER, content="original"),),
-            capability_nonce="any-cap",
+            provenance=(Data("msg", Confidentiality.INTERNAL, Integrity.USER),),
+            capability_nonce="wildcard-cap",
             delegation_chain=(),
         )
-        nonce = broker.grant_approval(effect, expiry=100.0, task_id="default")
+        commit = Commit(effect=effect_write, task=task)
 
-        stored = broker._approved_requests[nonce]
-
-        # Modified content
-        effect_modified = Effect(
-            etype="send",
-            target="internal@corp.com",
-            metadata={},
-            provenance=(Data("msg", Confidentiality.INTERNAL, Integrity.USER, content="modified"),),
-            capability_nonce="any-cap-2",
-            delegation_chain=(),
+        # Gate check: right="*" matches any etype, so Auth passes.
+        # The write effect would reach apply_effect, which would then fail because
+        # "write" is not valid for Email (this is correct — write ops on emails
+        # are not supported by the restricted store, caught at apply time).
+        gate_result = broker.gate(commit)
+        assert gate_result.allow is True, (
+            f"Auth with right='*' should pass for any etype. Evidence: {gate_result.evidence}"
         )
-        nonce2 = broker.grant_approval(effect_modified, expiry=100.0, task_id="default")
-        stored2 = broker._approved_requests[nonce2]
-
-        assert stored.content_hash != stored2.content_hash, (
-            "Modified content should produce a different hash"
+        assert "auth-ok" in gate_result.evidence["predicates"]["Auth"], (
+            f"Auth should be OK with right='*'. Evidence: {gate_result.evidence}"
         )
 
 
