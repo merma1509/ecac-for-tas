@@ -329,6 +329,8 @@ class ProcessLedgerClient(LedgerBackend):
     def get_authorization_entries(
         self,
     ) -> dict[tuple[str, str], list[LedgerEntry]]:
+        from .ledger import LedgerEntry
+
         raw = self._send(LedgerRequest.GET_AUTHORIZATION_ENTRIES, {})
         result: dict[tuple[str, str], list[LedgerEntry]] = {}
         for key_str, entries in raw.items():
