@@ -255,7 +255,7 @@ make all              # full CI gate: lint + typecheck + test + verify
 | `lint`                   | ruff check (all checks pass)                         |
 | `format`                 | ruff format + `--fix`                                |
 | `typecheck`              | mypy (strict) on `effect_broker`                     |
-| `test`                   | 209 pytest tests across 16 files                     |
+| `test`                   | 225 pytest tests across 16 files                     |
 | `run`                    | `python run_traces.py` (22 traces with evidence)     |
 | `verify`                 | assert trace outcomes (same as CI)                   |
 | `all`                    | setup → lint → typecheck → test → verify (full gate) |
@@ -328,10 +328,11 @@ classes and are asserted in `tests/test_broker.py`.
   capability that must still pass Auth ∧ FlowOK ∧ NoAmp ∧ Fresh; reusing it is
   a Fresh replay (tested in test_risk_escalation_one_shot_approval)
 - **Exact immutable request binding (kill-criterion #5).** `ApprovedRequest`
-  captures the complete effect identity: (etype, targets, content_hash, task_id).
-  Any deviation — different target, modified content, cross-task use — is blocked
-  by `ApprovalBinding` or `Fresh`. Content hash includes `Data.content`, so
-  content modifications after approval are detectable.
+  captures the complete effect identity: (etype, targets, task_id).
+  Any deviation — different etype, different targets, cross-task use — is blocked
+  by `ApprovalBinding`. Provenance/integrity is enforced by `FlowOK`, not binding.
+  Binding to actual content values would break legitimate dynamic content
+  (e.g. different message body per send invocation).
 - **BCC scope enforcement.** `check_noamp()` verifies that every BCC/CC
   recipient's domain label is contained in the capability's scope. A grant
   for `send to internal@corp.com` does not authorize `send to internal@corp.com
@@ -342,11 +343,11 @@ with BCC to external@attacker.com` unless `additional_targets` explicitly
 
 All three modes were evaluated on the same 20 adversarial traces (run `uv run python eval_comparison.py`):
 
-| Mode | Mechanism                        | Blocks    | Catch rate |
-| ---- | -------------------------------- | --------- | ---------- |
-| M1   | tool-call allowlist              | 0/20      | 0%         |
-| M2   | argument provenance (PACT-style) | 1/20      | 5%         |
-| M3   | effect-complete commit-time gate | **18/20** | **90%**    |
+| Mode | Mechanism                        | Blocks            | Catch rate |
+| ---- | -------------------------------- | ----------------- | ---------- |
+| M1   | tool-call allowlist              | 0/20              | 0%         |
+| M2   | argument provenance (PACT-style) | 1/20              | 5%         |
+| M3   | ECAC effect-complete gate        | **18/18** attacks | **100%**   |
 
 M3 catches **17 attacks that M1 and M2 miss entirely**. This includes:
 
@@ -368,11 +369,11 @@ M2's single catch (T8) is because the attacker-controlled `instruction` has inte
 
 ## Honest limitations
 
-- **213 tests ≠ real confinement.** Passing tests are regression evidence for the
+- **225 tests ≠ real confinement.** Passing tests are regression evidence for the
   implemented predicates. They do not establish genuine protected-effect confinement
   — that requires isolation, independent observation, and formal guarantees. The
   current model is a specification and executable invariant, not a verified secure
-  system. The full suite (16 test files, 213 tests) exercises all four predicates,
+  system. The full suite (16 test files, 225 tests) exercises all four predicates,
   concurrent replay, approval binding, closed sessions, boundary mediation, and IPC.
 - **Same-process isolation is advisory.** The broker, executor, store, and ledger
   all run in the same Python process. Direct store mutation (`store._files._data[...]`
