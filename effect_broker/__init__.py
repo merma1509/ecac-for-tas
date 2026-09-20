@@ -8,10 +8,7 @@ tool code are outside this model
 """
 
 from .broker import EffectBroker, Evidence
-from .executor import (
-    IsolatedExecutor,
-    make_content_hash,
-)
+from .executor import IsolatedExecutor
 from .lattice import Confidentiality, Integrity
 from .ledger import (
     EffectObserverVerdict,
@@ -65,7 +62,6 @@ __all__ = [
     "EffectBroker",
     # Executor (isolated, independent observer)
     "IsolatedExecutor",
-    "make_content_hash",
     # Ledger (independent observer)
     "IndependentEffectLedger",
     "EffectObserverVerdict",

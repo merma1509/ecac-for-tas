@@ -38,7 +38,6 @@ ARCHITECTURE (single-path refactor):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from hashlib import sha256
 from typing import TYPE_CHECKING
 
 from .mediation import MediationVerdict
@@ -184,14 +183,4 @@ class IsolatedExecutor:
         return self.broker.verify_complete_mediation()
 
 
-def make_content_hash(provenance: tuple[object, ...]) -> str:
-    """Compute a stable hash of provenance data for immutable request binding."""
-    from .model import Data
 
-    items: list[tuple[str, str, str] | tuple[str]] = []
-    for d in provenance:
-        if isinstance(d, Data):
-            items.append((d.name, d.confidentiality.name, d.integrity.name))
-        else:
-            items.append((str(d),))
-    return sha256(str(items).encode()).hexdigest()[:16]
