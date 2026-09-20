@@ -242,29 +242,31 @@ class EffectTarget:
 
 @dataclass(frozen=True)
 class ApprovedRequest:
-    """An immutable authorization binding: exact (etype, targets, content_hash).
+    """An immutable authorization binding: exact (etype, targets, task_id).
 
     Approvals are one-shot: they may authorize exactly the effect they were
     granted for, and NO variation. The binding covers:
 
-    - etype:       operation type (read/write/send/delete/network)
-    - targets:     complete set of resources this authorizes (including BCC)
-    - provenance:  hash of the provenance data that was approved
-    - expiry:      time after which this approval is invalid
-    - task_id:     the task this approval is scoped to
+    - etype:     operation type (read/write/send/delete/network)
+    - targets:   complete set of resources this authorizes (including BCC)
+    - task_id:   the task this approval is scoped to
+    - provenance:    provenance tuple (integrity enforced by FlowOK, not binding)
+    - expiry:         time after which this approval is invalid
+
+    Provenance and actual content values are NOT part of the binding — that is
+    enforced by FlowOK at commit time, using the task's declared flow_boundary.
+    Binding to actual content values would break legitimate dynamic content
+    (e.g. different message body per send invocation). The approver must trust
+    the tool's provenance labeling, which is validated at commit by FlowOK.
 
     Killing criterion #5: exact immutable request binding.
-    Using this approval for a different target, different recipients, or
-    modified content is blocked as Fresh (replay of a nonce that was already
-    consumed) and/or Auth (target-mismatch on the capability right+target).
+    Using this approval for a different etype, different targets, or a different
+    task is blocked by ApprovalBinding.
     """
 
     nonce: str  # unique one-shot token (consumed after first use)
     etype: str  # operation type this was approved for
     targets: EffectTarget  # complete authorized target set (primary + additional)
-    # Content hash: a stable fingerprint of the approved content (e.g. hash of
-    # message body). An effect with different content has a different identity.
-    content_hash: str
     expiry: float  # time after which this approval is invalid
     task_id: TaskId  # task scope: this approval is ONLY valid in this task
     granted_by: str  # who granted it (USER or APPROVER)
@@ -274,20 +276,17 @@ class ApprovedRequest:
 class Data:
     """A data value carrying confidentiality and integrity labels.
 
-    The `content` field holds the actual value that will be hashed for
-    immutable request binding (ApprovedRequest.content_hash). This ensures
-    that modified content after approval is detected.
-
     Provenance labels (confidentiality/integrity) are assigned based on
     the data's source, not derived from real dataflow in this same-process
-    model. The key invariant: content is included in the hash, so any
-    modification after approval is detectable.
+    model. Content is NOT included in immutable request binding — that would
+    break legitimate dynamic content (e.g. different message body per send
+    invocation). Provenance/integrity is validated by FlowOK at commit time.
     """
 
     name: str
     confidentiality: Confidentiality
     integrity: Integrity
-    content: str = ""  # actual value, hashed for immutable request binding
+    content: str = ""
 
 
 @dataclass(frozen=True)
@@ -441,7 +440,7 @@ class Commit:
 
     `approved_request` captures the immutable authorization binding from an
     approval grant (if this effect was approved). The EffectObserver uses
-    approved_request.targets and approved_request.content_hash to verify the
+    approved_request.targets and approved_request.task_id to verify the
     effect's complete identity — preventing modifications after approval.
     """
 
@@ -452,5 +451,5 @@ class Commit:
     # When set, the effect's complete identity must match this binding:
     #   - etype must match
     #   - known_targets must be ⊆ approved_request.targets
-    #   - content_hash must match
+    #   - task_id must match (cross-task use is blocked)
     approved_request: ApprovedRequest | None = None

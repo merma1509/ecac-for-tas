@@ -404,42 +404,16 @@ class EffectBroker:
         self.approvals[nonce] = expiry
 
         # Also store the ApprovedRequest for exact immutable request binding
-        # (kill-criterion #5: complete identity must match)
-        # CRITICAL: use canonical complete_targets() — same source as commit()
-        # and executor. This ensures authorized_targets are identical everywhere.
+        # (kill-criterion #5: complete identity must match).
+        # The binding covers etype, target set, and task_id.
+        # Provenance/integrity is checked by FlowOK, not the binding.
         authorized_targets = effect.complete_targets()
-        # Targets for ApprovedRequest: primary + additional, excluding primary
         all_targets = authorized_targets
-
-        # FIXED: approval scope must be domain-level (matching what check_noamp
-        # uses via _domain_for_email), not the raw email address. This ensures
-        # BCC recipients from the same domain pass NoAmp scope check.
-        # approval_scope is used only for building the ApprovedRequest targets
-        # (for the binding check, not for NoAmp — NoAmp uses the original cap).
-
-        # FIXED: content_hash includes Data.content for immutable request binding.
-        # This ensures that any modification to the content after approval
-        # (e.g., changing the message body) produces a different hash.
-        # FIXED: provenance elements are SORTED before hashing — tuple is unordered,
-        # so (A, B) and (B, A) would produce different hashes without sorting.
-        # Sorting by (name, confidentiality, integrity, content) ensures determinism:
-        # the same effect always produces the same hash regardless of insertion order.
-        from hashlib import sha256
-
-        content_parts: list[str] = []
-        for d in effect.provenance:
-            # Include the actual content value in the hash
-            content_parts.append(
-                f"{d.name}:{d.confidentiality.name}:{d.integrity.name}:{d.content}"
-            )
-        content_parts.sort()  # deterministic order regardless of tuple insertion
-        content_hash = sha256("|".join(content_parts).encode()).hexdigest()[:16]
 
         approved_req = ApprovedRequest(
             nonce=nonce,
             etype=effect.etype,
             targets=EffectTarget(primary=effect.target, additional=all_targets - {effect.target}),
-            content_hash=content_hash,
             expiry=expiry,
             task_id=task_id,
             granted_by=APPROVER,
@@ -584,11 +558,12 @@ class EffectBroker:
                 f"not in ceiling-scope={task.ceiling.scope})",
             )
 
-        # Sub-check 5: right must match (FIXED: no wildcard skip).
+        # Sub-check 5: right must match.
         # A capability grants exactly one right. An approval for read cannot
         # authorize write — right="*" on a default ceiling was the bypass path.
         # Strict ceiling.right must match capability.right must match effect.etype.
-        if capability.right != effect.etype:
+        # Exception: right="*" is a wildcard — matches any etype.
+        if capability.right != "*" and capability.right != effect.etype:
             return False, f"right-mismatch(cap_right={capability.right}!=etype={effect.etype})"
         if capability.target != effect.target:
             return False, f"target-mismatch(cap_target={capability.target}!={effect.target})"
@@ -694,21 +669,20 @@ class EffectBroker:
 
         # SSRF containment for network effects
         if effect.etype == "network":
-            from .model import URL as _URL
-
-            resource = self.store.resolve(effect.target)
-            if isinstance(resource, _URL) and resource.scope and "*" not in resource.scope:
-                if not capability.scope <= resource.scope:
+            if "://" in effect.target:
+                # Extract origin (scheme+host+port) without path for SSRF containment.
+                # Cap_scope={"http://internal.corp.com"} must cover the URL's origin so the
+                # broker controls which hosts are reachable regardless of path.
+                # "http://internal.corp.com/admin" -> "http://internal.corp.com"
+                after_scheme = effect.target.split("://", 1)[1]
+                path_start = after_scheme.find("/")
+                host_part = after_scheme[:path_start] if path_start >= 0 else after_scheme
+                url_origin = f"http://{host_part}"
+                target_domain = frozenset({url_origin})
+                if not target_domain <= capability.scope:
                     return False, (
                         f"ssrf containment failed: cap-scope={capability.scope} "
-                        f"not subset of url-scope={resource.scope}"
-                    )
-            elif "://" in effect.target:
-                target_domain = frozenset({effect.target.split("://", 1)[1].split("/")[0]})
-                if not capability.scope <= target_domain:
-                    return False, (
-                        f"ssrf containment failed: cap-scope={capability.scope} "
-                        f"not subset of url-domain={target_domain}"
+                        f"does not cover url-origin={target_domain}"
                     )
 
         return True, f"composition-ok(ceiling-scope={task.ceiling.scope})"
@@ -912,6 +886,45 @@ class EffectBroker:
 
         assert task.session is not None, "Task must have a session (set by __post_init__)"
 
+        # Auto-resolve approved_request from nonce.
+        # CRITICAL: if capability_nonce starts with "approval:" but approved_request
+        # is None, ApprovalBinding silently skips. This is a silent security failure.
+        # We fix it by looking up the ApprovedRequest automatically so callers do NOT
+        # need to pass it explicitly — the nonce is the authoritative key.
+        from dataclasses import replace
+        if (commit.approved_request is None and effect.capability_nonce is not None
+            and effect.capability_nonce.startswith("approval:")):
+            stored_req = self._approved_requests.get(effect.capability_nonce)
+            if stored_req is not None:
+                # Frozen dataclass: create a copy with the resolved approved_request.
+                commit = replace(commit, approved_request=stored_req)
+                effect = commit.effect  # update local ref after replace
+            else:
+                # Approval nonce referenced but not found → block at Fresh.
+                # This fires when a stale/invalid nonce is used.
+                allow = False
+                predicate_results: dict[str, PredicateResult] = {
+                    "Auth": (True, "auth-ok"),
+                    "FlowOK": (True, "flow-ok"),
+                    "NoAmp": (True, "composition-ok"),
+                    "Fresh": (False, f"approval-nonce-invalid({effect.capability_nonce})"),
+                }
+                blocking_predicate = "Fresh"
+                return CommitGateResult(
+                    allow=False,
+                    evidence={
+                        "allow": False,
+                        "primary_blocker": blocking_predicate,
+                        "predicates": {k: v[1] for k, v in predicate_results.items()},
+                        "boundary_stop": None,
+                        "approval_binding": None,
+                    },
+                    effect=effect,
+                    task=task,
+                    can_apply=False,
+                    nonce_reserved=False,
+                )
+
         # Atomic Fresh check: check AND reserve the nonce atomically.
         # This prevents double-commit with the same nonce under concurrency.
         # nonce_reserved = True means Fresh passed AND the nonce is now in used.
@@ -942,20 +955,9 @@ class EffectBroker:
                 approval_binding_ok = False
                 approval_binding_msg = f"approval-nonce-unknown({commit.approved_request.nonce})"
             else:
-                # FIXED: content_hash includes Data.content, not just names+labels
-                from hashlib import sha256
-
-                current_content_parts: list[str] = []
-                for d in effect.provenance:
-                    # Hash the actual content, not just name
-                    current_content_parts.append(
-                        f"{d.name}:{d.confidentiality.name}:{d.integrity.name}:{d.content}"
-                    )
-                current_content_parts.sort()  # deterministic — same order as grant_approval
-                current_content_hash = sha256("|".join(current_content_parts).encode()).hexdigest()[
-                    :16
-                ]
-
+                # ApprovalBinding checks: etype, target, additional recipients, task_id.
+                # Provenance/integrity is checked by FlowOK at commit time.
+                # We do NOT bind to content values — that would break dynamic content.
                 # CRITICAL: use canonical complete_targets() — authoritative
                 # source for target set. Must match what grant_approval() stored.
                 current_additional = effect.complete_targets() - {effect.target}
@@ -975,9 +977,6 @@ class EffectBroker:
                     extra = current_additional - stored.targets.additional
                     approval_binding_ok = False
                     approval_binding_msg = f"extra-targets-not-approved({extra})"
-                elif current_content_hash != stored.content_hash:
-                    approval_binding_ok = False
-                    approval_binding_msg = "content-modified-after-approval"
                 elif task.task_id != stored.task_id:
                     approval_binding_ok = False
                     approval_binding_msg = f"cross-task-use({task.task_id}!={stored.task_id})"

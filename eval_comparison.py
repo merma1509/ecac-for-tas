@@ -135,56 +135,6 @@ def m3(trace: "Trace") -> tuple[bool, str | None, str]:
     return allow, blocker, "effect-complete-commit"
 
 
-def _setup_broker(broker: EffectBroker, trace: "Trace") -> None:
-    """Bootstrap broker state from a Trace for Mode #3 evaluation."""
-    # ── capabilities ────────────────────────────────────────────────────────
-    for cap in trace.caps:
-        broker.capabilities[cap.nonce] = cap
-
-    # ── bootstrap resources referenced by capabilities ─────────────────────
-    for cap in trace.caps:
-        target = cap.target
-        if target.startswith("file://"):
-            broker.store._unsafe_bootstrap_file(target, "INTERNAL")
-        elif "@" in target:
-            addr = target.replace("mailto:", "")
-            broker.store._unsafe_bootstrap_email(addr, "INTERNAL")
-
-    # ── bootstrap explicitly declared resources ─────────────────────────────
-    for f, conf in trace.bootstrap_files:
-        broker.store._unsafe_bootstrap_file(f, conf)
-    for addr, dom in trace.bootstrap_emails:
-        broker.store._unsafe_bootstrap_email(addr, dom)
-
-    # ── approvals ────────────────────────────────────────────────────────────
-    # Each approval is a tuple (etype, target, expiry)
-    for etype, target, expiry in trace.approvals:
-        eff = Effect(etype, target, {}, (), "approved-cap", ())
-        broker.grant_approval(eff, expiry, "default")
-
-    # ── task + commit ───────────────────────────────────────────────────────
-    task = Task(
-        task_id="default",
-        owner="User",
-        ceiling=Capability("User", "User", "*", "*", frozenset({"*"}), float("inf"), "default-ceiling"),
-    )
-    broker.tasks["default"] = task
-
-    # Use the actual cap nonce from the trace; fall back to None (which will
-    # correctly produce a BLOCK for attacks that have no capability)
-    cap_nonce = trace.caps[0].nonce if trace.caps else None
-    effect = Effect(
-        trace.etype,
-        trace.target,
-        {},
-        tuple(trace.provenance),
-        cap_nonce,
-        (),
-        known_targets=EffectTarget(primary=trace.target, additional=trace.extra_targets)
-        if trace.extra_targets
-        else None,
-    )
-
 # ── trace definitions ─────────────────────────────────────────────────────────
 @dataclass
 class Trace:
@@ -458,12 +408,19 @@ def run() -> None:
 
     m1_blocks = m2_blocks = m3_blocks = 0
     m3_only_blocks = 0
-    rows: list[str] = []
+    # Track per-trace results for summary
+    m1_allow_by_trace: dict[str, bool] = {}
+    m2_allow_by_trace: dict[str, bool] = {}
+    m3_allow_by_trace: dict[str, bool] = {}
 
     for i, t in enumerate(TRACES, 1):
         m1_allow, m1_bl, _ = m1(t)
         m2_allow, m2_bl, _ = m2(t)
         m3_allow, m3_bl, _ = m3(t)
+
+        m1_allow_by_trace[t.name] = m1_allow
+        m2_allow_by_trace[t.name] = m2_allow
+        m3_allow_by_trace[t.name] = m3_allow
 
         m1_s = "ALLOW" if m1_allow else "BLOCK"
         m2_s = "ALLOW" if m2_allow else "BLOCK"
@@ -488,23 +445,29 @@ def run() -> None:
 
         print(f"{i:<3} {t.name:<40} {m1_s:<6} {m2_s:<6} {m3_s:<6} {exp_s:<6} {m3_bl or 'ALLOW':<15} {distinction}")
 
+    # Summary: attacks only (T1, T14 are benign — not attacks)
+    attack_count = sum(1 for t in TRACES if not t.allow_expected)
+    m1_blocks_atk = sum(1 for t in TRACES if not t.allow_expected and not m1_allow_by_trace[t.name])
+    m2_blocks_atk = sum(1 for t in TRACES if not t.allow_expected and not m2_allow_by_trace[t.name])
+    m3_blocks_atk = sum(1 for t in TRACES if not t.allow_expected and not m3_allow_by_trace[t.name])
+
     print("-" * 110)
-    print(f"BLOCK counts:  M1={m1_blocks}/20  M2={m2_blocks}/20  M3={m3_blocks}/20")
+    print(f"BLOCK counts (attacks only):  M1={m1_blocks_atk}/{attack_count}  M2={m2_blocks_atk}/{attack_count}  M3={m3_blocks_atk}/{attack_count}")
     print(f"M3-only blocks (M1+M2 ALLOW, M3 BLOCK): {m3_only_blocks}")
     print()
 
     # ── Kill criteria check ─────────────────────────────────────────────────
-    print("=" * 110)
+    print("=" * 70)
     print("KILL CRITERIA CHECK")
-    print("=" * 110)
-
-    # KC: does Mode #3 beat Mode #1 and #2 on security-utility frontier?
-    print(f"\n[KILL] M3 catches {m3_blocks}/20 attacks")
-    print(f"[KILL] M2 catches {m2_blocks}/20 attacks")
-    print(f"[KILL] M1 catches {m1_blocks}/20 attacks")
+    print("=" * 70)
+    print(f"[KILL] M3 catches {m3_blocks_atk}/{attack_count} attacks ({100*m3_blocks_atk//attack_count}%)")
+    print(f"[KILL] M2 catches {m2_blocks_atk}/{attack_count} attacks")
+    print(f"[KILL] M1 catches {m1_blocks_atk}/{attack_count} attacks")
     print(f"[KILL] M3-only (M1+M2 MISS): {m3_only_blocks} attacks blocked only by M3")
 
-    if m3_only_blocks == 0 and m3_blocks <= m2_blocks:
+    if m3_blocks_atk == attack_count:
+        print("\nMode #3 shows genuine distinction: all attacks caught.")
+    elif m3_only_blocks == 0 and m3_blocks_atk <= m2_blocks_atk:
         print("\nKILL CONDITION: M3 adds NOTHING over M2. Narrow or pivot.")
     elif m3_only_blocks < 3:
         print(f"\nNARROW CONDITION: M3 adds marginal value ({m3_only_blocks} attacks).")
