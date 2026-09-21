@@ -351,21 +351,34 @@ All three modes were evaluated on the same 20 adversarial traces (run `uv run py
 
 M3 catches **17 attacks that M1 and M2 miss entirely**. This includes:
 
-- **Capability laundering** (T5): M1/M2 allow because the tool name is on the allowlist / arguments are locally valid; M3 blocks because FlowOK detects the capability was derived from an untrusted source
-- **Confidential-data leakage** (T7): M1/M2 allow because arguments are locally sound; M3 blocks because FlowOK detects the confidentiality violation from a trusted source to an external sink
-- **Stale approval / replay** (T9, T10): M1/M2 cannot detect temporal misuse of a capability; M3 blocks because `Fresh` checks commit-time validity
-- **Declass/endorse abuse** (T11, T12): M1/M2 cannot check whether the exception was broker-granted; M3 blocks because the broker records and validates every declass/endorse grant
-- **BCC recipient spoofing** (T18): M1/M2 allow because the primary recipient is valid; M3 blocks because FlowOK checks all additional_targets including BCC/CC
-- **Amplification via composition** (T20): M1/M2 allow because individual steps are valid; M3 blocks because NoAmp verifies the entire delegation chain is monotonic
+- **Capability laundering** (T5): M1/M2 allow because the tool name is on the
+  allowlist / arguments are locally valid; M3 blocks because FlowOK detects
+  the capability was derived from an untrusted source
+- **Confidential-data leakage** (T7): M1/M2 allow because arguments are locally
+  sound; M3 blocks because FlowOK detects the confidentiality violation from a
+  trusted source to an external sink
+- **Stale approval / replay** (T9, T10): M1/M2 cannot detect temporal misuse of
+  a capability; M3 blocks because `Fresh` checks commit-time validity
+- **Declass/endorse abuse** (T11, T12): M1/M2 cannot check whether the exception
+  was broker-granted; M3 blocks because the broker records and validates every declass/endorse grant
+- **BCC recipient spoofing** (T18): M1/M2 allow because the primary recipient
+  is valid; M3 blocks because FlowOK checks all additional_targets including BCC/CC
+- **Amplification via composition** (T20): M1/M2 allow because individual steps are valid;
+  M3 blocks because NoAmp verifies the entire delegation chain is monotonic
 
 The only traces M3 allows that M1/M2 also allow:
 
 - **T1** (benign read): legitimate operation, should be allowed
-- **T14** (hidden side effect on declared target): ECAC-philosophy case — a tool that declares `trusted` with undisclosed `secrets` side effects is allowed because the broker does not yet observe the hidden effect; the broker stops the declared target, not the undisclosed one
+- **T14** (hidden side effect on declared target): ECAC-philosophy case — a tool that declares `trusted`
+  with undisclosed `secrets` side effects is allowed because the broker does not yet observe the hidden
+  effect; the broker stops the declared target, not the undisclosed one
 
-M2's single catch (T8) is because the attacker-controlled `instruction` has integrity=UNTRUSTED, which FlowOK in M2 catches even at the argument level. M3 also blocks T8, so the difference is M3's blocking is **earlier** (argument level, via FlowOK) while M1 misses it entirely.
+M2's single catch (T8) is because the attacker-controlled `instruction` has integrity=UNTRUSTED,
+which FlowOK in M2 catches even at the argument level. M3 also blocks T8, so the difference is M3's
+blocking is **earlier** (argument level, via FlowOK) while M1 misses it entirely.
 
-**Conclusion:** M3's commit-time effect-complete gate is the correct enforcement point. Verifying effects — not just tool names or arguments — is necessary to catch the full attack surface.
+**Conclusion:** M3's commit-time effect-complete gate is the correct enforcement point. Verifying effects
+— not just tool names or arguments — is necessary to catch the full attack surface.
 
 ## Honest limitations
 
@@ -380,7 +393,15 @@ M2's single catch (T8) is because the attacker-controlled `instruction` has inte
   = X) bypasses the executor and the ledger returns `UNKNOWN` for it — not `safe`
   — but the broker cannot prevent it. Real isolation requires a separate process
   or enclave.
-- **T13/T14/T15 use metadata, not real enforcement — but strict mode closes the bypass.** `Mediator.inspect()` uses `ToolSpec` metadata set by the test author. A real adversarial tool can lie about its actual targets. **Solution:** set `Mediator(..., strict=True)` — this requires all tools to register with the mediator. Unknown tools are blocked, not permitted. The mandatory boundary experiment (`tests/test_experiment.py`, M1–M5) uses a **real** untrusted tool to demonstrate that computation is actually bounded. **ECAC T14 philosophy:** if the declared target is authorized, the broker ALLOWs — hidden side effects on other resources are caught by the ledger/observer, not blocked at the broker gate. This reflects the scope boundary: the broker cannot see what side effects a tool performs.
+- **T13/T14/T15 use metadata, not real enforcement — but strict mode closes the bypass.**
+  `Mediator.inspect()` uses `ToolSpec` metadata set by the test author. A real adversarial
+  tool can lie about its actual targets. **Solution:** set `Mediator(..., strict=True)` — this
+  requires all tools to register with the mediator. Unknown tools are blocked, not permitted.
+  The mandatory boundary experiment (`tests/test_experiment.py`, M1–M5) uses a **real** untrusted
+  tool to demonstrate that computation is actually bounded. **ECAC T14 philosophy:** if the declared
+  target is authorized, the broker ALLOWs — hidden side effects on other resources are caught by the
+  ledger/observer, not blocked at the broker gate. This reflects the scope boundary: the broker cannot
+  see what side effects a tool performs.
 - **T14 (hidden side effect on declared target):** ECAC philosophy — a tool that
   declares `trusted` but secretly touches `secrets` as a side effect is ALLOWED
   by the broker. The broker cannot observe hidden side effects — it only sees
