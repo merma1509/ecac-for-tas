@@ -44,6 +44,8 @@ from .mediation import MediationVerdict
 
 if TYPE_CHECKING:
     from .broker import EffectBroker, Evidence
+    from .executor_ipc import ProcessExecutorClient
+    from .executor_subprocess import ExecutorProcessHandle
     from .ledger import IndependentEffectLedger
     from .model import Commit, Effect, Task
 
@@ -181,6 +183,167 @@ class IsolatedExecutor:
     def verify_mediation(self) -> list[str]:
         """Verify complete mediation. Delegates to the independent ledger."""
         return self.broker.verify_complete_mediation()
+
+
+@dataclass
+class SubprocessExecutor:
+    """Multi-process executor: gate() in broker process, apply_effect() in subprocess.
+
+    PHASE 1 (broker process):
+      - broker.gate(commit) evaluates Auth ∧ FlowOK ∧ NoAmp ∧ Fresh
+      - No state mutation here; this is the read-only authorization decision
+
+    PHASE 2 (subprocess):
+      - ProcessExecutorClient.execute(effect_dict) sends the effect over IPC
+      - IsolatedStore.apply_effect() mutates the subprocess's own store
+      - subprocess returns observed_targets (actual resources changed)
+
+    PHASE 3 (broker process, back):
+      - Record authorization (from gate) to the independent ledger
+      - Record observation (from subprocess response) to the independent ledger
+
+    KEY PROPERTIES:
+      - The broker NEVER holds a reference to the subprocess store.
+        All state reads go through IPC (via broker.observer).
+      - Direct store mutation (broker.store._files._data=...) is IMPOSSIBLE
+        in multi-process mode — the broker process has no access.
+      - The ledger's observation comes from the subprocess's IPC response,
+        NOT from the broker's own report.
+      - execute() is reentrant: gate() uses per-task locks for atomic Fresh.
+
+    USAGE:
+        broker = EffectBroker(mode="multi-process", ...)
+        broker.commit(commit)  # routes through SubprocessExecutor
+        broker.observer.verify_all(...)  # IPC reads of subprocess store
+        broker.shutdown()  # clean subprocess termination
+    """
+
+    broker: "EffectBroker"
+    task_id: str = "subprocess"
+    _ledger: "IndependentEffectLedger | None" = None
+    _client: "ProcessExecutorClient | None" = None
+    _process_handle: "ExecutorProcessHandle | None" = None
+    _execution_count: int = 0
+
+    def _set_ledger(self, ledger: "IndependentEffectLedger") -> None:
+        """Called by broker to inject the shared ledger."""
+        self._ledger = ledger
+
+    def _set_client(self, client: "ProcessExecutorClient") -> None:
+        """Called by broker to inject the IPC client after subprocess starts."""
+        self._client = client
+
+    def _set_process_handle(self, handle: "ExecutorProcessHandle") -> None:
+        """Called by broker to store the process handle for shutdown."""
+        self._process_handle = handle
+
+    @property
+    def ledger(self) -> "IndependentEffectLedger":
+        return self._ledger if self._ledger is not None else self.broker.ledger
+
+    def bootstrap_store(
+        self,
+        files: list[dict[str, str]] | None = None,
+        emails: list[dict[str, str]] | None = None,
+        mailboxes: list[str] | None = None,
+    ) -> None:
+        """Bootstrap the subprocess store with initial resources.
+
+        MUST be called BEFORE any execute() calls. This transfers the
+        broker's resource definitions (F ∪ E ∪ M) into the subprocess.
+
+        Args:
+            files: list of {"path": "...", "sensitivity": "PUBLIC|INTERNAL|CONFIDENTIAL|..."}
+            emails: list of {"address": "...", "domain": "INTERNAL|EXTERNAL"}
+            mailboxes: list of mailbox usernames
+        """
+        if self._client is None:
+            raise RuntimeError("SubprocessExecutor not bootstrapped: no IPC client")
+        self._client.bootstrap(files=files, emails=emails, mailboxes=mailboxes)
+
+    def execute(
+        self,
+        commit: "Commit",
+        mediation: "MediationVerdict | None" = None,
+    ) -> tuple[bool, "Evidence"]:
+        """Execute through the multi-process isolation path.
+
+        Three-phase execution:
+          1. gate() in broker process (read-only predicates)
+          2. IPC to subprocess → IsolatedStore.apply_effect()
+          3. Record authorization + observation to the independent ledger
+        """
+        self._execution_count += 1
+        effect = commit.effect
+        nonce = effect.capability_nonce
+        authorized_targets = effect.complete_targets()
+
+        # Phase 1: gate evaluation (read-only, in broker process)
+        gate_result = self.broker.gate(commit, mediation=mediation)
+        allow = gate_result.allow
+        evidence = gate_result.evidence
+
+        # Record authorization — ledger observes gate decision
+        actual_task_id = gate_result.task.task_id
+        self.ledger.record_authorization(
+            actual_task_id, nonce, authorized_targets, source="subprocess.gate"
+        )
+
+        if allow:
+            # Phase 2: apply in subprocess via IPC
+            if self._client is None:
+                raise RuntimeError("SubprocessExecutor: no IPC client available")
+
+            from .executor_ipc import effect_to_dict
+            effect_dict = effect_to_dict(effect)
+            resp = self._client.execute(effect_dict)
+
+            # Phase 3: record observation from subprocess's response
+            obs_targets = frozenset(resp.get("observed_targets", []))
+            identity_entry = resp.get("identity_entry", obs_targets)
+            self.ledger.record_observation(
+                actual_task_id, nonce, identity_entry, source="subprocess.apply"
+            )
+
+        else:
+            # BLOCKED: record explicit blocked observation
+            self.ledger.record_observation(
+                actual_task_id, nonce, None, source="subprocess.gate:BLOCKED"
+            )
+
+        return allow, evidence
+
+    def apply_effect(self, effect: "Effect", task: "Task") -> None:
+        """NOT USED in multi-process mode.
+
+        In multi-process mode, apply_effect() is called ONLY by the subprocess's
+        IsolatedStore. The broker calls execute() which routes through IPC.
+        This method raises NotImplementedError to catch any accidental misuse.
+        """
+        raise NotImplementedError(
+            "SubprocessExecutor.apply_effect() should not be called directly. "
+            "Use execute() which routes through IPC."
+        )
+
+    def verify_mediation(self) -> list[str]:
+        """Verify complete mediation. Delegates to the independent ledger."""
+        return self.broker.verify_complete_mediation()
+
+    def shutdown(self) -> None:
+        """Cleanly terminate the executor subprocess.
+
+        Sends SHUTDOWN via IPC, then kills the process handle.
+        Safe to call multiple times.
+        """
+        if self._client is not None:
+            try:
+                self._client.shutdown()
+            except Exception:
+                pass  # best-effort: process may already be dead
+        if self._process_handle is not None:
+            self._process_handle.stop()
+        self._client = None
+        self._process_handle = None
 
 
 
