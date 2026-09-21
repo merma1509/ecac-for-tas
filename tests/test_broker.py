@@ -13,6 +13,7 @@ from effect_broker.lattice import Confidentiality, Integrity
 from effect_broker.mediation import MediationVerdict, Mediator, ToolSpec
 from effect_broker.model import (
     AGENT,
+    ApprovedRequest,
     BROKER,
     USER,
     Capability,
@@ -20,9 +21,12 @@ from effect_broker.model import (
     Data,
     Domain,
     Effect,
+    EffectTarget,
+    File,
     LabelException,
     Task,
 )
+from effect_broker.ledger import LedgerVerdict, UnknownLedgerResult
 from effect_broker.traces import build
 
 CHAIN = (USER, AGENT, BROKER)
@@ -739,3 +743,358 @@ def test_same_capability_nonce_twice_blocked_by_fresh() -> None:
     assert allow2 is False
     assert evidence2["primary_blocker"] == "Fresh"
     assert "replay" in evidence2["predicates"]["Fresh"]
+
+
+class TestClosedSessionBlocksCommit:
+    """Gap: closed/dead session must block ALL commits in that task."""
+
+    def test_dead_session_blocks_commit(self) -> None:
+        """Setting session.live=False blocks commit for that task.
+
+        Once a session is closed, its authority ceiling is invalid.
+        The Fresh predicate returns session-closed. The task cannot
+        be reopened — a new task with a fresh session must be registered.
+        Uses build() + warmup commit to trigger lazy task creation.
+        """
+        from effect_broker.traces import build
+
+        broker = build()
+
+        # Trigger lazy task creation (first commit populates broker.tasks["default"])
+        warmup = Effect(
+            "send", "internal@corp.com", {},
+            (Data("warmup", Confidentiality.INTERNAL, Integrity.USER),),
+            "r-send:Agent:EffectBroker", (USER, AGENT, BROKER),
+        )
+        broker.commit(Commit(warmup))
+
+        task = broker.tasks["default"]
+        assert task.session is not None
+        assert task.session.live is True
+
+        # Close the session
+        task.session.live = False
+        assert task.session.live is False  # confirmed dead
+
+        # Any capability committed against this task → BLOCK
+        msg = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+            "r-send:Agent:EffectBroker",
+            (USER, AGENT, BROKER),
+        )
+        allow, evidence = broker.commit(Commit(msg))
+        assert allow is False
+        assert evidence["primary_blocker"] == "Fresh"
+        assert "session-closed" in evidence["predicates"]["Fresh"]
+
+    def test_closed_session_cannot_be_reopened(self) -> None:
+        """Session.live cannot be set back to True after being False."""
+        from effect_broker.traces import build
+
+        broker = build()
+        # Trigger lazy task creation
+        warmup = Effect("send", "internal@corp.com", {},
+                        (Data("warmup", Confidentiality.INTERNAL, Integrity.USER),),
+                        "r-send:Agent:EffectBroker", (USER, AGENT, BROKER))
+        broker.commit(Commit(warmup))
+        task = broker.tasks["default"]
+
+        task.session.live = False
+        with pytest.raises(ValueError, match="cannot be reopened"):
+            task.session.live = True  # type: ignore[assignment]
+
+
+class TestCrossTaskApprovalUse:
+    """Gap: approval granted for task-A must NOT commit in task-B."""
+
+    def test_approval_task_id_restricts_usage(self) -> None:
+        """Approval for task-A is blocked in task-B by ApprovalBinding.
+
+        The ApprovalBinding check in gate() verifies task_id exactly.
+        An approval scoped to task-A cannot be reused in task-B — even
+        if all other parameters (effect, targets, content) match.
+        Uses build() which pre-registers "default" task with capabilities.
+        """
+        from effect_broker.traces import build
+
+        broker = build()
+
+        task_a = Task(
+            task_id="task-a",
+            owner=USER,
+            ceiling=Capability(
+                USER, "EffectBroker", "send", "internal@corp.com",
+                frozenset({"internal"}), float("inf"), "ceiling-task-a",
+            ),
+        )
+        task_b = Task(
+            task_id="task-b",
+            owner=USER,
+            ceiling=Capability(
+                USER, "EffectBroker", "send", "internal@corp.com",
+                frozenset({"internal"}), float("inf"), "ceiling-task-b",
+            ),
+        )
+        broker.register_task(task_a)
+        broker.register_task(task_b)
+        broker.tasks["task-a"] = task_a
+
+        # Grant approval scoped to task-a
+        grant_effect = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("msg", Confidentiality.INTERNAL, Integrity.USER, "hello"),),
+            "unused",
+            (USER,),
+            known_targets=EffectTarget(primary="internal@corp.com"),
+        )
+        approval_nonce = broker.grant_approval(grant_effect, expiry=100.0, task_id="task-a")
+        stored = broker._approved_requests[approval_nonce]
+
+        # Commit with task-a: ALLOW
+        effect_a = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("msg", Confidentiality.INTERNAL, Integrity.USER, "hello"),),
+            approval_nonce,
+            (USER,),
+            known_targets=EffectTarget(primary="internal@corp.com"),
+        )
+        commit_a = Commit(effect=effect_a, task=task_a, tool_name=None)
+        allow_a, _ = broker.commit(commit_a)
+        assert allow_a is True, "Approval in task-a should ALLOW"
+
+        # Commit with task-b: BLOCK (cross-task use).
+        # CRITICAL: Commit.approved_request must be set to trigger ApprovalBinding.
+        effect_b = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("msg", Confidentiality.INTERNAL, Integrity.USER, "hello"),),
+            approval_nonce,
+            (USER,),
+            known_targets=EffectTarget(primary="internal@corp.com"),
+        )
+        commit_b = Commit(effect=effect_b, task=task_b, tool_name=None)
+        allow_b, evidence_b = broker.commit(commit_b)
+        assert allow_b is False
+        assert evidence_b["primary_blocker"] == "ApprovalBinding"
+        assert "cross-task-use" in evidence_b.get("approval_binding", "")
+
+
+
+class TestCrossTaskCapabilityScope:
+    """Gap: reusable capability with task_id must not be used outside that task."""
+
+    def test_reusable_cap_task_id_restricts_usage(self, broker: EffectBroker) -> None:
+        """Capability with cap.task_id set must be used only in that task.
+
+        A reusable capability derived for task-A (e.g., from a grant)
+        carries task_id=A. Attempting to use it in task-B is blocked
+        by check_auth() as task-scope-mismatch.
+        """
+        from effect_broker.model import Capability
+
+        task_a = Task(
+            task_id="task-a",
+            owner=USER,
+            ceiling=Capability(
+                USER, "EffectBroker", "send", "internal@corp.com",
+                frozenset({"internal"}), float("inf"), "ceiling-task-a",
+            ),
+        )
+        task_b = Task(
+            task_id="task-b",
+            owner=USER,
+            ceiling=Capability(
+                USER, "EffectBroker", "send", "internal@corp.com",
+                frozenset({"internal"}), float("inf"), "ceiling-task-b",
+            ),
+        )
+        broker.register_task(task_a)
+        broker.register_task(task_b)
+
+        # Root-grant gives capability with task_id=None (default = "default")
+        # We need a capability scoped to task-a — derive it
+        broker.grant_root(Capability(
+            USER, USER, "send", "internal@corp.com",
+            frozenset({"internal"}), 100, "cap-for-task-a",
+        ))
+        broker.attenuate(
+            "cap-for-task-a", "EffectBroker", "send",
+            "internal@corp.com", frozenset({"internal"}), 100,
+        )
+        # The attenuated cap inherits from parent — manually set task_id
+        broker.capabilities["cap-task-a-restricted"] = Capability(
+            USER, "EffectBroker", "send", "internal@corp.com",
+            frozenset({"internal"}), 100, "cap-task-a-restricted",
+            derives_from="cap-for-task-a:EffectBroker",
+            task_id="task-a",
+        )
+
+        # Use in task-a: ALLOW
+        msg_a = Effect(
+            "send", "internal@corp.com", {},
+            (Data("q", Confidentiality.INTERNAL, Integrity.USER),),
+            "cap-task-a-restricted", CHAIN,
+        )
+        allow_a, _ = broker.commit(Commit(msg_a, task=task_a))
+        assert allow_a is True
+
+        # Use in task-b: BLOCK (task-scope-mismatch)
+        msg_b = Effect(
+            "send", "internal@corp.com", {},
+            (Data("q", Confidentiality.INTERNAL, Integrity.USER),),
+            "cap-task-a-restricted", CHAIN,
+        )
+        allow_b, evidence_b = broker.commit(Commit(msg_b, task=task_b))
+        assert allow_b is False
+        assert evidence_b["primary_blocker"] == "Auth"
+        assert "task-scope-mismatch" in evidence_b["predicates"]["Auth"]
+
+
+class TestOverObservedIsUnknown:
+    """Gap: observer recording more observations than authorizations → UNKNOWN."""
+
+    def test_over_observed_returns_unknown(self, broker: EffectBroker) -> None:
+        """If obs_count > auth_count, ledger.verify() returns UNKNOWN.
+
+        This cannot happen through normal broker operation (the ledger is
+        called once per effect). But it proves the "unknown, not safe" invariant:
+        the ledger MUST NOT return CONFIRMED_COMMITTED when it cannot verify
+        the claim. This tests the boundary case directly.
+        """
+        from effect_broker.ledger import LedgerVerdict, UnknownLedgerResult
+
+        task_id = "default"
+        nonce = "test-nonce"
+
+        # Record ONE authorization
+        broker.ledger.record_authorization(
+            task_id, nonce, frozenset({"file:///reports"}), source="test",
+        )
+
+        # Record TWO observations (over-observed)
+        broker.ledger.record_observation(
+            task_id, nonce, frozenset({"file:///reports"}), source="test-obs-1",
+        )
+        broker.ledger.record_observation(
+            task_id, nonce, frozenset({"file:///reports"}), source="test-obs-2",
+        )
+
+        verdict = broker.ledger.verify(task_id, nonce)
+        assert isinstance(verdict, UnknownLedgerResult)
+        assert "over-observed" in verdict.reason
+        assert "obs_count=2" in verdict.reason
+
+
+class TestUnknownLedgerResultIsNotSafe:
+    """Gap: ledger returning UNKNOWN must not be treated as safe."""
+
+    def test_authorized_not_observed_returns_unknown(self, broker: EffectBroker) -> None:
+        """Authorization recorded but no observation → UNKNOWN (possible bypass).
+
+        Key invariant: auth > 0, obs = absent → UNKNOWN. NOT "safe."
+        This proves the ledger's "unknown, not safe" guarantee.
+        """
+        from effect_broker.ledger import UnknownLedgerResult
+
+        task_id = "default"
+        nonce = "orphan-auth"
+
+        # Authorization without observation (simulates bypass)
+        broker.ledger.record_authorization(
+            task_id, nonce, frozenset({"file:///secrets"}), source="test",
+        )
+        # No record_observation call
+
+        verdict = broker.ledger.verify(task_id, nonce)
+        assert isinstance(verdict, UnknownLedgerResult)
+        assert "possible_bypass" in verdict.reason or "authorized_not_observed" in verdict.reason
+
+    def test_direct_store_mutation_produces_unknown(self, broker: EffectBroker) -> None:
+        """Direct store mutation (bypassing executor) produces UNKNOWN from ledger.
+
+        This proves the "unknown, not safe" guarantee: direct mutation bypasses
+        the executor, so the ledger records only authorization (from gate) but
+        no observation (from apply_effect). The ledger verifies (auth=1, obs=0)
+        and returns UNKNOWN — NOT "safe."
+
+        In a multi-process deployment, the ledger process cannot be mutated
+        by the broker process, so this bypass is structurally impossible.
+        """
+        task_id = "default"
+        nonce = "bypass-nonce"
+
+        # Record authorization (as if broker allowed it via gate)
+        broker.ledger.record_authorization(
+            task_id, nonce, frozenset({"file:///reports"}), source="broker.gate",
+        )
+
+        # Direct store mutation bypassing executor (simulates same-process bypass)
+        # This is NOT observed by the ledger — no record_observation call
+        broker.store._files._data["file:///reports"] = File(
+            "file:///reports", Confidentiality.CONFIDENTIAL,
+        )
+        # NOTE: NO record_observation call — the executor is bypassed
+
+        verdict = broker.ledger.verify(task_id, nonce)
+        # Ledger sees (auth=1, obs=0) → UNKNOWN (possible bypass)
+        # NOT "safe" — this is the core invariant
+        assert isinstance(verdict, UnknownLedgerResult)
+        assert "authorized_not_observed" in verdict.reason or "possible_bypass" in verdict.reason
+
+
+class TestConcurrentNonceDoubleCommit:
+    """Gap: same nonce committed concurrently from two threads → only one succeeds."""
+
+    def test_concurrent_same_nonce_only_one_commits(self) -> None:
+        """Two threads using the same nonce simultaneously: only one Fresh passes.
+
+        The broker uses per-task locks in gate() to atomically check AND
+        reserve the nonce. This test verifies that concurrent attempts
+        with the same nonce result in exactly one ALLOW and one Fresh BLOCK.
+        Uses build() which pre-registers the default task with capabilities.
+        """
+        import threading
+
+        from effect_broker.traces import build
+
+        broker = build()
+
+        results: list[tuple[bool, str]] = []
+
+        def try_commit(thread_id: int) -> None:
+            msg = Effect(
+                "send",
+                "internal@corp.com",
+                {},
+                (Data("user_query", Confidentiality.INTERNAL, Integrity.USER),),
+                "r-send:Agent:EffectBroker",
+                (USER, AGENT, BROKER),
+            )
+            allow, evidence = broker.commit(Commit(msg))
+            results.append((allow, evidence["primary_blocker"] or "none"))
+
+        # Launch two threads simultaneously
+        t1 = threading.Thread(target=try_commit, args=(1,))
+        t2 = threading.Thread(target=try_commit, args=(2,))
+
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        allows = [allow for allow, _ in results if allow]
+        blocks = [blocker for _, blocker in results if not _]
+
+        # Exactly one ALLOW, one Fresh BLOCK
+        assert len(allows) == 1, f"Expected 1 ALLOW, got {len(allows)}: {results}"
+        assert len(blocks) == 1, f"Expected 1 BLOCK, got {len(blocks)}: {results}"
+        # The block must be Fresh (replay), not Auth/FlowOK/NoAmp
+        assert blocks[0] == "Fresh", f"Block must be Fresh, got: {results}"

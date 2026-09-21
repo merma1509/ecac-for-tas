@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 
 from effect_broker.lattice import Confidentiality, Integrity
-from effect_broker.model import Capability, Commit, Data, Effect, LabelException, Task
+from effect_broker.model import Capability, Commit, Data, Effect, EffectTarget, LabelException, Task
 from effect_broker.traces import build
 
 
@@ -54,15 +54,22 @@ def _effect(
     )
 
 
-def _grant_for(broker, etype: str, target: str, expiry: float = 100.0) -> tuple[str, Task]:
+def _grant_for(broker, etype: str, target: str, expiry: float = 100.0,
+               additional: frozenset[str] | None = None) -> tuple[str, Task]:
     """Grant an approval for (etype, target) and return (nonce, task).
 
     grant_approval creates a capability with the exact target, bypassing
     the mismatch that occurs with build()-seeded capabilities (which are
     scoped to specific targets from the trace setup).
+
+    Pass `additional` to also include BCC recipients in the binding's
+    approved target set. Without it, additional recipients added at commit
+    time will be blocked by ApprovalBinding.
     """
     task = _make_permissive_task("default")
     broker.register_task(task)
+    if additional is None:
+        additional = frozenset()
     request = Effect(
         etype=etype,
         target=target,
@@ -70,6 +77,7 @@ def _grant_for(broker, etype: str, target: str, expiry: float = 100.0) -> tuple[
         provenance=(Data("__request__", Confidentiality.INTERNAL, Integrity.USER),),
         capability_nonce=f"r-{etype}:Agent:EffectBroker",
         delegation_chain=(),
+        known_targets=EffectTarget(primary=target, additional=additional),
     )
     nonce = broker.grant_approval(request, expiry=expiry, task_id="default")
     return nonce, task
@@ -309,9 +317,16 @@ class TestFlowDeclassExactIdentity:
         """Grant with additional_targets explicitly includes BCC → covers FlowOK.
 
         Uses an INTERNAL domain BCC so NoAmp passes (capability scope = internal).
+        ApprovalBinding also covers the BCC recipient — must be in grant's
+        approved target set. Pass additional={team@...} to _grant_for so the
+        ApprovedRequest binding tracks it.
         """
         broker = build()
-        nonce, task = _grant_for(broker, "send", "internal@corp.com")
+        bcc_recipient = "team@internal.corp.com"
+        nonce, task = _grant_for(
+            broker, "send", "internal@corp.com",
+            additional=frozenset({bcc_recipient}),
+        )
 
         # Grant for primary + the BCC recipient (same internal domain → passes NoAmp)
         declass = LabelException(

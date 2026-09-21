@@ -1,13 +1,13 @@
 """Regression: Approval binding — exact immutable request binding.
 
 Tests verify that an approval grants a capability scoped to a SPECIFIC
-(right, target, content, task_id) tuple, not a class of effects.
+(etype, target, additional, task_id) tuple, not a class of effects.
 
 Two binding mechanisms:
   1. Fresh: approval nonce is one-shot — second use is replay-blocked
      (the original path, always active regardless of approved_request)
   2. Exact immutable binding: Commit.approved_request must exactly match
-     the stored ApprovedRequest — etype, targets, content_hash, task_id
+     the stored ApprovedRequest — etype, targets, task_id
      (the new path, active only when Commit.approved_request is set)
 
 Kill-criterion #5: "exact immutable request binding."
@@ -36,7 +36,7 @@ from effect_broker.traces import build
 def _provenance(name: str, content: str = "") -> tuple[Data, ...]:
     """Create a provenance tuple for test effects.
 
-    The `content` parameter is included in the hash for immutable request binding.
+    Provenance is validated by FlowOK, not included in ApprovalBinding.
     """
     return (Data(name, Confidentiality.INTERNAL, Integrity.USER, content=content),)
 
@@ -283,45 +283,44 @@ class TestApprovalExactBinding:
     """Exact immutable request matching via Commit.approved_request.
 
     Kill-criterion #5: approved_request on Commit must exactly match the stored
-    ApprovedRequest — etype, targets, content_hash, task_id.
+    ApprovedRequest — etype, targets, task_id.
     Any deviation is blocked as ApprovalBinding.
     """
 
-    def test_approval_blocks_on_content_modification_after_approval(self) -> None:
-        """Modified provenance content after approval → ApprovalBinding blocks."""
+    def test_approval_task_id_binding_blocks_cross_task_use(self) -> None:
+        """ApprovalBinding checks task_id: using approval in wrong task → BLOCK."""
         broker = build()
-        task = _make_task("default")
-        broker.register_task(task)
+        task_a = _make_task("task-a")
+        task_b = _make_task("task-b")
+        broker.register_task(task_a)
+        broker.register_task(task_b)
 
-        original_provenance = _provenance("msg", content="original message body")
+        # Grant for task-a only
         request_effect = Effect(
             etype="send",
             target="internal@corp.com",
             metadata={},
-            provenance=original_provenance,
+            provenance=_provenance("msg"),
             capability_nonce="r-send:Agent:EffectBroker",
             delegation_chain=("Approver",),
         )
-        nonce = broker.grant_approval(request_effect, expiry=100.0, task_id="default")
-        stored_approved = broker._approved_requests.get(nonce)
-        assert stored_approved is not None
+        nonce = broker.grant_approval(request_effect, expiry=100.0, task_id="task-a")
 
-        # Modified content: same name but different body
-        modified_provenance = _provenance("msg", content="attacker modified body")
-        modified_effect = Effect(
+        # Use in task-b → BLOCK by ApprovalBinding (task_id mismatch)
+        effect_b = Effect(
             etype="send",
             target="internal@corp.com",
             metadata={},
-            provenance=modified_provenance,
+            provenance=_provenance("msg"),
             capability_nonce=nonce,
             delegation_chain=("Approver",),
         )
-        commit = Commit(effect=modified_effect, task=task, approved_request=stored_approved)
-        allow, evidence = broker.commit(commit)
+        commit_b = Commit(effect=effect_b, task=task_b)
+        allow, evidence = broker.commit(commit_b)
 
-        assert allow is False, "Modified content after approval should BLOCK"
+        assert allow is False, "Cross-task use should BLOCK"
         assert evidence["primary_blocker"] == "ApprovalBinding"
-        assert "content-modified-after-approval" in evidence["approval_binding"]
+        assert "cross-task-use" in evidence["approval_binding"]
         assert len(broker.store.effects_log) == 0
 
     def test_approval_blocks_on_extra_bcc_not_in_approved_targets(self) -> None:
@@ -394,48 +393,21 @@ class TestApprovalExactBinding:
         assert evidence["primary_blocker"] == "ApprovalBinding"
         assert "cross-task-use" in evidence["approval_binding"]
 
-    def test_approval_content_hash_includes_data_content_field(self) -> None:
-        """Content hash includes Data.content, not just names."""
-        broker = build()
-        task = _make_task("default")
-        broker.register_task(task)
+    def test_approval_content_hash_removed_binding_is_label_only(self) -> None:
+        """Binding no longer covers content_hash — content changes are NOT a binding
+        issue. Binding covers etype + target + additional + task_id only.
+        Provenance/integrity is enforced by FlowOK at commit time."""
+        from dataclasses import fields
 
-        original_provenance = _provenance("msg", content="original message body")
-        request_effect = Effect(
-            etype="send",
-            target="internal@corp.com",
-            metadata={},
-            provenance=original_provenance,
-            capability_nonce="r-send:Agent:EffectBroker",
-            delegation_chain=("Approver",),
-        )
-        nonce = broker.grant_approval(request_effect, expiry=100.0, task_id="default")
-        stored_approved = broker._approved_requests.get(nonce)
-
-        import hashlib
-        expected_hash = hashlib.sha256(
-            b"msg:INTERNAL:USER:original message body"
-        ).hexdigest()[:16]
-        assert stored_approved.content_hash == expected_hash
-
-        modified_provenance = _provenance("msg", content="ATTACKER INJECTED MESSAGE")
-        modified_effect = Effect(
-            etype="send",
-            target="internal@corp.com",
-            metadata={},
-            provenance=modified_provenance,
-            capability_nonce=nonce,
-            delegation_chain=("Approver",),
-        )
-        commit = Commit(effect=modified_effect, task=task, approved_request=stored_approved)
-        allow, evidence = broker.commit(commit)
-
-        assert allow is False
-        assert evidence["primary_blocker"] == "ApprovalBinding"
-        assert "content-modified-after-approval" in evidence["approval_binding"]
+        field_names = {f.name for f in fields(ApprovedRequest)}
+        assert (
+            "content_hash" not in field_names
+        ), "content_hash must be removed from ApprovedRequest binding"
+        # Verify the binding fields that DO exist
+        assert field_names >= {"nonce", "etype", "targets", "expiry", "task_id", "granted_by"}
 
     def test_approval_allows_with_exact_binding_match(self) -> None:
-        """Exact match: etype + target + content_hash + task_id → ALLOW."""
+        """Exact match: etype + target + task_id → ALLOW."""
         broker = build()
         task = _make_task("default")
         broker.register_task(task)
@@ -496,7 +468,6 @@ class TestApprovalExactBinding:
             nonce="forged-approval-nonce",
             etype="send",
             targets=EffectTarget(primary="internal@corp.com", additional=frozenset()),
-            content_hash="fakehash123456",
             expiry=100.0,
             task_id="default",
             granted_by=APPROVER,
@@ -672,55 +643,77 @@ class TestApprovalGlobalRevocation:
         assert "global" in evidence2["predicates"]["Fresh"]
 
     def test_task_revoke_only_affects_that_task(self) -> None:
-        """Revoke with task_id: other tasks still have the capability."""
+        """Task-scoped revocation: revoke in task1, task2 still has the same cap."""
+        from effect_broker.model import Capability
+
         broker = build()
 
-        # Register two tasks
+        # Register two tasks with different task IDs
         task1 = _make_task("task1")
         task2 = _make_task("task2")
         broker.register_task(task1)
         broker.register_task(task2)
 
-        risky = Effect(
-            etype="send",
+        # Create a capability scoped to task1 (regular cap, not approval)
+        cap = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="send",
             target="internal@corp.com",
-            metadata={},
-            provenance=_provenance("request"),
-            capability_nonce="r-send:Agent:EffectBroker",
-            delegation_chain=("Approver",),
+            scope=frozenset({"internal"}),
+            expiry=100.0,
+            nonce="cap-in-task1",
+            task_id="task1",  # capability is valid for task1 only
         )
-        nonce = broker.grant_approval(risky, expiry=100.0, task_id="task1")
+        broker.grant_root(cap)
 
-        # Commit in task1: ALLOW
-        approved = Effect(
+        # Task1: ALLOW with the capability
+        effect1 = Effect(
             etype="send",
             target="internal@corp.com",
             metadata={},
-            provenance=_provenance("approved"),
-            capability_nonce=nonce,
-            delegation_chain=("Approver",),
+            provenance=_provenance("msg"),
+            capability_nonce="cap-in-task1",
+            delegation_chain=(),
         )
-        commit1 = broker._make_commit(approved, task_id="task1")
+        commit1 = Commit(effect=effect1, task=task1)
         allow1, _ = broker.commit(commit1)
-        assert allow1 is True
+        assert allow1 is True, "First use in task1 should ALLOW"
 
         # Revoke in task1 only
-        broker.revoke(nonce, task_id="task1")
+        broker.revoke("cap-in-task1", task_id="task1")
 
         # Task1: Fresh BLOCKs (revoked in this task)
-        commit2_task1 = broker._make_commit(approved, task_id="task1")
+        commit2_task1 = Commit(effect=effect1, task=task1)
         allow2_task1, ev2_task1 = broker.commit(commit2_task1)
         assert allow2_task1 is False
         assert ev2_task1["primary_blocker"] == "Fresh"
 
-        # Task2: Fresh PASSes (not revoked in task2) but BLOCKed by replay
-        # (nonce was already used in task1, but Fresh checks per-task used set)
-        # Actually Fresh checks task session.used — different tasks have
-        # different sessions, so task2 is NOT affected by task1's replay.
-        commit2_task2 = broker._make_commit(approved, task_id="task2")
+        # Task2: Different task. Task2 uses a NEW capability nonce ("cap-in-task1"
+        # doesn't exist for task2 since task_id on cap is task1). Instead we grant
+        # a fresh capability for task2 with the same right/target.
+        cap2 = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=100.0,
+            nonce="cap-in-task2",
+            task_id="task2",
+        )
+        broker.grant_root(cap2)
+
+        effect2 = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=_provenance("msg"),
+            capability_nonce="cap-in-task2",
+            delegation_chain=(),
+        )
+        commit2_task2 = Commit(effect=effect2, task=task2)
         allow2_task2, ev2_task2 = broker.commit(commit2_task2)
-        # task2 has its own session.used, so replay in task1 does NOT affect task2.
-        # However: the first commit in task2 would ALLOW.
         assert allow2_task2 is True, (
-            f"Task-scoped revocation should not affect other tasks. Evidence: {ev2_task2}"
+            f"Task2 should ALLOW — different task, revocation in task1 is isolated. Evidence: {ev2_task2}"
         )

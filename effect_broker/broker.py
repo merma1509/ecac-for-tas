@@ -46,7 +46,9 @@ from __future__ import annotations
 import threading
 from typing import cast
 
-from .executor import IsolatedExecutor
+from pathlib import Path
+
+from .executor import IsolatedExecutor, SubprocessExecutor
 from .ipc import LedgerBackend, LocalLedgerBackend
 from .ledger import IndependentEffectLedger
 from .mediation import MediationVerdict, Mediator
@@ -111,7 +113,27 @@ def _provides(auth_capability: Capability, right: str, target: str) -> bool:
 
 
 class EffectBroker:
-    def __init__(self, ledger: LedgerSource = None) -> None:
+    def __init__(
+        self,
+        ledger: LedgerSource = None,
+        *,
+        mode: str = "same-process",
+        executor_socket: str | Path = "/tmp/ecac-executor.sock",
+        store_socket: str | Path = "/tmp/ecac-executor-store.sock",
+    ) -> None:
+        """Create an EffectBroker.
+
+        Args:
+            ledger: the independent ledger (local or remote ProcessLedgerClient)
+            mode: execution mode — "same-process" (default) or "multi-process".
+                  In multi-process mode, the broker runs in a separate process
+                  from the executor's mutable store. State mutation happens in
+                  the subprocess; the broker communicates via IPC only.
+            executor_socket: Unix socket path for broker → executor IPC
+                             (only used in multi-process mode)
+            store_socket: Unix socket path for observer → executor store reads
+                         (only used in multi-process mode)
+        """
         # Ledger backend (local or remote IPC). The ledger is the single
         # source of truth for mediation verdicts. Neither broker nor
         # executor can modify ledger entries after recording.
@@ -137,23 +159,79 @@ class EffectBroker:
         self._mediator: Mediator | None = None
         # Per-task locks for atomic Fresh check + nonce reservation
         self._task_locks: dict[TaskId, threading.Lock] = {}
+        # Execution mode
+        self._mode = mode
+        self._executor_socket = Path(executor_socket)
+        self._store_socket = Path(store_socket)
 
-        # THE SOLE EXECUTOR for all effects (ADR-003).
-        # ALL commit operations route through this executor.
-        # broker.commit() is a reentrant wrapper that calls self._executor.execute().
-        # There is NO other path to _apply_effect().
-        self._executor: IsolatedExecutor = IsolatedExecutor(broker=self)
-        # Inject the ledger into the executor so both share the same records.
-        # This is the key to "one path, one ledger": authorization and observation
-        # are recorded from the same execution context.
+        if mode == "multi-process":
+            self._setup_multi_process()
+        else:
+            self._executor: IsolatedExecutor = IsolatedExecutor(broker=self)
+            # Inject the ledger into the executor so both share the same records.
+            self._executor._set_ledger(self.ledger)
+
+    def _setup_multi_process(self) -> None:
+        """Set up multi-process execution: start subprocess, create SubprocessExecutor."""
+        from .executor_subprocess import ExecutorProcessHandle
+        from .executor_ipc import ProcessExecutorClient
+
+        # Start the executor subprocess
+        handle = ExecutorProcessHandle(self._executor_socket, self._store_socket)
+        handle.start()
+
+        # Create IPC client
+        client = ProcessExecutorClient(self._executor_socket)
+
+        # Create SubprocessExecutor and wire it up
+        self._executor = SubprocessExecutor(broker=self)
         self._executor._set_ledger(self.ledger)
+        self._executor._set_client(client)
+        self._executor._set_process_handle(handle)
+
+        # Bootstrap the subprocess store with the broker's existing resources
+        self._bootstrap_executor_store(client)
+
+    def _bootstrap_executor_store(self, client: "ProcessExecutorClient") -> None:
+        """Bootstrap the subprocess store with resources from broker's same-process store.
+
+        Transfers resource definitions from the broker's store into the
+        subprocess's IsolatedStore so both views of state are consistent
+        at startup (pre-populated files, emails, mailboxes).
+        """
+        files: list[dict[str, str]] = [
+            {"path": f.path, "sensitivity": f.sensitivity.name}
+            for f in self.store._files._data.values()
+        ]
+        emails: list[dict[str, str]] = [
+            {"address": e.address, "domain": e.domain.name}
+            for e in self.store._emails._data.values()
+        ]
+        mailboxes: list[str] = list(self.store._mailboxes._data.keys())
+
+        client.bootstrap(files=files, emails=emails, mailboxes=mailboxes)
+
+    def shutdown(self) -> None:
+        """Cleanly shut down the broker and its subprocess (multi-process mode only).
+
+        In multi-process mode: sends SHUTDOWN to the executor subprocess,
+        terminates and rejoins the process. Safe to call multiple times
+        (idempotent after first call).
+
+        In same-process mode: no-op.
+        """
+        if self._mode == "multi-process":
+            executor = self._executor
+            if isinstance(executor, SubprocessExecutor):
+                executor.shutdown()
+            self._mode = "shutdown"  # prevent double-shutdown
 
     def set_mediator(self, mediator: Mediator) -> None:
         """Attach a Mediator (the enforcement shim) to this broker"""
         self._mediator = mediator
 
     @property
-    def executor(self) -> IsolatedExecutor:
+    def executor(self) -> IsolatedExecutor | SubprocessExecutor:
         """The sole executor for this broker. All effects go through it."""
         return self._executor
 
