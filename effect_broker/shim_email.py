@@ -61,7 +61,7 @@ class RealEmailShim:
     list is a BCC attempt — we fail closed before broker.commit().
     """
 
-    broker: "EffectBroker"
+    broker: EffectBroker
     task_id: str
     tool_name: str
 
@@ -83,7 +83,7 @@ class RealEmailShim:
 
     def __init__(
         self,
-        broker: "EffectBroker",
+        broker: EffectBroker,
         task_id: str = "default",
         tool_name: str = "untrusted-tool",
         smtp_host: str = "localhost",
@@ -111,9 +111,10 @@ class RealEmailShim:
             return canon.split("@")[1]
         return ""
 
-    def _derive_email_confidentiality(self, sender: str, recipients: frozenset[str]) -> Confidentiality:
+    def _derive_email_confidentiality(
+        self, sender: str, recipients: frozenset[str]
+    ) -> Confidentiality:
         """Derive confidentiality from sender/recipient domains."""
-        sender_domain = self._derive_domain(sender)
         corp_domains = {"corp.com", "internal.corp.com", "localhost"}
 
         # If any recipient is EXTERNAL, this is at least INTERNAL
@@ -137,7 +138,9 @@ class RealEmailShim:
             return Integrity.USER  # reply → trusted
         return Integrity.USER  # default: user-originated
 
-    def _build_message(self, sender: str, recipient: str, body: str, **extra: str) -> tuple[bytes, str, int]:
+    def _build_message(
+        self, sender: str, recipient: str, body: str, **extra: str
+    ) -> tuple[bytes, str, int]:
         """Build RFC 822 message. Returns (raw_bytes, subject, body_size)."""
         msg = email.message.EmailMessage()
         msg["From"] = sender
@@ -172,7 +175,8 @@ class RealEmailShim:
     def _open_smtp(self) -> smtplib.SMTP:
         """Open an SMTP connection to the configured MTA. Returns connected socket."""
         if self.use_tls:
-            server = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port)
+            # SMTP_SSL is a subclass of SMTP; cast to satisfy return type annotation
+            server: smtplib.SMTP = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port)
         else:
             server = smtplib.SMTP(self.smtp_host, self.smtp_port)
         if self.smtp_user and self.smtp_password:
@@ -183,7 +187,7 @@ class RealEmailShim:
         self,
         server: smtplib.SMTP,
         recipients: frozenset[str],
-    ) -> dict[str, tuple[int, str]]:
+    ) -> dict[str, tuple[int, bytes | str]]:
         """Send SMTP RCPT TO for each recipient. Returns per-recipient (code, msg).
 
         This is the core BCC-detection primitive. We call RCPT TO for EVERY
@@ -191,7 +195,7 @@ class RealEmailShim:
         accept delivery. Recipients that pass RCPT TO but are not in the
         declared list are BCC attempts.
         """
-        results: dict[str, tuple[int, str]] = {}
+        results: dict[str, tuple[int, bytes | str]] = {}
         for rcpt in sorted(recipients):
             code, msg = server.rcpt(rcpt)
             results[rcpt] = (code, msg)
@@ -245,9 +249,7 @@ class RealEmailShim:
         """
         # Canonicalize all addresses
         canon_recipient = self._canonical_email(recipient)
-        extras_canon = frozenset(
-            self._canonical_email(a) for a in extra_recipients.values()
-        )
+        extras_canon = frozenset(self._canonical_email(a) for a in extra_recipients.values())
         all_declared = frozenset({canon_recipient}) | extras_canon
 
         # Build message once (for body_size / content analysis)
@@ -265,8 +267,7 @@ class RealEmailShim:
             )
         except SMTPError as ex:
             raise EmailSecurityError(
-                f"[{self.tool_name}] SMTP BCC probe failed: {ex}. "
-                f"Failing closed — no email sent."
+                f"[{self.tool_name}] SMTP BCC probe failed: {ex}. Failing closed — no email sent."
             ) from ex
 
         # Fail closed: if MTA accepted recipients the tool did NOT declare,
@@ -296,9 +297,11 @@ class RealEmailShim:
                 "mta_actual_recipients": list(actual_accepted),
             },
             provenance=(
-                Data(f"shim-send", conf, integ),
+                Data("shim-send", conf, integ),
                 Data(f"sender={sender}", Confidentiality.CONFIDENTIAL, Integrity.HIGH),
-                Data(f"mta-accepted={actual_accepted}", Confidentiality.CONFIDENTIAL, Integrity.HIGH),
+                Data(
+                    f"mta-accepted={actual_accepted}", Confidentiality.CONFIDENTIAL, Integrity.HIGH
+                ),
             ),
             capability_nonce=nonce,
             delegation_chain=(self.tool_name, "RealEmailShim"),
@@ -306,8 +309,9 @@ class RealEmailShim:
         )
 
         from .model import Commit
+
         commit = Commit(effect=effect, task=None, tool_name=self.tool_name)
-        allow, evidence = self.broker._executor.execute(commit)
+        allow, evidence = self.broker.executor.execute(commit)
 
         op = EmailOp(
             operation="send",
@@ -381,8 +385,9 @@ class RealEmailShim:
         )
 
         from .model import Commit
+
         commit = Commit(effect=effect, task=None, tool_name=self.tool_name)
-        allow, evidence = self.broker._executor.execute(commit)
+        allow, evidence = self.broker.executor.execute(commit)
 
         if not allow:
             blocker = evidence.get("primary_blocker", "unknown")
@@ -424,13 +429,9 @@ class RealEmailShim:
                 else:
                     integ = Integrity.USER
         except imaplib.IMAP4.error as ex:
-            raise EmailSecurityError(
-                f"[{self.tool_name}] IMAP error reading inbox: {ex}"
-            ) from ex
+            raise EmailSecurityError(f"[{self.tool_name}] IMAP error reading inbox: {ex}") from ex
         except Exception as ex:
-            raise EmailSecurityError(
-                f"[{self.tool_name}] read_inbox failed: {ex}"
-            ) from ex
+            raise EmailSecurityError(f"[{self.tool_name}] read_inbox failed: {ex}") from ex
 
         self.ops.append(
             EmailOp(
@@ -459,11 +460,17 @@ class RealEmailShim:
         holder = self.tool_name
         target_pattern = f"mailto:{primary}" if "@" in primary else primary
 
-        for nonce, cap in self.broker.capabilities.items():
+        for _nonce, cap in self.broker.capabilities.items():
             if cap.holder in (holder, "EffectBroker") and cap.right in (right, "*"):
-                if cap.target == "*" or target_pattern.startswith(cap.target.replace("mailto:", "")):
+                if cap.target == "*" or target_pattern.startswith(
+                    cap.target.replace("mailto:", "")
+                ):
                     extras_key = ",".join(sorted(extras)) if extras else ""
-                    return f"{holder}:{right}:{primary}:{extras_key}" if extras_key else f"{holder}:{right}:{primary}"
+                    return (
+                        f"{holder}:{right}:{primary}:{extras_key}"
+                        if extras_key
+                        else f"{holder}:{right}:{primary}"
+                    )
 
         return f"no-cap-{right}-{primary}"
 
