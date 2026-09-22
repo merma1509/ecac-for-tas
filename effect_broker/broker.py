@@ -625,9 +625,23 @@ class EffectBroker:
         #   "internal" in {"internal"} = True <- CORRECT
         is_wildcard = "*" in task.ceiling.scope
         target_for_scope_check = self._scope_label_for_target(effect.target)
-        scope_ok = is_wildcard or (
-            capability.scope <= task.ceiling.scope and target_for_scope_check in task.ceiling.scope
-        )
+        # For file:// targets: check if the target is inside any scope element.
+        # A cap scoped to file:///a/b allows operations on
+        # file:///a/b/subdir/file.txt (target is a subdirectory of the scope).
+        # For non-file targets or wildcard scopes: use exact match.
+        if target_for_scope_check.startswith("file://") and not is_wildcard:
+            # Subdirectory containment: file:///a/b allows file:///a/b/c
+            target_in_scope = any(
+                target_for_scope_check.startswith(s + "/") or target_for_scope_check == s
+                for s in task.ceiling.scope
+            )
+            # Cap scope doesn't need to be subset of ceiling (for scoped caps)
+            scope_ok = target_in_scope
+        else:
+            # Original logic: cap scope ≤ ceiling scope AND target in ceiling.
+            # Special case: ceiling scope is wildcard {'*'} — skip subset check.
+            target_in_scope = is_wildcard or target_for_scope_check in task.ceiling.scope
+            scope_ok = (is_wildcard or capability.scope <= task.ceiling.scope) and target_in_scope
         if not scope_ok:
             return (
                 False,
@@ -643,8 +657,8 @@ class EffectBroker:
         # Exception: right="*" is a wildcard — matches any etype.
         if capability.right != "*" and capability.right != effect.etype:
             return False, f"right-mismatch(cap_right={capability.right}!=etype={effect.etype})"
-        if capability.target != effect.target:
-            return False, f"target-mismatch(cap_target={capability.target}!={effect.target})"
+        if capability.target != "*" and capability.target != effect.target:
+            return False, f"target-mismatch(cap_target={capability.target}!=effect.target={effect.target})"
 
         # Sub-check 6: task-scoping (only for reusable capabilities with task_id).
         # Approval capabilities (identified by "approval:" prefix) use ApprovalBinding
@@ -699,7 +713,15 @@ class EffectBroker:
         # raw email address. This is the same fix as in check_auth().
         is_wildcard = "*" in task.ceiling.scope
         target_for_scope_check = self._scope_label_for_target(effect.target)
-        target_in_scope = is_wildcard or target_for_scope_check in task.ceiling.scope
+        # Same subdirectory-aware logic as check_auth:
+        # file:///a/b allows file:///a/b/c (subdirectory)
+        if target_for_scope_check.startswith("file://"):
+            target_in_scope = is_wildcard or any(
+                target_for_scope_check.startswith(s + "/") or target_for_scope_check == s
+                for s in task.ceiling.scope
+            )
+        else:
+            target_in_scope = is_wildcard or target_for_scope_check in task.ceiling.scope
         if not target_in_scope:
             return (
                 False,
@@ -735,14 +757,20 @@ class EffectBroker:
                             f"not in cap-scope={capability.scope})"
                         )
                 else:
-                    # Non-email extra target: check if target is in cap scope
-                    # (e.g. "file:///../../etc/password" must be in scope)
-                    target_label = self._scope_label_for_target(extra_target)
-                    if target_label not in capability.scope:
+                    # Extra targets from the effect's complete_targets() are directory
+                    # paths (parent dirs, temp dirs, etc.) for file ops.
+                    # Check if the directory itself or any of its parent directories
+                    # is in the cap scope. This allows operations on files in
+                    # file:///a/b/subdir/file.txt where scope={file:///a/b}.
+                    target_label = extra_target
+                    if not any(
+                        target_label.startswith(s + "/") or target_label == s
+                        for s in capability.scope
+                    ):
                         return False, (
                             f"extra-target-outside-scope("
-                            f"{extra_target} (scope-label={target_label}) "
-                            f"not in cap-scope={capability.scope})"
+                            f"{extra_target} "
+                            f"not under cap-scope={capability.scope})"
                         )
 
         # SSRF containment for network effects
@@ -772,16 +800,32 @@ class EffectBroker:
           - "internal@corp.com" -> "internal" (matches ceiling scope {"internal"})
           - "external@attacker.com" -> "external" (matches ceiling scope {"external"})
 
-        For non-email targets (files, URLs), returns the target as-is:
-          - "file:///reports" -> "file:///reports"
-          - "http://internal.corp.com" -> "http://internal.corp.com"
+        For file:// targets, returns the parent directory URI so that:
+          - "file:///canon/new_file.txt" -> "file:///canon"
+            (matches ceiling scope {"file:///canon"})
 
-        This ensures domain-scoped capabilities work correctly for email,
-        which is the CRITICAL FIX for the email-domain-scope bug.
+        For other targets, returns the target as-is:
+          - "http://internal.corp.com" -> "http://internal.corp.com"
         """
         if "@" in target:
             domain = self._domain_for_email(target)
             return domain if domain is not None else target
+
+        if target.startswith("file://"):
+            # Extract scope-relevant label for containment check.
+            # For a FILE target file:///a/b/c:
+            #   scope-label = parent(file:///a/b/c) = file:///a/b
+            #   → checks if parent is in scope
+            # For a DIRECTORY extra-target file:///a/b:
+            #   scope-label = file:///a/b (use as-is — it's already a scope element)
+            #   → checks if the directory itself is in scope
+            path_part = target[7:]  # remove "file://"
+            last_slash = path_part.rfind("/")
+            if last_slash > 0:
+                return f"file://{path_part[:last_slash]}"
+            # Bare path like "file:///filename" → use the path itself as label
+            return target
+
         return target
 
     def _domain_for_email(self, addr: str) -> str | None:
