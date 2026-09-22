@@ -10,7 +10,7 @@ state — not from tool-provided declarations — so the tool cannot forge outco
 
 ## Invariant
 
-```python
+```bash
 Commit(e, t)  ⇒  Auth(e, t) ∧ FlowOK(e, t) ∧ NoAmp(e, t) ∧ Fresh(e, t)
 ```
 
@@ -143,14 +143,14 @@ tests/
            │  (read-only predicates)         (sole mutation point)
            ↓                                    ↓
    ┌─────────────────┐          ┌──────────────────────────────┐
-   │  EffectBroker   │          │     RestrictedResourceStore   │
-   │  Auth/FlowOK/    │          │     apply_effect() → F ∪ E   │
-   │  NoAmp/Fresh     │          │     effects_log              │
+   │  EffectBroker   │          │    RestrictedResourceStore   │
+   │  Auth/FlowOK/   │          │     apply_effect() → F ∪ E   │
+   │  NoAmp/Fresh    │          │     effects_log              │
    └─────────────────┘          └──────────────────────────────┘
            ↑                                    ↑
            │ executor.execute()                 │
            │ (both paths unify here)            │
-           └────────────────┬─────────────────┘
+           └────────────────┬───────────────────┘
                             ↓
                    ┌────────────────────────────────────────────────┐
                    │                 TWO PATHS TO executor          │
