@@ -57,6 +57,10 @@ DEPLOYMENT IMPLICATIONS:
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from effect_broker.broker import EffectBroker
 
 
 class VerdictInvariant(Enum):
@@ -79,12 +83,12 @@ class VerdictInvariant(Enum):
 
 @dataclass(frozen=True)
 class UnknownNotSafeSpec:
-    """Formal specification of the "unknown, not safe" invariant.
+    """Formal specification of the "unknown, not safe" invariant
 
-    Use this as a checklist for implementing and verifying new components.
+    Use this as a checklist for implementing and verifying new components
     """
 
-    # The ledger MUST return UNKNOWN (not safe) when it cannot verify.
+    # The ledger MUST return UNKNOWN (not safe) when it cannot verify
     ledger_returns_unknown_on_unverifiable: bool = True
 
     # Authorization without observation → UNKNOWN
@@ -108,20 +112,21 @@ class UnknownNotSafeSpec:
     @property
     def all_invariants_hold(self) -> bool:
         """All invariants must hold for the guarantee to be valid."""
-        return all([
-            self.ledger_returns_unknown_on_unverifiable,
-            self.ledger_returns_unknown_on_auth_without_obs,
-            self.ledger_returns_unknown_on_obs_without_auth,
-            self.ledger_returns_unknown_on_count_mismatch,
-            self.ledger_requires_auth_equals_obs_for_confirmed,
-            self.broker_never_reports_safe_for_unverifiable,
-            self.observer_returns_unknown_for_unobserved,
-        ])
+        return all(
+            [
+                self.ledger_returns_unknown_on_unverifiable,
+                self.ledger_returns_unknown_on_auth_without_obs,
+                self.ledger_returns_unknown_on_obs_without_auth,
+                self.ledger_returns_unknown_on_count_mismatch,
+                self.ledger_requires_auth_equals_obs_for_confirmed,
+                self.broker_never_reports_safe_for_unverifiable,
+                self.observer_returns_unknown_for_unobserved,
+            ]
+        )
 
 
 # ---- Invariant check helpers ----
-
-def check_unknown_not_safe(broker) -> list[str]:
+def check_unknown_not_safe(broker: EffectBroker) -> list[str]:
     """Check that the broker+ledger satisfy the 'unknown, not safe' invariant.
 
     Returns list of failures (empty = invariant holds).
@@ -131,9 +136,9 @@ def check_unknown_not_safe(broker) -> list[str]:
       2. Broker-authorized effect with no observer → ledger must return UNKNOWN
       3. An unverifiable capability use → ledger must return UNKNOWN
     """
-    from .ledger import CONFIRMED_COMMITTED, REJECTED, UnknownLedgerResult
-    from .model import Capability, USER, BROKER
     from .lattice import Confidentiality
+    from .ledger import UnknownLedgerResult
+    from .model import BROKER, USER, Capability
 
     failures = []
 
@@ -143,7 +148,10 @@ def check_unknown_not_safe(broker) -> list[str]:
 
     # Record only authorization (as if broker allowed it)
     broker.ledger.record_authorization(
-        task_id, nonce, frozenset({"file:///inv-bypass"}), source="broker.gate",
+        task_id,
+        nonce,
+        frozenset({"file:///inv-bypass"}),
+        source="broker.gate",
     )
     # No observation — simulates direct store mutation bypass
 
@@ -153,14 +161,17 @@ def check_unknown_not_safe(broker) -> list[str]:
             f"Case 1 (direct store mutation bypass): ledger returned {type(verdict).__name__} "
             f"instead of UNKNOWN. Ledger verdict: {verdict}"
         )
-    elif "authorized_not_observed" not in verdict.reason and "possible_bypass" not in verdict.reason:
+    elif (
+        "authorized_not_observed" not in verdict.reason and "possible_bypass" not in verdict.reason
+    ):
         failures.append(
-            f"Case 1 (direct mutation): UNKNOWN reason '{verdict.reason}' "
-            f"does not indicate bypass. Must contain 'authorized_not_observed' or 'possible_bypass'."
+            "Case 1 (direct mutation): UNKNOWN reason "
+            f"'{verdict.reason}' does not indicate bypass. Must contain "
+            "'authorized_not_observed' or 'possible_bypass'."
         )
 
     # Reset for next case
-    broker.ledger._records.clear()
+    broker.ledger.reset()
 
     # Case 2: Capability with no authorization record
     broker.store._unsafe_bootstrap_file("file:///inv-unverifiable", Confidentiality.PUBLIC)

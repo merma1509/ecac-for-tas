@@ -15,6 +15,7 @@ dev = [
     "pytest>=8.0",
     "mypy>=1.10",
     "ruff>=0.6",
+    "aiosmtpd>=1.4",
 ]
 
 [build-system]
@@ -42,5 +43,7 @@ select = ["E", "F", "I", "W", "UP", "B"]
 
 [dependency-groups]
 dev = [
+    "aiosmtpd>=1.4.6",
     "mypy>=2.3.1",
+    "pytest>=9.1.1",
 ]

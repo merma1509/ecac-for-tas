@@ -218,27 +218,27 @@ class SubprocessExecutor:
         broker.shutdown()  # clean subprocess termination
     """
 
-    broker: "EffectBroker"
+    broker: EffectBroker
     task_id: str = "subprocess"
-    _ledger: "IndependentEffectLedger | None" = None
-    _client: "ProcessExecutorClient | None" = None
-    _process_handle: "ExecutorProcessHandle | None" = None
+    _ledger: IndependentEffectLedger | None = None
+    _client: ProcessExecutorClient | None = None
+    _process_handle: ExecutorProcessHandle | None = None
     _execution_count: int = 0
 
-    def _set_ledger(self, ledger: "IndependentEffectLedger") -> None:
+    def _set_ledger(self, ledger: IndependentEffectLedger) -> None:
         """Called by broker to inject the shared ledger."""
         self._ledger = ledger
 
-    def _set_client(self, client: "ProcessExecutorClient") -> None:
+    def _set_client(self, client: ProcessExecutorClient) -> None:
         """Called by broker to inject the IPC client after subprocess starts."""
         self._client = client
 
-    def _set_process_handle(self, handle: "ExecutorProcessHandle") -> None:
+    def _set_process_handle(self, handle: ExecutorProcessHandle) -> None:
         """Called by broker to store the process handle for shutdown."""
         self._process_handle = handle
 
     @property
-    def ledger(self) -> "IndependentEffectLedger":
+    def ledger(self) -> IndependentEffectLedger:
         return self._ledger if self._ledger is not None else self.broker.ledger
 
     def bootstrap_store(
@@ -263,9 +263,9 @@ class SubprocessExecutor:
 
     def execute(
         self,
-        commit: "Commit",
-        mediation: "MediationVerdict | None" = None,
-    ) -> tuple[bool, "Evidence"]:
+        commit: Commit,
+        mediation: MediationVerdict | None = None,
+    ) -> tuple[bool, Evidence]:
         """Execute through the multi-process isolation path.
 
         Three-phase execution:
@@ -295,6 +295,7 @@ class SubprocessExecutor:
                 raise RuntimeError("SubprocessExecutor: no IPC client available")
 
             from .executor_ipc import effect_to_dict
+
             effect_dict = effect_to_dict(effect)
             resp = self._client.execute(effect_dict)
 
@@ -313,7 +314,7 @@ class SubprocessExecutor:
 
         return allow, evidence
 
-    def apply_effect(self, effect: "Effect", task: "Task") -> None:
+    def apply_effect(self, effect: Effect, task: Task) -> None:
         """NOT USED in multi-process mode.
 
         In multi-process mode, apply_effect() is called ONLY by the subprocess's
@@ -344,6 +345,3 @@ class SubprocessExecutor:
             self._process_handle.stop()
         self._client = None
         self._process_handle = None
-
-
-

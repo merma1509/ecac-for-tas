@@ -33,19 +33,19 @@ import json
 import threading
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 
 class ExecutorRequest(Enum):
     """Wire format: broker → executor subprocess."""
 
-    EXECUTE = auto()      # Apply an effect, return observed_targets
-    READ_STORE = auto()   # Observer reads actual store state for verification
+    EXECUTE = auto()  # Apply an effect, return observed_targets
+    READ_STORE = auto()  # Observer reads actual store state for verification
     READ_EMAILS = auto()  # Observer reads emails for duplicate accounting
-    READ_FILES = auto()   # Observer reads files
+    READ_FILES = auto()  # Observer reads files
     READ_MAILBOXES = auto()  # Observer reads mailboxes
-    BOOTSTRAP = auto()    # Bootstrap initial resources (files/emails/mailboxes)
-    SHUTDOWN = auto()     # Clean shutdown
+    BOOTSTRAP = auto()  # Bootstrap initial resources (files/emails/mailboxes)
+    SHUTDOWN = auto()  # Clean shutdown
 
 
 # ---- Dataclass serialization ----
@@ -191,10 +191,14 @@ def serialize_request(kind: ExecutorRequest, payload: dict[str, Any]) -> bytes:
 
 def parse_response(raw: bytes) -> dict[str, Any]:
     """Parse a JSON response."""
-    return json.loads(raw.decode())
+    return cast(dict[str, Any], json.loads(raw.decode()))
 
 
-def send_and_receive(socket_path: str | Path, kind: ExecutorRequest, payload: dict[str, Any]) -> dict[str, Any]:
+def send_and_receive(
+    socket_path: str | Path,
+    kind: ExecutorRequest,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
     """Send a request and receive the response over Unix socket."""
     import socket as _sock
 
@@ -247,7 +251,7 @@ class ProcessExecutorClient:
             resp = send_and_receive(self._path, ExecutorRequest.EXECUTE, {"effect": effect_dict})
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
-        return resp["result"]
+        return cast(dict[str, Any], resp["result"])
 
     def read_store(self) -> dict[str, Any]:
         """Read the complete executor store state (for independent observer)."""
@@ -255,7 +259,7 @@ class ProcessExecutorClient:
             resp = send_and_receive(self._path, ExecutorRequest.READ_STORE, {})
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
-        return resp["result"]
+        return cast(dict[str, Any], resp["result"])
 
     def read_files(self) -> dict[str, Any]:
         """Read just the files state."""
@@ -263,7 +267,7 @@ class ProcessExecutorClient:
             resp = send_and_receive(self._path, ExecutorRequest.READ_FILES, {})
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
-        return resp["result"]
+        return cast(dict[str, Any], resp["result"])
 
     def read_emails(self) -> dict[str, Any]:
         """Read just the emails state."""
@@ -271,7 +275,7 @@ class ProcessExecutorClient:
             resp = send_and_receive(self._path, ExecutorRequest.READ_EMAILS, {})
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
-        return resp["result"]
+        return cast(dict[str, Any], resp["result"])
 
     def read_mailboxes(self) -> dict[str, Any]:
         """Read just the mailboxes state."""
@@ -279,7 +283,7 @@ class ProcessExecutorClient:
             resp = send_and_receive(self._path, ExecutorRequest.READ_MAILBOXES, {})
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
-        return resp["result"]
+        return cast(dict[str, Any], resp["result"])
 
     def bootstrap(
         self,
@@ -317,7 +321,7 @@ class ProcessExecutorClient:
         The process handle will then terminate/kill the process.
         """
         with self._lock:
-            resp = send_and_receive(self._path, ExecutorRequest.SHUTDOWN, {})
+            send_and_receive(self._path, ExecutorRequest.SHUTDOWN, {})
         # Ignore response errors — we just want to trigger shutdown.
         # The process handle will ensure cleanup regardless.
         return

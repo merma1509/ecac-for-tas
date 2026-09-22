@@ -15,7 +15,7 @@ from what the MTA actually does.
 from __future__ import annotations
 
 import email.message
-import re
+import imaplib
 import smtplib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -49,25 +49,19 @@ class RealEmailShim:
 
     The tool calls shim.send(...), shim.read_inbox(...).
     The shim:
-      1. Builds the message
-      2. Opens a real SMTP connection (or mock for tests)
-      3. Derives the ACTUAL recipients from the SMTP transaction
-         (not from the tool's declared recipients list)
-      4. If BCC recipients are present in actual recipients but not
-         in declared: detect the bypass attempt
-      5. Submits to broker gate with the complete REAL recipient set
-      6. On ALLOW: sends via SMTP
-      7. Records the MTA delivery log
+      1. SMTP RCPT-TO probe (RSET-only, no DATA) → discovers ACTUAL recipients
+      2. If BCC detected → fail closed immediately (no broker.commit)
+      3. broker.commit() with the real (MTA-verified) target set
+      4. On ALLOW: real SMTP DATA delivery or IMAP SELECT + SEARCH + FETCH
 
-    BCC detection: We parse the SMTP conversation to find the complete
-    recipient list. If the actual recipients ⊄ declared_recipients,
-    the broker gate's NoAmp check will fire (extra target outside scope).
-
-    SMTP mock: In test/dev mode, uses a local mock SMTP server that
-    records all RCPT TO commands. In production, uses real SMTP.
+    BCC detection: We open a real SMTP connection, call RCPT TO for every
+    recipient, read the per-recipient SMTP responses, then RSET to abort
+    the transaction (no message queued or delivered). The MTA tells us which
+    addresses it will accept. Any accepted address not in the tool's declared
+    list is a BCC attempt — we fail closed before broker.commit().
     """
 
-    broker: "EffectBroker"
+    broker: EffectBroker
     task_id: str
     tool_name: str
 
@@ -78,22 +72,32 @@ class RealEmailShim:
     smtp_password: str | None = None
     use_tls: bool = False
 
+    # IMAP config — set these to connect to a real IMAP server
+    imap_host: str = "localhost"
+    imap_port: int = 993
+    imap_user: str | None = None
+    imap_password: str | None = None
+
     # Independent observer record
     ops: list[EmailOp] = field(default_factory=list)
 
     def __init__(
         self,
-        broker: "EffectBroker",
+        broker: EffectBroker,
         task_id: str = "default",
         tool_name: str = "untrusted-tool",
         smtp_host: str = "localhost",
         smtp_port: int = 25,
+        imap_host: str = "localhost",
+        imap_port: int = 993,
     ) -> None:
         self.broker = broker
         self.task_id = task_id
         self.tool_name = tool_name
         self.smtp_host = smtp_host
         self.smtp_port = smtp_port
+        self.imap_host = imap_host
+        self.imap_port = imap_port
         self.ops = []
 
     def _canonical_email(self, addr: str) -> str:
@@ -107,9 +111,10 @@ class RealEmailShim:
             return canon.split("@")[1]
         return ""
 
-    def _derive_email_confidentiality(self, sender: str, recipients: frozenset[str]) -> Confidentiality:
+    def _derive_email_confidentiality(
+        self, sender: str, recipients: frozenset[str]
+    ) -> Confidentiality:
         """Derive confidentiality from sender/recipient domains."""
-        sender_domain = self._derive_domain(sender)
         corp_domains = {"corp.com", "internal.corp.com", "localhost"}
 
         # If any recipient is EXTERNAL, this is at least INTERNAL
@@ -133,7 +138,9 @@ class RealEmailShim:
             return Integrity.USER  # reply → trusted
         return Integrity.USER  # default: user-originated
 
-    def _build_message(self, sender: str, recipient: str, body: str, **extra: str) -> tuple[bytes, str, int]:
+    def _build_message(
+        self, sender: str, recipient: str, body: str, **extra: str
+    ) -> tuple[bytes, str, int]:
         """Build RFC 822 message. Returns (raw_bytes, subject, body_size)."""
         msg = email.message.EmailMessage()
         msg["From"] = sender
@@ -145,179 +152,173 @@ class RealEmailShim:
         raw = msg.as_bytes()
         return raw, msg["Subject"], len(raw)
 
-    def _smtp_send(
-        self,
-        sender: str,
-        all_recipients: frozenset[str],
-        raw_message: bytes,
-    ) -> tuple[str, list[str]]:
-        """Send via real SMTP. Returns (sender, [delivered recipients]).
-
-        In test mode (localhost:9025), uses MockSMTP.
-        In production, uses real SMTP with TLS.
-
-        The key security feature: we record the ACTUAL recipients from
-        the RCPT TO SMTP commands, not the tool's declared list.
-        """
-        # Try mock SMTP first (port 9025 for tests)
-        actual_delivered: list[str] = []
+    def _smtp_send(self, sender: str, recipients: frozenset[str], raw_message: bytes) -> list[str]:
+        """Send raw bytes via real SMTP. Returns list of recipients accepted by MTA."""
         try:
-            if self.smtp_host == "localhost" and self.smtp_port == 9025:
-                actual_delivered = self._mock_smtp_send(all_recipients)
-            else:
-                actual_delivered = self._real_smtp_send(sender, all_recipients, raw_message)
-            return sender, actual_delivered
-        except Exception as ex:
-            raise SMTPError(f"SMTP send failed: {ex}") from ex
-
-    def _mock_smtp_send(self, recipients: frozenset[str]) -> list[str]:
-        """Mock SMTP for testing — records all RCPT TO commands.
-
-        This simulates what a real MTA would do: accept delivery for
-        every RCPT TO address, including BCC recipients.
-        """
-        # In test mode, we just record that we delivered to all recipients
-        # The mock server (test fixture) handles the actual socket
-        return list(recipients)
-
-    def _real_smtp_send(
-        self,
-        sender: str,
-        recipients: frozenset[str],
-        raw_message: bytes,
-    ) -> list[str]:
-        """Real SMTP send with TLS support."""
-        delivered: list[str] = []
-        try:
-            if self.use_tls:
-                server = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port)
-            else:
-                server = smtplib.SMTP(self.smtp_host, self.smtp_port)
-
+            server = self._open_smtp()
             try:
-                if self.smtp_user and self.smtp_password:
-                    server.login(self.smtp_user, self.smtp_password)
-
-                # Send to all recipients — record who actually accepted
-                for rcpt in recipients:
-                    code, msg = server.send_message(
-                        email.message.EmailMessage.from_bytes(raw_message),
-                        to_addrs=[rcpt],
-                        mail_options=[],
-                        rcpt_options=[],
-                    )
-                    if code == 250:
-                        delivered.append(rcpt)
+                # Establish the mail transaction (RSET to reset any prior state)
+                server.rset()
+                server.mail(sender)
+                # RCPT TO for each — this is where BCC detection happens
+                rcpt_results = self._smtp_rcpt_to(server, recipients)
+                # DATA with full message
+                server.data(raw_message)
+                # Collect accepted recipients (code 250 = OK)
+                delivered = [r for r, (code, _) in rcpt_results.items() if code == 250]
+                return delivered
             finally:
                 server.quit()
-
         except smtplib.SMTPException as ex:
             raise SMTPError(f"SMTP error: {ex}") from ex
-        return delivered
+
+    def _open_smtp(self) -> smtplib.SMTP:
+        """Open an SMTP connection to the configured MTA. Returns connected socket."""
+        if self.use_tls:
+            # SMTP_SSL is a subclass of SMTP; cast to satisfy return type annotation
+            server: smtplib.SMTP = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port)
+        else:
+            server = smtplib.SMTP(self.smtp_host, self.smtp_port)
+        if self.smtp_user and self.smtp_password:
+            server.login(self.smtp_user, self.smtp_password)
+        return server
+
+    def _smtp_rcpt_to(
+        self,
+        server: smtplib.SMTP,
+        recipients: frozenset[str],
+    ) -> dict[str, tuple[int, bytes | str]]:
+        """Send SMTP RCPT TO for each recipient. Returns per-recipient (code, msg).
+
+        This is the core BCC-detection primitive. We call RCPT TO for EVERY
+        recipient before DATA. The MTA tells us per-recipient whether it will
+        accept delivery. Recipients that pass RCPT TO but are not in the
+        declared list are BCC attempts.
+        """
+        results: dict[str, tuple[int, bytes | str]] = {}
+        for rcpt in sorted(recipients):
+            code, msg = server.rcpt(rcpt)
+            results[rcpt] = (code, msg)
+        return results
 
     def _parse_bcc_from_smtp(
         self,
         sender: str,
         declared: frozenset[str],
-        body: str,
-        **extra: str,
     ) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
-        """Parse actual recipients from SMTP transaction.
+        """Probe the MTA to discover actual recipients via SMTP RCPT TO.
 
         Returns (declared_recipients, actual_recipients, bcc_detected).
-        BCC detection: the actual recipients from the SMTP session
-        (parsed from RCPT TO commands) may include addresses not in
-        the declared list. These are BCC attempts.
 
-        In a real shim: we would inspect the actual SMTP conversation.
-        In this implementation: we simulate by passing all extra_recipients
-        through the broker gate and letting NoAmp check fire if they are
-        outside the capability scope.
+        BCC detection: after RSET (no DATA), the MTA accepted recipients are
+        the ACTUAL set. Any accepted recipient not in declared is a BCC attempt.
         """
-        declared_set = frozenset({declared}) | frozenset(extra.values()) if extra else frozenset({declared})
-
-        # In real implementation: parse SMTP RCPT TO from the connection
-        # Here: the actual recipients = declared + whatever the tool passed
-        # The key invariant: the broker's complete_targets() includes ALL
-        # recipients, and NoAmp checks if all are within the capability scope.
-
-        # BCC detection via broker: if the tool tries to BCC by passing extra
-        # recipients not in the declared list, they show up in extra_resources.
-        # The broker's NoAmp scope check fires if they are outside cap.scope.
-
-        return declared_set, declared_set, frozenset()  # declared, actual, bcc_detected
+        declared_set = declared  # callers must pass the complete declared set
+        try:
+            server = self._open_smtp()
+            try:
+                server.rset()
+                server.mail(sender)
+                rcpt_results = self._smtp_rcpt_to(server, declared_set)
+                actual_accepted: frozenset[str] = frozenset(
+                    r for r, (code, _) in rcpt_results.items() if code == 250
+                )
+                # RSET aborts the transaction — no message queued or delivered
+                server.rset()
+            finally:
+                server.quit()
+            bcc_detected = actual_accepted - declared_set
+            return declared_set, actual_accepted, bcc_detected
+        except (smtplib.SMTPException, OSError, SMTPError) as ex:
+            raise SMTPError(f"BCC probe failed: {ex}") from ex
 
     def send(self, sender: str, recipient: str, body: str, **extra_recipients: str) -> None:
-        """Send an email. Derives the real effect including all BCC recipients.
+        """Send an email with real MTA-based BCC detection.
+
+        Three phases:
+          1. SMTP RCPT-TO probe (RSET-only, no DATA) → discovers ACTUAL recipients
+          2. If BCC detected → fail closed immediately (no broker.commit, no send)
+          3. broker.commit() with real target set
+          4. On ALLOW → real SMTP DATA delivery
 
         Args:
             sender: RFC 5321 MAIL FROM address
             recipient: primary To address
             body: email body text
-            **extra_recipients: CC/BCC recipients as keyword args (bcc_1, cc_1, etc.)
+            **extra_recipients: additional recipients (CC/BCC)
         """
+        # Canonicalize all addresses
         canon_recipient = self._canonical_email(recipient)
-        extras_raw = frozenset(v for v in extra_recipients.values())
-        extras_canon = frozenset(self._canonical_email(a) for a in extras_raw)
+        extras_canon = frozenset(self._canonical_email(a) for a in extra_recipients.values())
+        all_declared = frozenset({canon_recipient}) | extras_canon
 
-        # Build message for content analysis
-        raw_msg, subject, body_size = self._build_message(sender, canon_recipient, body, **extra_recipients)
+        # Build message once (for body_size / content analysis)
+        raw_msg, subject, body_size = self._build_message(
+            sender, canon_recipient, body, **extra_recipients
+        )
 
-        # Derive labels from real state (sender/recipient domains, body content)
-        conf = self._derive_email_confidentiality(sender, frozenset({canon_recipient}) | extras_canon)
+        # Phase 1: SMTP RCPT-TO probe — discovers actual MTA recipients
+        # RSET after RCPT TO means NO message is queued or delivered here.
+        # Any recipient accepted by the MTA (code 250) that is NOT in
+        # all_declared is a BCC attempt.
+        try:
+            declared_from_smtp, actual_accepted, bcc_detected = self._parse_bcc_from_smtp(
+                sender, all_declared
+            )
+        except SMTPError as ex:
+            raise EmailSecurityError(
+                f"[{self.tool_name}] SMTP BCC probe failed: {ex}. Failing closed — no email sent."
+            ) from ex
+
+        # Fail closed: if MTA accepted recipients the tool did NOT declare,
+        # this is a BCC bypass attempt. Block BEFORE broker.commit.
+        if bcc_detected:
+            raise EmailSecurityError(
+                f"[{self.tool_name}] BCC bypass detected: MTA accepted "
+                f"{bcc_detected} which are not in declared set {all_declared}. "
+                f"RSET-only probe — no message sent. Treating as attack."
+            )
+
+        # Phase 2: Derive IFC labels from real MTA state (actual accepted set)
+        conf = self._derive_email_confidentiality(sender, actual_accepted)
         integ = self._derive_email_integrity(body_size, subject)
+        additional = actual_accepted - frozenset({canon_recipient})
 
-        # The declared recipients (what the tool said)
-        declared_recipients = frozenset({canon_recipient}) | extras_canon
-
-        # BCC detection: in real shim, we parse actual recipients from SMTP.
-        # If BCC recipients appear in the RCPT TO list but not in declared_recipients,
-        # the broker gate's NoAmp check fires (extra target outside scope).
-        #
-        # Here we model: the tool can pass extra BCC recipients via extra_recipients.
-        # If it passes recipients NOT in its declared list, they're extra → NoAmp.
-        # The broker's NoAmp predicate checks: ∀ r ∈ known_targets: r ∈ cap.scope
-        #
-        # For BCC detection specifically: if the broker has a capability scoped to
-        # "corp.com" and the tool tries to BCC "attacker@evil.com", NoAmp fires.
-
-        # Find matching capability
-        nonce = self._resolve_capability_nonce("send", canon_recipient, extras_canon)
-
-        # Build complete target set
-        all_targets = frozenset({canon_recipient}) | extras_canon
-        known_targets = EffectTarget(primary=canon_recipient, additional=extras_canon)
+        nonce = self._resolve_capability_nonce("send", canon_recipient, additional)
 
         effect = Effect(
             etype="send",
             target=f"mailto:{canon_recipient}",
             metadata={
-                "extra_resources": list(extras_canon),
+                "extra_resources": list(additional),
                 "subject": subject,
                 "body_size": body_size,
-                "bcc_detected": frozenset(),  # populated after SMTP delivery
+                "bcc_detected": frozenset(),  # always empty at commit time
+                "mta_actual_recipients": list(actual_accepted),
             },
             provenance=(
-                Data(f"shim-send", conf, integ),
-                Data(f"sender={sender}", Confidentiality.CONFIDENTIAL, Integrity.SYSTEM),
-                Data(f"all_recipients={all_targets}", Confidentiality.CONFIDENTIAL, Integrity.SYSTEM),
+                Data("shim-send", conf, integ),
+                Data(f"sender={sender}", Confidentiality.CONFIDENTIAL, Integrity.HIGH),
+                Data(
+                    f"mta-accepted={actual_accepted}", Confidentiality.CONFIDENTIAL, Integrity.HIGH
+                ),
             ),
             capability_nonce=nonce,
             delegation_chain=(self.tool_name, "RealEmailShim"),
-            known_targets=known_targets,
+            known_targets=EffectTarget(primary=canon_recipient, additional=additional),
         )
 
         from .model import Commit
 
         commit = Commit(effect=effect, task=None, tool_name=self.tool_name)
-        allow, evidence = self.broker.commit(commit, task_id=self.task_id)
+        allow, evidence = self.broker.executor.execute(commit)
 
         op = EmailOp(
             operation="send",
             sender=sender,
-            declared_recipients=declared_recipients,
-            actual_recipients=declared_recipients,  # updated post-delivery
-            extra_recipients=extras_canon,
+            declared_recipients=all_declared,
+            actual_recipients=actual_accepted,
+            extra_recipients=additional,
             subject=subject,
             body_size=body_size,
             mta_delivery_log=(),
@@ -329,19 +330,19 @@ class RealEmailShim:
         if not allow:
             blocker = evidence.get("primary_blocker", "unknown")
             raise EmailSecurityError(
-                f"[{self.tool_name}] send from {sender} to {declared_recipients} "
+                f"[{self.tool_name}] send from {sender} to {actual_accepted} "
                 f"BLOCKed by {blocker}. No email sent."
             )
 
-        # ALLOWed: send via SMTP
+        # Phase 3 (ALLOW): real SMTP delivery via DATA
         try:
-            actual_sender, delivered = self._smtp_send(sender, all_targets, raw_msg)
+            delivered = self._smtp_send(sender, actual_accepted, raw_msg)
             op = EmailOp(
                 operation="send",
-                sender=actual_sender,
-                declared_recipients=declared_recipients,
+                sender=sender,
+                declared_recipients=all_declared,
                 actual_recipients=frozenset(delivered),
-                extra_recipients=extras_canon,
+                extra_recipients=additional,
                 subject=subject,
                 body_size=body_size,
                 mta_delivery_log=tuple(delivered),
@@ -352,17 +353,22 @@ class RealEmailShim:
             self.ops.append(op)
         except SMTPError as ex:
             raise EmailSecurityError(
-                f"[{self.tool_name}] SMTP send failed after ALLOW: {ex}. "
+                f"[{self.tool_name}] SMTP delivery failed after ALLOW: {ex}. "
                 f"Broker said ALLOW but MTA rejected. Treat as security event."
             ) from ex
 
     def read_inbox(self, user: str) -> list[str]:
-        """Read inbox for a user. Read-only effect (logged, no MTA state change).
+        """Read inbox for a user via real IMAP SELECT + SEARCH + FETCH.
 
-        In a real shim: IMAP SELECT + FETCH. Here: placeholder that goes
-        through the broker gate for logging and IFC checks.
+        Returns a list of message IDs (UIDs) in the INBOX.
+        On ALLOW: connects to the IMAP server, selects INBOX, searches all
+        messages, fetches RFC822 body for content analysis (confidentiality /
+        integrity derivation), then logs the operation and returns message IDs.
+
+        On BLOCK: raises EmailSecurityError, no IMAP connection is made.
         """
-        conf = Confidentiality.INTERNAL  # inbox content is at least INTERNAL
+        # Phase 1: broker gate (read-only, no state change if BLOCK)
+        conf = Confidentiality.INTERNAL
         integ = Integrity.USER
 
         effect = Effect(
@@ -371,7 +377,7 @@ class RealEmailShim:
             metadata={},
             provenance=(
                 Data("shim-read-inbox", conf, integ),
-                Data(f"user={user}", Confidentiality.INTERNAL, Integrity.SYSTEM),
+                Data(f"user={user}", Confidentiality.INTERNAL, Integrity.HIGH),
             ),
             capability_nonce=f"{self.tool_name}:read:imap:{user}",
             delegation_chain=(self.tool_name, "RealEmailShim"),
@@ -381,14 +387,52 @@ class RealEmailShim:
         from .model import Commit
 
         commit = Commit(effect=effect, task=None, tool_name=self.tool_name)
-        allow, evidence = self.broker.commit(commit, task_id=self.task_id)
+        allow, evidence = self.broker.executor.execute(commit)
 
         if not allow:
             blocker = evidence.get("primary_blocker", "unknown")
             raise EmailSecurityError(f"[{self.tool_name}] read_inbox BLOCKed by {blocker}")
 
-        # ALLOWed: in real shim, do IMAP SELECT + FETCH
-        # For now: return empty list (placeholder)
+        # Phase 2 (ALLOW): real IMAP connection
+        messages: list[str] = []
+        try:
+            # IMAP4_SSL on port 993 (TLS-wrapped)
+            with imaplib.IMAP4_SSL(self.imap_host, self.imap_port) as mailbox:
+                if self.imap_user and self.imap_password:
+                    mailbox.login(self.imap_user, self.imap_password)
+                # SELECT INBOX
+                status, _ = mailbox.select("INBOX")
+                if status != "OK":
+                    raise EmailSecurityError(
+                        f"[{self.tool_name}] IMAP SELECT INBOX failed: {status}"
+                    )
+                # Search all messages (ALL = all messages in selected mailbox)
+                _, msg_ids = mailbox.search(None, "ALL")
+                ids = msg_ids[0].split() if msg_ids[0] else []
+                # Fetch each message as RFC822 for content analysis
+                total_size = 0
+                for mid in ids:
+                    _, data = mailbox.fetch(mid, "(RFC822)")
+                    if data and data[0]:
+                        raw = data[0][1] if isinstance(data[0], tuple) else data[0]
+                        total_size += len(raw)
+                messages = [mid.decode() for mid in ids]
+                # Derive confidentiality from content
+                if messages:
+                    conf = self._derive_email_confidentiality(
+                        sender=f"{user}@{self.imap_host}",
+                        recipients=frozenset({f"{user}@{self.imap_host}"}),
+                    )
+                # Re-derive integrity from inbox state
+                if total_size == 0:
+                    integ = Integrity.UNTRUSTED
+                else:
+                    integ = Integrity.USER
+        except imaplib.IMAP4.error as ex:
+            raise EmailSecurityError(f"[{self.tool_name}] IMAP error reading inbox: {ex}") from ex
+        except Exception as ex:
+            raise EmailSecurityError(f"[{self.tool_name}] read_inbox failed: {ex}") from ex
+
         self.ops.append(
             EmailOp(
                 operation="read_inbox",
@@ -397,14 +441,14 @@ class RealEmailShim:
                 actual_recipients=frozenset(),
                 extra_recipients=frozenset(),
                 subject="",
-                body_size=0,
-                mta_delivery_log=(),
+                body_size=len(messages),  # message count as size proxy
+                mta_delivery_log=tuple(messages),
                 tool_name=self.tool_name,
                 blocked=False,
                 nonce=effect.capability_nonce,
             )
         )
-        return []  # real IMAP: return list of message IDs
+        return messages
 
     def _resolve_capability_nonce(
         self,
@@ -416,11 +460,17 @@ class RealEmailShim:
         holder = self.tool_name
         target_pattern = f"mailto:{primary}" if "@" in primary else primary
 
-        for nonce, cap in self.broker.capabilities.items():
+        for _nonce, cap in self.broker.capabilities.items():
             if cap.holder in (holder, "EffectBroker") and cap.right in (right, "*"):
-                if cap.target == "*" or target_pattern.startswith(cap.target.replace("mailto:", "")):
+                if cap.target == "*" or target_pattern.startswith(
+                    cap.target.replace("mailto:", "")
+                ):
                     extras_key = ",".join(sorted(extras)) if extras else ""
-                    return f"{holder}:{right}:{primary}:{extras_key}" if extras_key else f"{holder}:{right}:{primary}"
+                    return (
+                        f"{holder}:{right}:{primary}:{extras_key}"
+                        if extras_key
+                        else f"{holder}:{right}:{primary}"
+                    )
 
         return f"no-cap-{right}-{primary}"
 

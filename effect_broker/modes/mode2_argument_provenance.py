@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 @dataclass
 class ArgumentBinding:
     """A binding: this effect was authorized for these specific arguments."""
+
     right: str
     target: str
     scope: frozenset[str]
@@ -37,6 +38,7 @@ class ArgumentBinding:
 @dataclass
 class ProvenanceNode:
     """A node in the provenance graph."""
+
     name: str
     source: str  # "argument", "derived", "constant"
     label: str = "INTERNAL"  # confidentiality class

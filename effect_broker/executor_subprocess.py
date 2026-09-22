@@ -158,6 +158,7 @@ class IsolatedStore:
             if target not in self._files:
                 from effect_broker.lattice import Confidentiality
                 from effect_broker.model import File
+
                 self._files[target] = File(target, Confidentiality.PUBLIC)
             self.effects_log.append(("write", f"file:{target}"))
             self.identity_log.append(all_targets_frozen)
@@ -167,6 +168,7 @@ class IsolatedStore:
             if target not in self._files:
                 from effect_broker.lattice import Confidentiality
                 from effect_broker.model import File
+
                 self._files[target] = File(target, Confidentiality.PUBLIC)
             self.effects_log.append(("read", f"file:{target}"))
             self.identity_log.append(all_targets_frozen)
@@ -399,7 +401,6 @@ class ExecutorProcessHandle:
         return self._socket_path
 
     def start(self, timeout: float = 5.0) -> None:
-        import os as _os
         import subprocess as _subprocess
         import sys as _sys
         import time as _time
@@ -431,18 +432,14 @@ class ExecutorProcessHandle:
         start = _time.monotonic()
         while (_time.monotonic() - start) < timeout:
             if self._proc.poll() is not None:
-                raise RuntimeError(
-                    f"Executor subprocess exited early: {self._proc.returncode}"
-                )
+                raise RuntimeError(f"Executor subprocess exited early: {self._proc.returncode}")
             if self._socket_path.exists():
                 break
             _time.sleep(0.05)
         else:
             self._proc.terminate()
             self._proc.wait(timeout=2)
-            raise RuntimeError(
-                f"Executor socket never created within {timeout}s"
-            )
+            raise RuntimeError(f"Executor socket never created within {timeout}s")
         _time.sleep(0.5)
 
     def stop(self, timeout: float = 2.0) -> None:

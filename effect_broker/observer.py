@@ -37,6 +37,8 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from effect_broker.broker import EffectBroker
+    from effect_broker.ledger import LedgerVerdict
     from effect_broker.model import Effect
 
 
@@ -74,17 +76,17 @@ class CompleteMediationResult:
 
     # Ledger component
     ledger_confirmed: bool  # ledger returned CONFIRMED_COMMITTED
-    ledger_unknown: bool    # ledger returned UNKNOWN
+    ledger_unknown: bool  # ledger returned UNKNOWN
     ledger_rejected: bool  # ledger returned REJECTED
 
     # Observer component
-    observer_observed: bool   # observer confirmed effect occurred
+    observer_observed: bool  # observer confirmed effect occurred
     observer_not_observed: bool  # observer checked and saw nothing
-    observer_unknown: bool   # observer cannot determine
+    observer_unknown: bool  # observer cannot determine
 
     # Combined
     complete_mediation: bool  # True ONLY if ledger_confirmed AND observer_observed
-    bypass_detected: bool     # True if observer observed but ledger didn't confirm
+    bypass_detected: bool  # True if observer observed but ledger didn't confirm
 
     @property
     def summary(self) -> str:
@@ -118,14 +120,16 @@ class IndependentObserver:
 
     def __init__(
         self,
-        broker: "EffectBroker | None" = None,
-        store: "Any | None" = None,
+        broker: EffectBroker | None = None,
+        store: Any | None = None,
     ) -> None:
         self._broker = broker
         self._store = store
         self._checks: list[ObserverCheck] = []
 
-    def observe_effect(self, effect: "Effect", expected_targets: frozenset[str] | None = None) -> ObserverVerdict:
+    def observe_effect(
+        self, effect: Effect, expected_targets: frozenset[str] | None = None
+    ) -> ObserverVerdict:
         """Observe whether an effect actually occurred.
 
         This is the INDEPENDENT check — it does NOT look at the broker's
@@ -141,7 +145,6 @@ class IndependentObserver:
             NOT_OBSERVED: the effect did NOT occur (store state unchanged)
             UNKNOWN: cannot determine (e.g., same-process store access failed)
         """
-        from effect_broker.model import EffectTarget
 
         if self._store is None and self._broker is not None:
             self._store = self._broker.store
@@ -254,8 +257,8 @@ class IndependentObserver:
 
     def check_complete_mediation(
         self,
-        ledger_verdict: "Any",  # LedgerVerdict
-        effect: "Effect",
+        ledger_verdict: Any,  # LedgerVerdict
+        effect: Effect,
         broker_allowed: bool,
     ) -> CompleteMediationResult:
         """Check complete mediation: ledger + observer together.
@@ -276,9 +279,7 @@ class IndependentObserver:
 
         ledger_confirmed = ledger_verdict == LedgerVerdict.CONFIRMED_COMMITTED
         ledger_unknown = isinstance(ledger_verdict, UnknownLedgerResult)
-        ledger_rejected = (
-            ledger_verdict == LedgerVerdict.CONFIRMED_BLOCKED
-        )
+        ledger_rejected = ledger_verdict == LedgerVerdict.CONFIRMED_BLOCKED
 
         # Observer component
         obs_verdict = self.observe_effect(effect)
@@ -320,7 +321,7 @@ class IndependentObserver:
                     sig_parts = check.effect_signature.split(":")
                     task_id = sig_parts[0] if sig_parts else "unknown"
                     nonce = check.effect_signature
-                    from effect_broker.ledger import CONFIRMED_COMMITTED
-                    if self._broker.ledger.verify(task_id, nonce) != CONFIRMED_COMMITTED:
+                    confirmed = LedgerVerdict.CONFIRMED_COMMITTED
+                    if self._broker.ledger.verify(task_id, nonce) != confirmed:
                         return False  # Bypass detected: observed but not confirmed
         return True

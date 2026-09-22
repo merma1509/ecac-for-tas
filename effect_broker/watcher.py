@@ -27,23 +27,24 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     pass
 
+
 # ---- Platform detection ----
-try:
-    import inotify.adapters  # Linux
+def _detect_watcher_type() -> str:
+    import importlib.util
 
-    _WATCHER_TYPE = "inotify"
-except ImportError:
-    try:
-        import fsevents  # macOS
+    if importlib.util.find_spec("inotify") is not None:
+        return "inotify"
+    if importlib.util.find_spec("fsevents") is not None:
+        return "fsevents"
+    return "polling"
 
-        _WATCHER_TYPE = "fsevents"
-    except ImportError:
-        _WATCHER_TYPE = "polling"  # fallback
+
+_WATCHER_TYPE = _detect_watcher_type()
 
 
 @dataclass
@@ -101,11 +102,11 @@ class FileWatcher:
     # Paths to watch (sandbox root directories)
     _watch_paths: list[str] = field(default_factory=list)
     _effects: list[IndependentEffect] = field(default_factory=list)
-    _last_check: float = field(default_factory=field_factory_float)
+    _last_check: float = field(default_factory=time.time)
 
     _thread: threading.Thread | None = None
-    _stop_event: threading.Event = field(default=threading.Event)
-    _queue: queue.Queue = field(default_factory=queue.Queue)
+    _stop_event: threading.Event = field(default_factory=lambda: threading.Event())
+    _queue: queue.Queue[object] = field(default_factory=lambda: queue.Queue())
 
     _watcher_type: str = field(default_factory=lambda: _WATCHER_TYPE)
     _inotify: object = field(default=None)
@@ -113,6 +114,7 @@ class FileWatcher:
 
     # Polling interval (seconds) for fallback mode
     _polling_interval: float = 0.1
+
     # Paths to watch (real OS paths)
     def __init__(
         self,
@@ -154,7 +156,7 @@ class FileWatcher:
     # ---- inotify (Linux) ----
     def _run_inotify(self) -> None:
         """Linux: use inotify to watch filesystem events."""
-        import inotify.adapters
+        import inotify.adapters  # type: ignore[import-not-found]
 
         # inotify constants we care about
         IN_MODIFY = 0x00000002
@@ -163,7 +165,6 @@ class FileWatcher:
         IN_MOVED_FROM = 0x00000400
         IN_MOVED_TO = 0x00000800
         IN_CLOSE_WRITE = 0x00000008
-        IN_ISDIR = 0x40000000
 
         i = inotify.adapters.Inotify()
         for path in self._watch_paths:
@@ -200,7 +201,7 @@ class FileWatcher:
     # ---- FSEvents (macOS) ----
     def _run_fsevents(self) -> None:
         """macOS: use FSEvents to watch filesystem events."""
-        import fsevents
+        import fsevents  # type: ignore[import-not-found]
 
         def callback(event: object) -> None:
             flags = getattr(event, "flags", 0)
@@ -245,7 +246,7 @@ class FileWatcher:
             for watch_path in self._watch_paths:
                 if not os.path.exists(watch_path):
                     continue
-                for root, dirs, files in os.walk(watch_path):
+                for root, _dirs, files in os.walk(watch_path):
                     for name in files:
                         full = os.path.join(root, name)
                         try:
@@ -257,7 +258,7 @@ class FileWatcher:
             # Diff against previous snapshot
             deleted_paths = set(snapshots) - set(current)
             for path in deleted_paths:
-                inode, size, mtime = snapshots[path]
+                inode, size, _mtime = snapshots[path]
                 self._effects.append(
                     IndependentEffect(
                         etype="delete",
@@ -271,7 +272,7 @@ class FileWatcher:
                     )
                 )
 
-            for path, (inode, size, mtime) in current.items():
+            for path, (inode, size, _mtime) in current.items():
                 if path not in snapshots:
                     # New file
                     self._effects.append(
@@ -306,7 +307,9 @@ class FileWatcher:
             # Process queued events
             while True:
                 try:
-                    etype, path, cookie, _ = self._queue.get_nowait()
+                    etype, path, cookie, _ = cast(
+                        tuple[str, str, object, object], self._queue.get_nowait()
+                    )
                     self._effects.append(
                         IndependentEffect(
                             etype=etype,
@@ -315,7 +318,7 @@ class FileWatcher:
                             size_delta=0,
                             new_inode=None,
                             deleted_inode=None,
-                            cookie=cookie,
+                            cookie=cast(int | None, cookie),
                             source=self._watcher_type,
                         )
                     )
@@ -352,9 +355,6 @@ class FileWatcher:
         failures: list[str] = []
 
         for effect in self._effects:
-            key = (self._watch_paths[0] if self._watch_paths else "", effect.path)
-            # In a real implementation: match by path + timestamp window
-            # Here: placeholder that always returns OK for watched paths
             in_watch = any(effect.path.startswith(wp) for wp in self._watch_paths)
             if not in_watch:
                 continue  # not in our watch scope
@@ -377,7 +377,7 @@ class FileWatcher:
         records the real OS path in effect.metadata at commit time.
         """
         # Placeholder: derive nonce from path
-        return f"{self.task_id or 'default'}:{effect.etype}:{effect.path}"
+        return f"default:{effect.etype}:{effect.path}"
 
     def record_checkpoint(self) -> float:
         """Record the current time as the checkpoint for next get_effects_since call."""
@@ -389,7 +389,3 @@ class FileWatcher:
         """Clear all recorded effects."""
         self._effects.clear()
         self._last_check = time.time()
-
-
-def field_factory_float() -> float:
-    return time.time()
