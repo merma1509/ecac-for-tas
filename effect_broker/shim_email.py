@@ -225,7 +225,7 @@ class RealEmailShim:
                 server.quit()
             bcc_detected = actual_accepted - declared_set
             return declared_set, actual_accepted, bcc_detected
-        except smtplib.SMTPException as ex:
+        except (smtplib.SMTPException, OSError, SMTPError) as ex:
             raise SMTPError(f"BCC probe failed: {ex}") from ex
 
     def send(self, sender: str, recipient: str, body: str, **extra_recipients: str) -> None:
@@ -259,9 +259,15 @@ class RealEmailShim:
         # RSET after RCPT TO means NO message is queued or delivered here.
         # Any recipient accepted by the MTA (code 250) that is NOT in
         # all_declared is a BCC attempt.
-        declared_from_smtp, actual_accepted, bcc_detected = self._parse_bcc_from_smtp(
-            sender, all_declared
-        )
+        try:
+            declared_from_smtp, actual_accepted, bcc_detected = self._parse_bcc_from_smtp(
+                sender, all_declared
+            )
+        except SMTPError as ex:
+            raise EmailSecurityError(
+                f"[{self.tool_name}] SMTP BCC probe failed: {ex}. "
+                f"Failing closed — no email sent."
+            ) from ex
 
         # Fail closed: if MTA accepted recipients the tool did NOT declare,
         # this is a BCC bypass attempt. Block BEFORE broker.commit.
@@ -291,8 +297,8 @@ class RealEmailShim:
             },
             provenance=(
                 Data(f"shim-send", conf, integ),
-                Data(f"sender={sender}", Confidentiality.CONFIDENTIAL, Integrity.SYSTEM),
-                Data(f"mta-accepted={actual_accepted}", Confidentiality.CONFIDENTIAL, Integrity.SYSTEM),
+                Data(f"sender={sender}", Confidentiality.CONFIDENTIAL, Integrity.HIGH),
+                Data(f"mta-accepted={actual_accepted}", Confidentiality.CONFIDENTIAL, Integrity.HIGH),
             ),
             capability_nonce=nonce,
             delegation_chain=(self.tool_name, "RealEmailShim"),
@@ -301,7 +307,7 @@ class RealEmailShim:
 
         from .model import Commit
         commit = Commit(effect=effect, task=None, tool_name=self.tool_name)
-        allow, evidence = self.broker.commit(commit, task_id=self.task_id)
+        allow, evidence = self.broker._executor.execute(commit)
 
         op = EmailOp(
             operation="send",
@@ -367,7 +373,7 @@ class RealEmailShim:
             metadata={},
             provenance=(
                 Data("shim-read-inbox", conf, integ),
-                Data(f"user={user}", Confidentiality.INTERNAL, Integrity.SYSTEM),
+                Data(f"user={user}", Confidentiality.INTERNAL, Integrity.HIGH),
             ),
             capability_nonce=f"{self.tool_name}:read:imap:{user}",
             delegation_chain=(self.tool_name, "RealEmailShim"),
@@ -376,7 +382,7 @@ class RealEmailShim:
 
         from .model import Commit
         commit = Commit(effect=effect, task=None, tool_name=self.tool_name)
-        allow, evidence = self.broker.commit(commit, task_id=self.task_id)
+        allow, evidence = self.broker._executor.execute(commit)
 
         if not allow:
             blocker = evidence.get("primary_blocker", "unknown")
