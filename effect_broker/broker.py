@@ -44,11 +44,11 @@ Real isolation requires a separate process/enclave (production target).
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import cast
 
-from pathlib import Path
-
 from .executor import IsolatedExecutor, SubprocessExecutor
+from .executor_ipc import ProcessExecutorClient
 from .ipc import LedgerBackend, LocalLedgerBackend
 from .ledger import IndependentEffectLedger
 from .mediation import MediationVerdict, Mediator
@@ -163,18 +163,17 @@ class EffectBroker:
         self._mode = mode
         self._executor_socket = Path(executor_socket)
         self._store_socket = Path(store_socket)
+        self._executor: IsolatedExecutor | SubprocessExecutor | None = None
 
         if mode == "multi-process":
             self._setup_multi_process()
         else:
-            self._executor: IsolatedExecutor = IsolatedExecutor(broker=self)
-            # Inject the ledger into the executor so both share the same records.
+            self._executor = IsolatedExecutor(broker=self)
             self._executor._set_ledger(self.ledger)
 
     def _setup_multi_process(self) -> None:
         """Set up multi-process execution: start subprocess, create SubprocessExecutor."""
         from .executor_subprocess import ExecutorProcessHandle
-        from .executor_ipc import ProcessExecutorClient
 
         # Start the executor subprocess
         handle = ExecutorProcessHandle(self._executor_socket, self._store_socket)
@@ -192,7 +191,7 @@ class EffectBroker:
         # Bootstrap the subprocess store with the broker's existing resources
         self._bootstrap_executor_store(client)
 
-    def _bootstrap_executor_store(self, client: "ProcessExecutorClient") -> None:
+    def _bootstrap_executor_store(self, client: ProcessExecutorClient) -> None:
         """Bootstrap the subprocess store with resources from broker's same-process store.
 
         Transfers resource definitions from the broker's store into the
@@ -233,6 +232,7 @@ class EffectBroker:
     @property
     def executor(self) -> IsolatedExecutor | SubprocessExecutor:
         """The sole executor for this broker. All effects go through it."""
+        assert self._executor is not None, "executor not initialized"
         return self._executor
 
     # ---- capability management (monotonic, root-anchored) ----
@@ -658,7 +658,10 @@ class EffectBroker:
         if capability.right != "*" and capability.right != effect.etype:
             return False, f"right-mismatch(cap_right={capability.right}!=etype={effect.etype})"
         if capability.target != "*" and capability.target != effect.target:
-            return False, f"target-mismatch(cap_target={capability.target}!=effect.target={effect.target})"
+            return (
+                False,
+                f"target-mismatch(cap_target={capability.target}!=effect.target={effect.target})",
+            )
 
         # Sub-check 6: task-scoping (only for reusable capabilities with task_id).
         # Approval capabilities (identified by "approval:" prefix) use ApprovalBinding
@@ -941,6 +944,7 @@ class EffectBroker:
         Returns:
             (allow, evidence) — same as gate() but with state applied on allow
         """
+        assert self._executor is not None
         return self._executor.execute(commit, mediation=mediation)
 
     def commit_effect(self, effect: Effect, task: Task | None = None) -> tuple[bool, Evidence]:
@@ -1014,8 +1018,12 @@ class EffectBroker:
         # We fix it by looking up the ApprovedRequest automatically so callers do NOT
         # need to pass it explicitly — the nonce is the authoritative key.
         from dataclasses import replace
-        if (commit.approved_request is None and effect.capability_nonce is not None
-            and effect.capability_nonce.startswith("approval:")):
+
+        if (
+            commit.approved_request is None
+            and effect.capability_nonce is not None
+            and effect.capability_nonce.startswith("approval:")
+        ):
             stored_req = self._approved_requests.get(effect.capability_nonce)
             if stored_req is not None:
                 # Frozen dataclass: create a copy with the resolved approved_request.
@@ -1025,26 +1033,24 @@ class EffectBroker:
                 # Approval nonce referenced but not found → block at Fresh.
                 # This fires when a stale/invalid nonce is used.
                 allow = False
-                predicate_results: dict[str, PredicateResult] = {
+                approval_predicate_results: dict[str, PredicateResult] = {
                     "Auth": (True, "auth-ok"),
                     "FlowOK": (True, "flow-ok"),
                     "NoAmp": (True, "composition-ok"),
                     "Fresh": (False, f"approval-nonce-invalid({effect.capability_nonce})"),
                 }
-                blocking_predicate = "Fresh"
                 return CommitGateResult(
                     allow=False,
                     evidence={
                         "allow": False,
-                        "primary_blocker": blocking_predicate,
-                        "predicates": {k: v[1] for k, v in predicate_results.items()},
+                        "primary_blocker": "Fresh",
+                        "predicates": {k: v[1] for k, v in approval_predicate_results.items()},
                         "boundary_stop": None,
                         "approval_binding": None,
                     },
                     effect=effect,
                     task=task,
                     can_apply=False,
-                    nonce_reserved=False,
                 )
 
         # Atomic Fresh check: check AND reserve the nonce atomically.
@@ -1061,7 +1067,7 @@ class EffectBroker:
         }
         allow = all(predicate_result[0] for predicate_result in predicate_results.values())
         predicate_order = ("Auth", "FlowOK", "NoAmp", "Fresh")
-        blocking_predicate = next(
+        blocking_predicate: str | None = next(
             (predicate for predicate in predicate_order if not predicate_results[predicate][0]),
             None,
         )
