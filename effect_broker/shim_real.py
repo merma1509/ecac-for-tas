@@ -27,14 +27,17 @@ import os
 import pathlib
 import re
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar, cast
 
 from .lattice import Confidentiality, Integrity
 from .model import Commit, Data, Effect, EffectTarget
 
 if TYPE_CHECKING:
     from .broker import EffectBroker
+
+T = TypeVar("T")
 
 
 @dataclass
@@ -88,7 +91,7 @@ class RealFileShim:
 
     def __init__(
         self,
-        broker: "EffectBroker",
+        broker: EffectBroker,
         task_id: str = "default",
         tool_name: str = "untrusted-tool",
     ) -> None:
@@ -304,9 +307,9 @@ class RealFileShim:
         self,
         op_type: str,
         path: str,
-        action: callable,
+        action: Callable[[str], T],
         content: bytes | None = None,
-    ) -> object:
+    ) -> T:
         """Execute an operation through the enforcement gate.
 
         Flow:
@@ -340,6 +343,7 @@ class RealFileShim:
             if base_cap is not None:
                 # Copy the capability with the derived nonce (same rights/scope/target)
                 from .model import Capability as CapClass
+
                 aliased = CapClass(
                     owner=base_cap.owner,
                     holder=base_cap.holder,
@@ -392,41 +396,43 @@ class RealFileShim:
                 f"No OS state changed."
             )
 
-                # ALLOWed: perform the real OS operation
+            # ALLOWed: perform the real OS operation
         try:
-            result = None  # default: no return value
-
             if op_type == "write":
+                assert content is not None, "write called with None content"
                 with open(canon, "wb") as f:
-                    f.write(content)  # type: ignore
-                post_exists, post_content = True, content
+                    f.write(content)
+                self.ops.append(op)
+                return cast(T, None)  # write returns None
 
             elif op_type == "read":
                 with open(canon, "rb") as f:
-                    result = f.read()
-                post_exists, post_content = True, result
+                    data = f.read()
+                self.ops.append(op)
+                return cast(T, data)
 
             elif op_type == "stat":
-                result = os.stat(canon)
-                post_exists, post_content = True, None
+                stat_result = os.stat(canon)
+                self.ops.append(op)
+                return cast(T, stat_result)
 
             elif op_type == "listdir":
-                result = os.listdir(canon)
-                post_exists, post_content = True, None
+                entries = os.listdir(canon)
+                self.ops.append(op)
+                return cast(T, entries)
 
             elif op_type == "exists":
-                result = os.path.exists(canon)
-                post_exists, post_content = result, None
+                exists_result = os.path.exists(canon)
+                self.ops.append(op)
+                return cast(T, exists_result)
 
             elif op_type == "delete":
                 os.remove(canon)
-                post_exists, post_content = False, None
+                self.ops.append(op)
+                return cast(T, None)
 
             else:
                 raise ValueError(f"Unknown op type: {op_type}")
-
-            self.ops.append(op)
-            return result
 
         except FileNotFoundError as ex:
             raise OSError(f"File not found: {canon}") from ex
