@@ -192,6 +192,19 @@ class RestrictedResourceStore:
         domain = uri.split("://", 1)[1].split("/")[0] if "://" in uri else uri
         return URL(uri=uri, scope=frozenset({domain}))
 
+    def _derive_confidentiality_from_effect(self, effect: Effect) -> Confidentiality:
+        """Derive confidentiality from the effect's provenance labels.
+
+        The shim sets provenance labels based on real filesystem state.
+        We use the highest confidentiality in the effect's provenance.
+        """
+        if not effect.provenance:
+            return Confidentiality.INTERNAL
+        return max(
+            (d.confidentiality for d in effect.provenance),
+            default=Confidentiality.INTERNAL,
+        )
+
     def _deliver_to_targets(self, effect: Effect, all_targets: frozenset[str]) -> None:
         """Deliver a send effect to ALL targets (primary + additional recipients).
 
@@ -239,14 +252,29 @@ class RestrictedResourceStore:
         to verify complete mediation.
 
         Semantics:
-          - write/delete: files
+          - write/delete: files (dynamically resolved if not bootstrapped)
           - send: delivers to sender's outbox (address → mailbox)
           - read: logged, no persistent change
           - network: logged, no persistent change
+
+        Note: In the simulated store, write effects don't actually persist
+        file content — the real state is on disk. The store just logs the
+        effect for the observer. For real file I/O, see RealFileShim which
+        calls actual OS operations before committing to the broker.
         """
         target_id = effect.target
         resource = self.resolve(target_id)
-        if resource is None:
+
+        # Dynamic resource creation: for file:// URIs, auto-create File if not
+        # bootstrapped. This allows the shim to create new files without
+        # pre-registering every path in the store.
+        if resource is None and target_id.startswith("file://"):
+            # Derive sensitivity from the effect's provenance, or default INTERNAL
+            conf = self._derive_confidentiality_from_effect(effect)
+            resource = File(target_id, conf)
+            self._files._data[target_id] = resource
+        elif resource is None:
+            # For other resource types, still require bootstrapping
             raise KeyError(f"effect targets unknown resource: {target_id}")
 
         # Build complete set of resources this effect touches
