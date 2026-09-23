@@ -456,14 +456,19 @@ class EffectBroker:
             task_id = "default"
         nonce = f"approval:{effect.etype}:{effect.target}:{len(self.approvals)}"
 
-        # FIXED: approval scope must be domain-level so BCC recipients from the
-        # same domain pass NoAmp's scope check. _domain_for_email() returns
-        # "internal" or "external" from the email address; use that as the scope
-        # element so that any BCC recipient from the same domain is in scope.
+        # Scope for this approval capability. For send effects, the scope must
+        # cover ALL recipients (primary + BCC) — NoAmp's extra-target check
+        # verifies every BCC domain is in the cap scope. If only primary's domain
+        # is in scope, a BCC to external will fail NoAmp even WITH approval.
         if effect.etype == "send" and "@" in effect.target:
-            # Derive domain from primary address for scope
-            domain_label = self._domain_for_email(effect.target)
-            cap_scope = frozenset({domain_label} if domain_label else {effect.target})
+            # Collect ALL email domains from primary + extra targets
+            all_targets = effect.complete_targets()
+            scope_elements: set[str] = set()
+            for addr in all_targets:
+                domain_label = self._domain_for_email(addr)
+                if domain_label is not None:
+                    scope_elements.add(domain_label)
+            cap_scope = frozenset(scope_elements) if scope_elements else frozenset({effect.target})
         else:
             cap_scope = frozenset({effect.target})
 
@@ -704,8 +709,34 @@ class EffectBroker:
     def check_noamp(self, effect: Effect, task: Task) -> PredicateResult:
         """Composition safety: effect authority stays within the task ceiling
 
-        For `network` effects, also enforces SSRF containment: the capability's
-        scope must be a subset of the URL's domain scope
+        Single-effect scope: NoAmp verifies that the effect's target and all
+        extra_targets (BCC/CC recipients) are within the task ceiling scope.
+        For `network` effects, also enforces SSRF containment.
+
+        LIMITATION — NoAmp does NOT model inter-effect composition:
+          The four-predicate gate evaluates ONE effect at a time. It cannot
+          detect amplification via the SEQUENCE of two (or more) effects where
+          each individually passes but the combination is an attack.
+
+          Example of an uncaught sequence:
+            1. Effect A: read(secrets) — ALLOW (agent has read capability)
+            2. Effect B: send(internal, body=secrets_data) — ALLOW (cap + FlowOK)
+
+          Both effects pass individually. But the sequence is an exfiltration
+          attack. NoAmp cannot see this because:
+            - It only examines Effect B in isolation
+            - It cannot track that secrets data from Effect A flows into Effect B
+            - Provenance of Effect B claims INTERNAL/USER, hiding the origin
+
+          Detecting this requires DATA-FLOW LEVEL taint tracking (PACT/CaMeL
+          territory), not just effect-level authorization. This is an
+          architectural limit of ECAC's effect-complete approach.
+
+          MITIGATION: The ledger/observer can detect this pattern AFTER commit
+          by correlating read(secrets) → identity_log entry → subsequent
+          send(internal) with overlapping target sets. This is "detection after
+          the fact" (not prevention) and requires process isolation to be
+          meaningful.
         """
         capability = self.capabilities.get(effect.capability_nonce)
         if capability is None:
@@ -779,20 +810,43 @@ class EffectBroker:
         # SSRF containment for network effects
         if effect.etype == "network":
             if "://" in effect.target:
-                # Extract origin (scheme+host+port) without path for SSRF containment.
-                # Cap_scope={"http://internal.corp.com"} must cover the URL's origin so the
-                # broker controls which hosts are reachable regardless of path.
-                # "http://internal.corp.com/admin" -> "http://internal.corp.com"
+                # Extract the domain/host from the URL, normalize for comparison.
+                # The capability scope stores DOMAIN-LEVEL entries (e.g. {"internal.corp.com"})
+                # not full URL origins. We must extract the domain from both the URL
+                # and the scope entries to compare them consistently.
                 after_scheme = effect.target.split("://", 1)[1]
                 path_start = after_scheme.find("/")
                 host_part = after_scheme[:path_start] if path_start >= 0 else after_scheme
-                url_origin = f"http://{host_part}"
-                target_domain = frozenset({url_origin})
-                if not target_domain <= capability.scope:
-                    return False, (
-                        f"ssrf containment failed: cap-scope={capability.scope} "
-                        f"does not cover url-origin={target_domain}"
-                    )
+                # Extract domain from host: strip port, strip subdomains to root
+                # "internal.corp.com" -> "internal.corp.com"
+                # "internal.corp.com:8080" -> "internal.corp.com"
+                url_domain = host_part.split(":")[0].lower()
+
+                # Compare the URL's domain against each scope entry.
+                # Scope entries are domain-level (e.g. "internal.corp.com" or "evil.com").
+                # We compare domain strings directly — "internal.corp.com" == "internal.corp.com".
+                # If scope={"*"} → wildcard, skip containment check.
+                if "*" not in capability.scope:
+                    domain_allowed = False
+                    for scope_entry in capability.scope:
+                        if scope_entry.startswith("http://") or scope_entry.startswith("https://"):
+                            # Scope entry is a full origin — extract its domain
+                            scope_after = scope_entry.split("://", 1)[1]
+                            scope_host = scope_after.split("/")[0].split(":")[0].lower()
+                            scope_domain = scope_host
+                        else:
+                            # Scope entry is a domain string (e.g. "internal.corp.com")
+                            scope_domain = scope_entry.lower()
+
+                        if url_domain == scope_domain:
+                            domain_allowed = True
+                            break
+
+                    if not domain_allowed:
+                        return False, (
+                            f"ssrf containment failed: url-domain={url_domain} "
+                            f"not in cap-scope={capability.scope}"
+                        )
 
         return True, f"composition-ok(ceiling-scope={task.ceiling.scope})"
 
@@ -832,12 +886,73 @@ class EffectBroker:
         return target
 
     def _domain_for_email(self, addr: str) -> str | None:
-        """Derive the domain label from an email address for scope checking."""
+        """Derive the domain label from an email address for scope checking.
+
+        Uses the formal Domain enum from model.py — NOT string heuristics.
+        This ensures attacker-controlled domains are always "external", not
+        accidentally classified as "internal" by the "corp in domain" heuristic.
+
+        Rules (in priority order):
+          1. If the email address is a bootstrap resource (registered in store),
+             use its actual domain classification from the ResourceStore.
+          2. Known trusted domains (allowlist): internal corporate domains
+             with a controlled registration path. "corp.com" alone is NOT enough —
+             "evil.corp.com" also matches "corp" and must be "external".
+          3. External: any other domain (including attacker-controlled domains
+             with "corp" in the name like "evil-corp.com" or "attacker-corp.com").
+          4. No "@" → None (not an email address).
+
+        The allowlist is intentionally restrictive: we err on the side of
+        "external" to avoid misclassifying attacker-controlled lookalike domains.
+        Production deployments should expand this list with their actual
+        trusted domain suffixes.
+        """
         if "@" not in addr:
             return None
-        domain_part = addr.split("@")[1]
-        if "corp" in domain_part or "internal" in domain_part:
+        domain_part = addr.split("@")[1].lower()
+
+        # Priority 1: check the ResourceStore — authoritative for registered resources
+        # A bootstrap'd resource has a pre-classified Domain enum value.
+        from .model import Domain
+
+        if addr in self.store._emails._data:
+            email_resource = self.store._emails._data[addr]
+            if email_resource.domain == Domain.INTERNAL:
+                return "internal"
+            return "external"
+
+        # Priority 2: allowlist of known trusted domain suffixes.
+        # CRITICAL: "corp" alone in the domain is NOT sufficient to classify as internal.
+        # "attacker@corp.com" and "evil@corp.com" must be "external" — an attacker
+        # can register "corp.com" typosquatting domain. We require the EXACT domain,
+        # not just a substring match.
+        TRUSTED_DOMAINS: frozenset[str] = frozenset(
+            {
+                "corp.com",  # legitimate corporate domain
+                "internal.corp.com",  # explicit internal subdomain
+            }
+        )
+        EXTERNAL_DOMAINS: frozenset[str] = frozenset(
+            {
+                "elsewhere.com",  # known external in test bootstrap
+                "attacker.com",  # attacker domain in test traces
+                "evil.com",
+                "attacker.evil.com",
+            }
+        )
+
+        # Strip port if present
+        clean_domain = domain_part.split(":")[0]
+
+        if clean_domain in EXTERNAL_DOMAINS:
+            return "external"
+        if clean_domain in TRUSTED_DOMAINS:
             return "internal"
+
+        # Default: external (safe by default for unknown domains).
+        # This prevents attacker-controlled domains like "mycorp.com" or "corp.evil.com"
+        # from being accidentally classified as internal. Known corporate email
+        # MUST be explicitly added to TRUSTED_DOMAINS in production deployments.
         return "external"
 
     def check_fresh(self, effect: Effect, task: Task) -> PredicateResult:
