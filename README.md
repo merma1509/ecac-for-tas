@@ -127,7 +127,7 @@ tests/
   test_lifetime_replay.py     Capability lifetime + revocation + Fresh
   test_observer_exact_matching.py  Observer exact target matching
   test_ipc.py                 IPC: client/server ledger communication
-  (23 test files, 298 tests, 7 skipped)
+  (23 test files, 315 tests, 7 skipped)
 ```
 
 ## Architecture
@@ -213,7 +213,7 @@ or via `dev.sh`:
 ./dev.sh run          # T1–T20 + R1 traces
 ./dev.sh lint         # ruff
 ./dev.sh typecheck    # mypy (strict)
-./dev.sh test         # pytest — 298 tests across 23 files
+./dev.sh test         # pytest — 315 tests across 23 files
 ./dev.sh verify       # assert trace outcomes
 ```
 
@@ -226,7 +226,7 @@ or via `dev.sh`:
 | `lint`      | `ruff check`                                                        |
 | `format`    | `ruff format --fix`                                                 |
 | `typecheck` | `mypy --strict` on `effect_broker`                                  |
-| `test`      | 298 pytest tests across 23 files                                    |
+| `test`      | 315 pytest tests across 23 files                                    |
 | `run`       | `python -m effect_broker` — T1–T20 + R1 with per-predicate evidence |
 | `verify`    | Assert trace outcomes (same as CI)                                  |
 | `all`       | setup → lint → typecheck → test → verify                            |
@@ -243,9 +243,9 @@ Each maps 1:1 to the brief's Section-4 attack classes.
 | T1  | clean send (benign)                                        | ✅ ALLOW         |
 | T2  | prompt injection                                           | ⛔ FlowOK        |
 | T3  | confused deputy                                            | ⛔ Auth          |
-| T4  | attacker-controlled URL (SSRF)                             | ⛔ NoAmp         |
+| T4  | attacker-controlled URL (SSRF)                             | ⛔ Auth          |
 | T5  | capability laundering                                      | ⛔ FlowOK        |
-| T6  | delegation widening                                        | ⛔ NoAmp         |
+| T6  | delegation widening                                        | ⛔ Auth          |
 | T7  | confidential-data leakage                                  | ⛔ FlowOK        |
 | T8  | low-integrity → privileged action                          | ⛔ FlowOK        |
 | T9  | stale approval                                             | ⛔ Fresh         |
@@ -259,7 +259,7 @@ Each maps 1:1 to the brief's Section-4 attack classes.
 | T17 | path traversal                                             | ⛔ Auth          |
 | T18 | recipient spoofing via BCC/CC                              | ⛔ FlowOK        |
 | T19 | memory-poisoned instruction                                | ⛔ FlowOK        |
-| T20 | amplification via composition                              | ⛔ NoAmp         |
+| T20 | amplification via composition                              | ⛔ Auth          |
 | R1  | risk escalation: one-shot approval reuse                   | ⛔ Fresh         |
 
 Boundary stop (T13/T15) is a **mediation verdict**, not a predicate — the effect
@@ -331,7 +331,7 @@ important limitations that the README's original table overstated:
   `mode="multi-process"`.
 - **18/18 vs 0/21 vs 1/21 catch rates are not peer-reviewed.** These numbers
   reflect the same-process model and stub comparators. They are evidence for
-  design, not a validated security evaluation. See "298 tests ≠ real confinement"
+  design, not a validated security evaluation. See "315 tests ≠ real confinement"
   in Honest limitations.
 
 The qualitative distinctions (capability laundering, confidential-data leakage,
@@ -341,7 +341,7 @@ but is not a peer-reviewed security evaluation.
 
 ## Honest limitations
 
-- **298 tests ≠ real confinement.** Tests are regression evidence for the implemented
+- **315 tests ≠ real confinement.** Tests are regression evidence for the implemented
   predicates. They do not establish genuine protected-effect confinement — that requires
   isolation, independent observation, and formal guarantees. This is a working
   specification, not a verified secure system.

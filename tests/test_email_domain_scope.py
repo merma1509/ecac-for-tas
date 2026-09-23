@@ -193,17 +193,41 @@ class TestEmailDomainScopeFix:
         assert "extra-target-outside-scope" in ev["predicates"]["NoAmp"]
 
     def test_scope_label_for_target_extracts_domain_from_email(self) -> None:
-        """_scope_label_for_target() returns domain label for email targets."""
+        """_scope_label_for_target() returns domain label for email targets.
+
+        Domain classification uses a TWO-LEVEL check:
+          1. ResourceStore bootstrap data (authoritative for registered emails)
+          2. TRUSTED_DOMAINS allowlist (for known corporate domains like corp.com)
+
+        This prevents attacker-controlled lookalike domains from being classified
+        as "internal". Only explicitly registered or explicitly allowlisted domains
+        get "internal" status — all others get "external" (safe by default).
+        """
+        from effect_broker.model import Domain
+
         broker = build()
 
-        # Internal domain
+        # Level 1: registered in ResourceStore (authoritative for that address)
+        # internal@corp.com IS bootstrap'd by build() → "internal"
         assert broker._scope_label_for_target("internal@corp.com") == "internal"
-        assert broker._scope_label_for_target("team@corp.com") == "internal"
-        assert broker._scope_label_for_target("alice@internal.corp.net") == "internal"
+        # Register additional addresses explicitly
+        broker.store._unsafe_bootstrap_email("alice@internal.corp.com", Domain.INTERNAL)
+        assert broker._scope_label_for_target("alice@internal.corp.com") == "internal"
 
-        # External domain
+        # Level 2: TRUSTED_DOMAINS allowlist (for generic corporate domain)
+        # "corp.com" is in TRUSTED_DOMAINS → "internal"
+        assert broker._scope_label_for_target("team@corp.com") == "internal"
+        assert broker._scope_label_for_target("bob@corp.com") == "internal"
+
+        # NOT internal: unknown/external domains → "external" (safe by default)
         assert broker._scope_label_for_target("attacker@elsewhere.com") == "external"
         assert broker._scope_label_for_target(" Mallory @ gmail.com ") == "external"
+        # "internal.corp.net" is NOT in TRUSTED_DOMAINS (only corp.com is)
+        assert broker._scope_label_for_target("alice@internal.corp.net") == "external"
+        # "attacker.com" is in EXTERNAL_DOMAINS → "external"
+        assert broker._scope_label_for_target("attacker@attacker.com") == "external"
+        # Notcorp.com: not in any allowlist → "external" (safe by default)
+        assert broker._scope_label_for_target("alice@notcorp.com") == "external"
 
         # Non-email targets pass through unchanged
         assert broker._scope_label_for_target("file:///reports") == "file:///reports"

@@ -608,12 +608,16 @@ class LedgerProcessHandle:
         # Use -m to run as a module so effect_broker imports resolve correctly.
         # Change to the package root so -m resolves effect_broker as a package.
         ecac_root = Path(__file__).parent.parent  # project root (contains effect_broker/)
-        script = ecac_root / "effect_broker" / "ledger_process.py"
         if self._socket_path.exists():
             self._socket_path.unlink()
         self._proc = subprocess.Popen(
-            [sys.executable, "-m", "effect_broker.ledger_process",
-             "--socket", str(self._socket_path)],
+            [
+                sys.executable,
+                "-m",
+                "effect_broker.ledger_process",
+                "--socket",
+                str(self._socket_path),
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
