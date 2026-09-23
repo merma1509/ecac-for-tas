@@ -215,7 +215,7 @@ or via `dev.sh`:
 ./dev.sh run          # T1–T20 + R1 traces
 ./dev.sh lint         # ruff
 ./dev.sh typecheck    # mypy (strict)
-./dev.sh test         # pytest — 330 tests across 23 files
+./dev.sh test         # pytest — 336 tests across 23 files
 ./dev.sh verify       # assert trace outcomes
 ```
 
@@ -228,7 +228,7 @@ or via `dev.sh`:
 | `lint`      | `ruff check`                                                        |
 | `format`    | `ruff format --fix`                                                 |
 | `typecheck` | `mypy --strict` on `effect_broker`                                  |
-| `test`      | 330 pytest tests across 23 files                                    |
+| `test`      | 336 pytest tests across 23 files                                    |
 | `run`       | `python -m effect_broker` — T1–T20 + R1 with per-predicate evidence |
 | `verify`    | Assert trace outcomes (same as CI)                                  |
 | `all`       | setup → lint → typecheck → test → verify                            |
@@ -349,7 +349,7 @@ important limitations that the README's original table overstated:
   `mode="multi-process"`.
 - **18/18 vs 0/21 vs 1/21 catch rates are not peer-reviewed.** These numbers
   reflect the same-process model and stub comparators. They are evidence for
-  design, not a validated security evaluation. See "330 tests ≠ real confinement"
+  design, not a validated security evaluation. See "336 tests ≠ real confinement"
   in Honest limitations.
 
 The qualitative distinctions (capability laundering, confidential-data leakage,
@@ -359,7 +359,7 @@ peer-reviewed security evaluation.
 
 ## Honest limitations
 
-- **330 tests ≠ real confinement.** Tests are regression evidence for the implemented
+- **336 tests ≠ real confinement.** Tests are regression evidence for the implemented
   predicates. They do not establish genuine protected-effect confinement — that requires
   isolation, independent observation, and formal guarantees. This is a working
   specification, not a verified secure system.
@@ -372,13 +372,20 @@ peer-reviewed security evaluation.
   must come from a trusted manifest (e.g. MCP tool schema verified by administrator),
   not from tool self-description. The shim's structural check is only as strong as
   the trust placed in the manifest.
-- **Provenance derivation is heuristic, not from real OS metadata.** `derive_file_provenance`
-  uses path keyword patterns (`secrets/` → CONFIDENTIAL). A full implementation would
-  query OS-level metadata (SELinux contexts, Windows sensitivity labels). Current
-  derivation is traceable and auditable but not from a real security system.
-- **Cross-task composition is not tracked.** Session Taint prevents intra-task
-  composition attacks (read-secrets → send-internal within one session). Cross-task
-  composition (effect in Task A flows into Task B) is not tracked — deferred.
+- **Real OS provenance (statx + permission bits).** `derive_file_provenance()` now
+  queries `os.statx()` (Linux kernel ≥ 4.11) for ENCRYPTED/IMMUTABLE filesystem flags,
+  then falls back to `os.stat()` real permission bits: owner-only (0o600) → CONFIDENTIAL,
+  group-readable (0o640) → INTERNAL, world-readable (0o644) → PUBLIC, keyword fallback
+  only for non-existent files. The kernel reads from the OS, not the LLM's declarations.
+  Full OS-level label APIs (SELinux getxattr, Windows sensitivity labels) deferred —
+  the statx/permission-bit heuristic is traceable and auditable on all Unix systems.
+- **Cross-task composition (PARTIALLY enforced).** Session Taint prevents intra-task
+  read-secrets→send-internal attacks. Cross-task isolation is enforced at the capability
+  level: `check_auth()` sub-check 6 blocks reusable capabilities with `task_id` when used
+  in a different task; `ApprovalBinding` blocks cross-task approval use ("cross-task-use");
+  `LabelException.task_id` prevents cross-task declass from clearing a task's taint.
+  NOT enforced: data-level flow (output of Task A used as input to Task B) — requires
+  language-level taint tracking (PACT/CaMeL). Deferred.
 - **TCB expansion is unquantified.** Effect mediation pulls primitives into the
   trusted core; the TCB size and correctness are not formally argued.
 - **Exactly-once external semantics not claimed.** The ledger confirms each authorized
@@ -387,7 +394,10 @@ peer-reviewed security evaluation.
 - **No performance or approval-burden metrics.** Experiments measure correctness only.
 - **No external baseline comparison.** ECAC is not yet compared against a genuine
   baseline under matched assumptions.
-- **Formal proof deferred.** The proof sketch in `effect_broker/proof.py` provides a
-  structured argument. Machine-checked verification (TLA+ spec) provides additional
-  rigor. Full Coq/Isabelle formalization is deferred as the return-on-investment
-  does not justify the effort at this stage.
+- **Formal proof (structured sketch + TLA+ spec).** The proof sketch in
+  `effect_broker/proof.py` provides a structured argument. A TLA+ spec in `TLA+/ECAC.tla`
+  formalizes the four-predicate gate, commit operation, and safety invariants
+  (`Inv1`–`Inv5`). The spec can be model-checked with Apalache or TLC. Coq/Isabelle
+  formalization (machine-checked proof) is deferred — TLA+ model checking on finite
+  instances provides strong evidence; full proof requires significant effort for
+  marginal additional assurance.

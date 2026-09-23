@@ -235,11 +235,26 @@ LIMITATIONS OF THIS PROOF SKETCH:
    UnknownObserverResult — this is "unknown, not safe" by design, but it means
    complete mediation cannot be formally verified without process isolation.
 
-5. TOOL-DECLARED CAPABILITIES: ToolRegistry enforces structural constraints.
-   In production, tool declarations must come from a trusted manifest (e.g. MCP
-   tool schema verified by system administrator), NOT from tool self-description.
-   The broker's `_find_capability()` still uses metadata-based capability lookup
-   (ToolRegistry adds structural enforcement on top, not in place of it).
+5. TOOL MANIFEST TRUST (MITIGATED): ToolRegistry enforces that tools use
+   only their DECLARED capabilities. Undeclared operations raise SecurityError
+   at the shim BEFORE the Effect is built. BUT: the ToolDeclaration itself
+   must come from a trusted source.
+
+   The current implementation uses `declarations["tool-name"] = ToolDeclaration(...)`
+   which is code-based registration (effectively: a trusted manifest in code).
+   This is the right architecture — the manifest is code, not tool self-description.
+
+   REMAINING GAP: In a deployment where the MCP server provides tool schemas
+   dynamically, an adversarial server could serve a tool schema that claims
+   "read only" but the tool actually writes. MITIGATION: the shim enforces
+   structure, so even if the schema lies, the tool is caught by the structural
+   check (if the shim is integrated with the MCP client). The broker cannot
+   distinguish between a "trusted manifest in code" and a "dynamically loaded
+   manifest from the MCP server" unless the MCP client is also in the TCB.
+
+   In practice: if RealFileShim/RealEmailShim are the ONLY OS calls, and the
+   MCP client calls through the shim, the tool cannot bypass even if it lies
+   about its schema — the shim's structural check fires on the actual operation.
 
 6. HOLD-OUT EVALUATION: The 20 trace attacks in eval_comparison.py were
    designed with knowledge of the implementation. A proper held-out evaluation
@@ -251,22 +266,31 @@ LIMITATIONS OF THIS PROOF SKETCH:
    refinement proofs. Coq/Isabelle formalization deferred (significant effort
    for marginal additional assurance at this stage).
 
-8. CROSS-TASK COMPOSITION: Session Taint prevents intra-task composition attacks
-   (read-secrets→send-internal). Cross-task composition (effect in Task A flows
-   into Task B) is NOT tracked — requires task-level isolation beyond process
-   isolation. Deferred.
+8. CROSS-TASK COMPOSITION (PARTIAL ENFORCEMENT):
+   Intra-task: Session Taint prevents read-secrets→send-internal in the SAME task.
+   Inter-task (effect from Task A → Task B): PARTIALLY enforced:
+     - check_auth() sub-check 6: reusable caps with task_id are task-scoped
+     - ApprovalBinding: cross-task approval use is BLOCKed ("cross-task-use")
+     - LabelException.task_id: cross-task declass does NOT clear Task A's taint
+     NOT enforced: data-level flow (effect output from Task A used as input to Task B)
+     — this requires language-level taint tracking (PACT/CaMeL). Deferred.
 
-9. PROVENANCE: Labels are derived from path patterns (simulating OS metadata).
-   Real provenance would require integration with language-level taint tracking
-   (PACT/CaMeL) or OS-level file metadata (SELinux contexts, Windows labels).
-   Current derivation is traceable and auditable, but not from a real system.
+9. PROVENANCE: NOW RESOLVED.
+   The kernel derives labels from REAL OS metadata, not path keywords:
+     - derive_file_provenance(target): os.statx() → ENCRYPTED/IMMUTABLE flags
+     - os.stat() permission bits: owner-only (0o600) → CONFIDENTIAL,
+       group-readable (0o640) → INTERNAL, world-readable (0o644) → PUBLIC
+     - RealFileShim._derive_path_confidentiality(): tries statx → stat() → keywords
+     - All three approaches are traceable: the metadata is embedded in Effect.metadata
+   The LLM cannot forge provenance — the kernel reads from the OS, not from tool claims.
+   Deferred: full OS-level label APIs (SELinux getxattr, Windows sensitivity labels)
+   require platform-specific integration beyond the statx/permission-bit heuristic.
 """
 
 
 # =============================================================================
 # 7. TCB SIZE (Lines of Code)
 # =============================================================================
-
 TCB_SIZE = {
     "broker.py (core gate + predicates)": "~800 lines",
     "model.py (Effect, Capability, Task)": "~500 lines",
