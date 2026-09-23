@@ -51,6 +51,7 @@ from typing import cast
 from .executor import IsolatedExecutor, SubprocessExecutor
 from .executor_ipc import ProcessExecutorClient
 from .ipc import LedgerBackend, LocalLedgerBackend
+from .lattice import Confidentiality, Integrity
 from .ledger import IndependentEffectLedger
 from .mediation import MediationVerdict, Mediator
 from .model import (
@@ -68,7 +69,6 @@ from .model import (
     Task,
     TaskId,
 )
-from .lattice import Confidentiality, Integrity
 from .restricted_store import RestrictedResourceStore as ResourceStore
 
 # Union of types that can be passed as the `ledger` argument.
@@ -174,7 +174,7 @@ def derive_file_provenance(target: str) -> tuple[Confidentiality, Integrity]:
 
     # Step 1: Try os.statx() (Linux with kernel >= 4.11)
     try:
-        stx = os.statx(os_path, flags=os.STATX_ALL)
+        stx = os.statx(os_path, flags=os.STATX_ALL)  # type: ignore[attr-defined]
         # ENCRYPTED flag → CONFIDENTIAL (filesystem-level sensitivity)
         if stx.stx_attributes & (1 << 0):
             return Confidentiality.CONFIDENTIAL, Integrity.USER
@@ -258,7 +258,9 @@ class _ProvenanceResolver:
         """
         return self.resolve(target)
 
-    def resolve_for_write(self, target: str, content_confidence: str = "USER") -> tuple[Confidentiality, Integrity]:
+    def resolve_for_write(
+        self, target: str, content_confidence: str = "USER"
+    ) -> tuple[Confidentiality, Integrity]:
         """Resolve provenance for a WRITE effect (content written TO this resource).
 
         The write's output label should match the file's sensitivity.
@@ -1500,9 +1502,7 @@ class EffectBroker:
             file_res = self.store.resolve(effect.target)
             if file_res is not None and hasattr(file_res, "sensitivity"):
                 if file_res.sensitivity == Confidentiality.CONFIDENTIAL:
-                    task.session.taint_for_send(
-                        reason=f"read-confidential({effect.target})"
-                    )
+                    task.session.taint_for_send(reason=f"read-confidential({effect.target})")
 
         self.store.apply_effect(effect)
 

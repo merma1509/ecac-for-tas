@@ -218,7 +218,7 @@ class RealFileShim:
         """
         try:
             canon = self._canonical_path(path)
-            stx = os.statx(canon, flags=os.STATX_ALL)
+            stx = os.statx(canon, flags=os.STATX_ALL)  # type: ignore[attr-defined]
             label = self._try_statx_label(stx, canon)
             if label is not None:
                 return label
@@ -244,9 +244,7 @@ class RealFileShim:
             # Deny-most default: treat as INTERNAL (not PUBLIC)
             return Confidentiality.INTERNAL
 
-    def _try_statx_label(
-        self, stx: os.statx_result, path: str
-    ) -> Confidentiality | None:
+    def _try_statx_label(self, stx: object, path: str) -> Confidentiality | None:
         """Query OS-level extended attributes for a sensitivity label.
 
         On Linux with SELinux (enforcing):
@@ -266,15 +264,18 @@ class RealFileShim:
         # Check the ENCRYPTED attribute (filesystem-level confidentiality signal)
         # This is a real OS signal: if the file is encrypted at rest, it is
         # CONFIDENTIAL. Set with: chattr +i file  OR  BitLocker/FileVault
-        if stx.stx_attributes & (1 << 0):  # STATX_ATTR_ENCRYPTED
+        stx_attributes: int = getattr(stx, "stx_attributes", 0)
+        stx_mode: int = getattr(stx, "stx_mode", 0)
+        if stx_attributes & (1 << 0):  # STATX_ATTR_ENCRYPTED
             return Confidentiality.CONFIDENTIAL
 
         # Check for system immutable attribute (chattr +i / +a)
         # Immutable files are typically high-sensitivity (root-owned config, secrets)
-        if stx.stx_attributes & (1 << 1):  # STATX_ATTR_IMMUTABLE
+        if stx_attributes & (1 << 1):  # STATX_ATTR_IMMUTABLE
             # Immutable + non-world-readable → likely CONFIDENTIAL
-            # Only flag as CONFIDENTIAL if also owner-only (prevents false CONFIDENTIAL on /etc/passwd)
-            mode = stx.stx_mode & 0o777
+            # flag as CONFIDENTIAL if also owner-only; prevents false
+            # CONFIDENTIAL on files like /etc/passwd (world-readable + immutable)
+            mode = stx_mode & 0o777
             if mode & 0o077:  # group or world has some access → not confidential
                 return Confidentiality.INTERNAL
             return Confidentiality.CONFIDENTIAL
@@ -461,7 +462,7 @@ class RealFileShim:
         # on all platforms — wrap in try/except to keep effect derivation robust.
         statx_meta: dict[str, object] = {}
         try:
-            stx = os.statx(canon, flags=os.STATX_ALL)
+            stx = os.statx(canon, flags=os.STATX_ALL)  # type: ignore[attr-defined]
             statx_meta = {
                 "stx_mode_octal": f"0o{stx.stx_mode & 0o777:03o}",
                 "stx_attributes_hex": f"0x{stx.stx_attributes:x}",
@@ -480,15 +481,19 @@ class RealFileShim:
             target=uri,
             metadata={
                 "os_statx": statx_meta,
-                "confidentiality_source": "os-statx" if statx_meta.get("stx_unavailable") is None
-                    else "permission-bits" if conf == Confidentiality.CONFIDENTIAL or conf == Confidentiality.PUBLIC
-                    else "path-keyword-fallback",
+                "confidentiality_source": "os-statx"
+                if statx_meta.get("stx_unavailable") is None
+                else "permission-bits"
+                if conf == Confidentiality.CONFIDENTIAL or conf == Confidentiality.PUBLIC
+                else "path-keyword-fallback",
                 "pre_exists": pre_exists,
             },
             provenance=(
                 Data(f"shim-{op_type}", conf, integ),
                 Data(f"real-path={canon}", conf, Integrity.USER),
-                Data(f"os-statx-mode={statx_meta.get('stx_mode_octal', 'N/A')}", conf, Integrity.USER),
+                Data(
+                    f"os-statx-mode={statx_meta.get('stx_mode_octal', 'N/A')}", conf, Integrity.USER
+                ),
             ),
             capability_nonce=nonce,
             delegation_chain=(self.tool_name, "RealFileShim"),
