@@ -2,8 +2,10 @@
 
 **Executable kernel** for commit-time, effect-complete authority confinement of LLM tool agents.
 Every tool-call side effect passes through a four-predicate gate (`Auth ∧ FlowOK ∧ NoAmp ∧ Fresh`);
-nothing mutates external state outside the gate. The kernel is derived from real OS, SMTP and IMAP
-state — not from tool-provided declarations — so the tool cannot forge outcomes.
+nothing mutates external state outside the gate. The kernel derives provenance labels from
+**real resource metadata** (path patterns, domain classification) — not from tool declarations.
+Structural enforcement (ToolRegistry) checks tool capabilities BEFORE the Effect is built.
+Session Taint Mode prevents inter-effect composition attacks (read-secrets → send-internal).
 
 > **Status:** validated executable model. The predicates are machine-checkable and
 > independently falsifiable. This is a working specification, not a production system.
@@ -127,7 +129,7 @@ tests/
   test_lifetime_replay.py     Capability lifetime + revocation + Fresh
   test_observer_exact_matching.py  Observer exact target matching
   test_ipc.py                 IPC: client/server ledger communication
-  (23 test files, 315 tests, 7 skipped)
+  (23 test files, 330 tests, 7 skipped)
 ```
 
 ## Architecture
@@ -213,7 +215,7 @@ or via `dev.sh`:
 ./dev.sh run          # T1–T20 + R1 traces
 ./dev.sh lint         # ruff
 ./dev.sh typecheck    # mypy (strict)
-./dev.sh test         # pytest — 315 tests across 23 files
+./dev.sh test         # pytest — 330 tests across 23 files
 ./dev.sh verify       # assert trace outcomes
 ```
 
@@ -226,7 +228,7 @@ or via `dev.sh`:
 | `lint`      | `ruff check`                                                        |
 | `format`    | `ruff format --fix`                                                 |
 | `typecheck` | `mypy --strict` on `effect_broker`                                  |
-| `test`      | 315 pytest tests across 23 files                                    |
+| `test`      | 330 pytest tests across 23 files                                    |
 | `run`       | `python -m effect_broker` — T1–T20 + R1 with per-predicate evidence |
 | `verify`    | Assert trace outcomes (same as CI)                                  |
 | `all`       | setup → lint → typecheck → test → verify                            |
@@ -238,29 +240,29 @@ or via `dev.sh`:
 Runnable scripts: initial state → agent proposal → broker decision → expected outcome.
 Each maps 1:1 to the brief's Section-4 attack classes.
 
-| #   | Attack class                                               | Expected result  |
-| --- | ---------------------------------------------------------- | ---------------- |
-| T1  | clean send (benign)                                        | ✅ ALLOW         |
-| T2  | prompt injection                                           | ⛔ FlowOK        |
-| T3  | confused deputy                                            | ⛔ Auth          |
-| T4  | attacker-controlled URL (SSRF)                             | ⛔ Auth          |
-| T5  | capability laundering                                      | ⛔ FlowOK        |
-| T6  | delegation widening                                        | ⛔ Auth          |
-| T7  | confidential-data leakage                                  | ⛔ FlowOK        |
-| T8  | low-integrity → privileged action                          | ⛔ FlowOK        |
-| T9  | stale approval                                             | ⛔ Fresh         |
-| T10 | replay                                                     | ⛔ Fresh         |
-| T11 | declassification abuse                                     | ⛔ FlowOK        |
-| T12 | endorsement abuse                                          | ⛔ FlowOK        |
-| T13 | false MCP description (declared vs actual target mismatch) | ⛔ boundary stop |
-| T14 | hidden side effect on declared target                      | ✅ ALLOW         |
-| T15 | monitor bypass                                             | ⛔ boundary stop |
-| T16 | capability forgery                                         | ⛔ NoAmp         |
-| T17 | path traversal                                             | ⛔ Auth          |
-| T18 | recipient spoofing via BCC/CC                              | ⛔ FlowOK        |
-| T19 | memory-poisoned instruction                                | ⛔ FlowOK        |
-| T20 | amplification via composition                              | ⛔ Auth          |
-| R1  | risk escalation: one-shot approval reuse                   | ⛔ Fresh         |
+| #   | Attack class                                               | Expected result              |
+| --- | ---------------------------------------------------------- | ---------------------------- |
+| T1  | clean send (benign)                                        | ✅ ALLOW                     |
+| T2  | prompt injection                                           | ⛔ FlowOK                    |
+| T3  | confused deputy                                            | ⛔ Auth                      |
+| T4  | attacker-controlled URL (SSRF)                             | ⛔ Auth                      |
+| T5  | capability laundering                                      | ⛔ FlowOK                    |
+| T6  | delegation widening                                        | ⛔ Auth                      |
+| T7  | confidential-data leakage                                  | ⛔ FlowOK                    |
+| T8  | low-integrity → privileged action                          | ⛔ FlowOK                    |
+| T9  | stale approval                                             | ⛔ Fresh                     |
+| T10 | replay                                                     | ⛔ Fresh                     |
+| T11 | declassification abuse                                     | ⛔ FlowOK                    |
+| T12 | endorsement abuse                                          | ⛔ FlowOK                    |
+| T13 | false MCP description (declared vs actual target mismatch) | ⛔ boundary stop             |
+| T14 | hidden side effect on declared target                      | ⛔ structural (ToolRegistry) |
+| T15 | monitor bypass                                             | ⛔ boundary stop             |
+| T16 | capability forgery                                         | ⛔ NoAmp                     |
+| T17 | path traversal                                             | ⛔ Auth                      |
+| T18 | recipient spoofing via BCC/CC                              | ⛔ FlowOK                    |
+| T19 | memory-poisoned instruction                                | ⛔ FlowOK                    |
+| T20 | amplification via composition                              | ⛔ Auth                      |
+| R1  | risk escalation: one-shot approval reuse                   | ⛔ Fresh                     |
 
 Boundary stop (T13/T15) is a **mediation verdict**, not a predicate — the effect
 never reaches the remote tool because the broker stops it or the guarantee ends
@@ -302,6 +304,22 @@ at the broker→tool boundary.
   only with a broker-recorded `LabelException`. An LLM-attached exception that
   was never broker-granted is rejected — T11 (declass abuse) and T12 (endorse
   abuse) confirm "LLM may request, never perform."
+- **Session Taint Mode prevents inter-effect composition attacks.** When a
+  `read(CONFIDENTIAL file)` effect commits, the session is marked as tainted.
+  Any subsequent `send` effect in that session is blocked by FlowOK with
+  "session-taint" unless a broker-recorded declass exception clears the taint.
+  This closes the read-secrets → send-exfil attack that NoAmp cannot catch
+  (effect-level only, no cross-effect tracking).
+- **Provenance derivation from real resource metadata.** The broker derives
+  labels from path patterns (`secrets/` → CONFIDENTIAL) and domain classification
+  (not hand-assigned by the LLM). `_ProvenanceResolver` uses the resource's own
+  metadata — the LLM cannot forge provenance labels.
+- **ToolRegistry structural enforcement (T13/T14).** Every tool must declare
+  its capabilities upfront via `ToolDeclaration`. Before the Effect is built,
+  the shim checks (operation, target) against the tool's declared rights/targets.
+  Undeclared operations raise `SecurityError` at the shim level — before reaching
+  the broker gate. This closes the T14 (hidden write) gap that the four-predicate
+  gate alone cannot catch.
 - **Risk escalation (R1) is outside the allow rule.** Approval grants a fresh
   one-shot capability that must still pass all four predicates; reuse is a
   `Fresh` replay.
@@ -331,17 +349,17 @@ important limitations that the README's original table overstated:
   `mode="multi-process"`.
 - **18/18 vs 0/21 vs 1/21 catch rates are not peer-reviewed.** These numbers
   reflect the same-process model and stub comparators. They are evidence for
-  design, not a validated security evaluation. See "315 tests ≠ real confinement"
+  design, not a validated security evaluation. See "330 tests ≠ real confinement"
   in Honest limitations.
 
 The qualitative distinctions (capability laundering, confidential-data leakage,
-stale/replay, BCC scope) are architecturally sound and tested by the trace
-suite in the same-process model. `eval_comparison.py` demonstrates the approach
-but is not a peer-reviewed security evaluation.
+stale/replay, BCC scope, hidden side effects) are architecturally sound and tested
+by the trace suite. `eval_comparison.py` demonstrates the approach but is not a
+peer-reviewed security evaluation.
 
 ## Honest limitations
 
-- **315 tests ≠ real confinement.** Tests are regression evidence for the implemented
+- **330 tests ≠ real confinement.** Tests are regression evidence for the implemented
   predicates. They do not establish genuine protected-effect confinement — that requires
   isolation, independent observation, and formal guarantees. This is a working
   specification, not a verified secure system.
@@ -349,21 +367,18 @@ but is not a peer-reviewed security evaluation.
   run in the same Python process. Direct store mutation (`store._files._data[...]=X`)
   bypasses the executor; the ledger returns `UNKNOWN` for it — not `safe`. Real
   isolation requires a separate process or enclave.
-- **T13/T14/T15 use metadata, not real enforcement — mitigated by strict mode.**
-  `Mediator.inspect()` uses `ToolSpec` metadata set by the test author; a real
-  adversarial tool can lie about its actual targets. `Mediator(..., strict=True)`
-  makes mediator registration mandatory — unknown tools are BLOCKed. The mandatory
-  boundary experiment (`tests/test_experiment.py`, M1–M5) uses a **real untrusted tool**
-  to demonstrate that computation is actually bounded.
-- **T14 (hidden side effect on declared target):** ECAC philosophy — broker authorizes
-  the declared target; undisclosed side effects are caught by the ledger/observer in
-  production, not blocked at the broker gate. This is the scope boundary of the broker,
-  filled by the ledger.
-- **Provenance labels are hand-assigned.** Labels are derived by the shim from actual
-  OS/SMTP/IMAP state, but the label-to-keyword mapping is heuristic. Real taint
-  propagation requires language-level taint tracking or runtime provenance APIs.
-- **Resource labels are minimal.** File sensitivity (path keywords) and email domain
-  are the only resource classifications; a full policy repository is not modeled.
+- **Tool declarations must come from a trusted manifest.** ToolRegistry enforces
+  structural constraints based on tool self-declarations. In production, declarations
+  must come from a trusted manifest (e.g. MCP tool schema verified by administrator),
+  not from tool self-description. The shim's structural check is only as strong as
+  the trust placed in the manifest.
+- **Provenance derivation is heuristic, not from real OS metadata.** `derive_file_provenance`
+  uses path keyword patterns (`secrets/` → CONFIDENTIAL). A full implementation would
+  query OS-level metadata (SELinux contexts, Windows sensitivity labels). Current
+  derivation is traceable and auditable but not from a real security system.
+- **Cross-task composition is not tracked.** Session Taint prevents intra-task
+  composition attacks (read-secrets → send-internal within one session). Cross-task
+  composition (effect in Task A flows into Task B) is not tracked — deferred.
 - **TCB expansion is unquantified.** Effect mediation pulls primitives into the
   trusted core; the TCB size and correctness are not formally argued.
 - **Exactly-once external semantics not claimed.** The ledger confirms each authorized
@@ -372,3 +387,7 @@ but is not a peer-reviewed security evaluation.
 - **No performance or approval-burden metrics.** Experiments measure correctness only.
 - **No external baseline comparison.** ECAC is not yet compared against a genuine
   baseline under matched assumptions.
+- **Formal proof deferred.** The proof sketch in `effect_broker/proof.py` provides a
+  structured argument. Machine-checked verification (TLA+ spec) provides additional
+  rigor. Full Coq/Isabelle formalization is deferred as the return-on-investment
+  does not justify the effort at this stage.
