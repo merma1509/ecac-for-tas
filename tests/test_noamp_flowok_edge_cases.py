@@ -888,3 +888,111 @@ class TestProvenanceDerivation:
         conf, integ = resolver.resolve("alice@external.com")
         assert conf == Confidentiality.PUBLIC, f"Expected PUBLIC for external domain, got {conf}"
         assert integ == Integrity.USER
+
+
+class TestRealOSProvenance:
+    """Real OS provenance: kernel reads actual stat bits, not path keywords.
+
+    RESOLVES: "Provenance derivation is heuristic" — kernel reads os.statx() /
+    os.stat() permission bits. The LLM cannot forge these.
+
+    Derivation hierarchy (first match wins):
+      1. os.statx() ENCRYPTED flag → CONFIDENTIAL
+      2. os.statx() IMMUTABLE + owner-only → CONFIDENTIAL
+      3. os.stat() permission bits (owner-only / group / world)
+      4. Path keyword fallback (last resort for new files)
+    """
+
+    def test_owner_only_file_is_confidential(self, tmp_path) -> None:
+        """File with mode 0o600 → CONFIDENTIAL (reads real permission bits)."""
+        from effect_broker.broker import derive_file_provenance
+        from effect_broker.lattice import Confidentiality
+        import os
+
+        # Create file with owner-only permissions
+        f = tmp_path / "random-test-file"
+        f.write_text("hello world")
+        os.chmod(f, 0o600)
+
+        conf, _ = derive_file_provenance(f"file:///{f}")
+        assert conf == Confidentiality.CONFIDENTIAL, (
+            f"Owner-only file (0o600) should be CONFIDENTIAL, got {conf}"
+        )
+
+    def test_world_readable_file_is_public(self, tmp_path) -> None:
+        """File with mode 0o644 → PUBLIC (world-readable)."""
+        from effect_broker.broker import derive_file_provenance
+        from effect_broker.lattice import Confidentiality
+        import os
+
+        f = tmp_path / "public-doc.txt"
+        f.write_text("public content")
+        os.chmod(f, 0o644)
+
+        conf, _ = derive_file_provenance(f"file:///{f}")
+        assert conf == Confidentiality.PUBLIC, (
+            f"World-readable file (0o644) should be PUBLIC, got {conf}"
+        )
+
+    def test_group_readable_file_is_internal(self, tmp_path) -> None:
+        """File with mode 0o640 → INTERNAL (group-readable, not world)."""
+        from effect_broker.broker import derive_file_provenance
+        from effect_broker.lattice import Confidentiality
+        import os
+
+        f = tmp_path / "group-report.txt"
+        f.write_text("internal data")
+        os.chmod(f, 0o640)
+
+        conf, _ = derive_file_provenance(f"file:///{f}")
+        assert conf == Confidentiality.INTERNAL, (
+            f"Group-readable file (0o640) should be INTERNAL, got {conf}"
+        )
+
+    def test_new_file_falls_back_to_keywords(self, tmp_path) -> None:
+        """File that doesn't exist yet → path keyword fallback (last resort)."""
+        from effect_broker.broker import derive_file_provenance
+        from effect_broker.lattice import Confidentiality
+
+        # file:///secrets/... doesn't exist → keyword fallback
+        conf, _ = derive_file_provenance("file:///secrets/new-file.txt")
+        assert conf == Confidentiality.CONFIDENTIAL, (
+            f"Non-existent secrets file should use keyword fallback, got {conf}"
+        )
+
+    def test_email_resolver_uses_domain_not_path_keywords(self) -> None:
+        """Email target uses domain classification, not file path keywords."""
+        from effect_broker.broker import EffectBroker
+        from effect_broker.lattice import Confidentiality
+
+        broker = EffectBroker()
+        # corp.com is INTERNAL, even though path contains no keywords
+        conf, _ = broker._provenance_resolver.resolve("user@corp.com")
+        assert conf == Confidentiality.INTERNAL
+        # external.com is PUBLIC
+        conf, _ = broker._provenance_resolver.resolve("user@external.com")
+        assert conf == Confidentiality.PUBLIC
+
+    def test_derive_file_provenance_reads_real_permission_bits(self, tmp_path) -> None:
+        """derive_file_provenance() reads real os.stat() permission bits, not keywords."""
+        from effect_broker.broker import derive_file_provenance
+        from effect_broker.lattice import Confidentiality
+        import os
+
+        # A file with a "random" name but owner-only permissions → CONFIDENTIAL
+        # This proves the kernel reads real permission bits (not the name)
+        f = tmp_path / "random-xyz-123"
+        f.write_text("hello")
+        os.chmod(f, 0o600)
+
+        conf, _ = derive_file_provenance(f"file:///{f}")
+        assert conf == Confidentiality.CONFIDENTIAL, (
+            f"Owner-only (0o600) should be CONFIDENTIAL via real stat(), got {conf}"
+        )
+
+        # Now change to world-readable — should become PUBLIC (kernel reads stat, not name)
+        os.chmod(f, 0o644)
+        conf, _ = derive_file_provenance(f"file:///{f}")
+        assert conf == Confidentiality.PUBLIC, (
+            f"Same file, 0o644 → PUBLIC (real os.stat() confirms), got {conf}"
+        )

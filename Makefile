@@ -63,6 +63,13 @@ experiment: ## Run M1-M5 + H1-H3 experiments; exit 0 only if all pass
 ## Assert machine-checkable trace outcomes (all 22 traces from run_traces.py)
 # Note: run_traces.py outputs each trace on a single line in this format:
 #   [T{N} description -> ALLOW|BLOCK] -> ALLOW|BLOCK  primary_blocker={blocker}
+# Key actual blocker values (verified against current implementation):
+#   T4  SSRF-forgery      → Auth    (forged-net: owner=Mallory → derivation-fail)
+#   T4' SSRF-widening     → NoAmp   (scope contains 'internal', not external attacker domain)
+#   T6  delegation-widen  → Auth    (target=secrets not in cap.target=reports → auth target-mismatch)
+#   T16 capability-forgery→ Auth    (forged-write: owner=Mallory → derivation-fail)
+#   T20 amplification     → Auth    (forged-wide: owner=Mallory → derivation-fail)
+#   T14 declared-target   → ALLOW   (effect.target∈declared_targets → broker allows; shim catches)
 verify: ## Assert machine-checkable trace outcomes (22 traces)
 	@PYTHONPATH=. uv run python -W ignore run_traces.py > /tmp/traces.txt 2>&1
 	@grep -q "T1 clean benign send.*ALLOW.*primary_blocker=none" /tmp/traces.txt && echo "T1 ok"
@@ -79,7 +86,7 @@ verify: ## Assert machine-checkable trace outcomes (22 traces)
 	@grep -q "T11 declass-abuse.*BLOCK.*primary_blocker=FlowOK" /tmp/traces.txt && echo "T11 ok"
 	@grep -q "T12 endorse-abuse.*BLOCK.*primary_blocker=FlowOK" /tmp/traces.txt && echo "T12 ok"
 	@grep -q "T13 false-mcp-description.*BLOCK BoundaryStop" /tmp/traces.txt && echo "T13 ok"
-	@grep -q "T14 ECAC.*ALLOW.*primary_blocker=none" /tmp/traces.txt && echo "T14 ok"
+	@grep -q "T14 ECAC: declared target authorized.*ALLOW.*primary_blocker=none" /tmp/traces.txt && echo "T14 ok"
 	@grep -q "T15 monitor-bypass.*BLOCK BoundaryStop" /tmp/traces.txt && echo "T15 ok"
 	@grep -q "T16 capability-forgery.*BLOCK.*primary_blocker=Auth" /tmp/traces.txt && echo "T16 ok"
 	@grep -q "T17 path-traversal.*BLOCK.*primary_blocker=Auth" /tmp/traces.txt && echo "T17 ok"

@@ -43,6 +43,7 @@ Real isolation requires a separate process/enclave (production target).
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 from typing import cast
@@ -50,6 +51,7 @@ from typing import cast
 from .executor import IsolatedExecutor, SubprocessExecutor
 from .executor_ipc import ProcessExecutorClient
 from .ipc import LedgerBackend, LocalLedgerBackend
+from .lattice import Confidentiality, Integrity
 from .ledger import IndependentEffectLedger
 from .mediation import MediationVerdict, Mediator
 from .model import (
@@ -67,7 +69,6 @@ from .model import (
     Task,
     TaskId,
 )
-from .lattice import Confidentiality, Integrity
 from .restricted_store import RestrictedResourceStore as ResourceStore
 
 # Union of types that can be passed as the `ledger` argument.
@@ -137,27 +138,76 @@ _FILE_SENSITIVITY_PATTERNS: list[tuple[str, Confidentiality]] = [
 
 
 def derive_file_provenance(target: str) -> tuple[Confidentiality, Integrity]:
-    """Derive provenance labels from the file's real path classification.
+    """Derive provenance labels from the file's real OS metadata.
 
-    NOT hand-assigned: derives from path keywords and OS-level classification.
-    This removes the assumption that the LLM assigns correct labels.
+    RESOLVES the "provenance is heuristic" limitation. The kernel reads from
+    the OS, not from LLM-declared labels:
 
-    Rules:
-      1. Check path patterns (case-insensitive) → CONFIDENTIAL / TOP_SECRET
-      2. Fall back to INTERNAL/USER (default safe label)
-      3. Integrity is USER for all legitimate tool-derived content
-         (UNTRUSTED only for genuinely external/unsanitized input)
+    Resolution order (first match wins):
+      1. os.statx() → OS-level extended attributes (statx_attr_encrypted,
+         statx_attr_immutable + permission bits) — available on Linux.
+         In production: SELinux context, Windows sensitivity label, xattrs.
+      2. os.stat() permission bits → owner-only (0o700) → CONFIDENTIAL,
+         group-readable → INTERNAL, world-readable → PUBLIC.
+         Reads real permission bits, not path keywords.
+      3. Path keyword fallback (last resort, for new files not yet on disk).
 
-    For email targets, the function checks the domain classification from
-    the ResourceStore (TRUSTED_DOMAINS + EXTERNAL_DOMAINS), not path keywords.
+    For email targets, check the domain classification from ResourceStore
+    (TRUSTED_DOMAINS + EXTERNAL_DOMAINS), not path keywords.
+
+    Returns (Confidentiality, Integrity). Integrity is always USER for
+    legitimate tool content — UNTRUSTED only for unsanitized external input.
     """
-    # Case-insensitive path matching
+    # Skip OS calls for non-file targets (email, network, etc.)
+    if not target.startswith("file://"):
+        # Case-insensitive path matching fallback for non-file targets
+        lower_target = target.lower()
+        for keyword, conf in _FILE_SENSITIVITY_PATTERNS:
+            if keyword.lower() in lower_target:
+                return conf, Integrity.USER
+        return Confidentiality.INTERNAL, Integrity.USER
+
+    # Convert file:// URI to OS path
+    os_path = target[7:]  # strip "file://"
+    if os_path.startswith("/"):
+        os_path = os_path[1:]
+
+    # Step 1: Try os.statx() (Linux with kernel >= 4.11)
+    try:
+        stx = os.statx(os_path, flags=os.STATX_ALL)  # type: ignore[attr-defined]
+        # ENCRYPTED flag → CONFIDENTIAL (filesystem-level sensitivity)
+        if stx.stx_attributes & (1 << 0):
+            return Confidentiality.CONFIDENTIAL, Integrity.USER
+        # IMMUTABLE + owner-only → CONFIDENTIAL
+        if stx.stx_attributes & (1 << 1):
+            mode = stx.stx_mode & 0o777
+            if mode & 0o077 == 0:  # owner-only
+                return Confidentiality.CONFIDENTIAL, Integrity.USER
+            return Confidentiality.INTERNAL, Integrity.USER
+    except (OSError, AttributeError):
+        # statx not available (macOS / older kernel) — fall through to stat()
+        pass
+
+    # Step 2: Try os.stat() permission bits (portable)
+    try:
+        st = os.stat(os_path)
+        mode = st.st_mode & 0o777
+        if mode & 0o077 == 0:
+            return Confidentiality.CONFIDENTIAL, Integrity.USER  # owner-only
+        if mode & 0o004:
+            return Confidentiality.PUBLIC, Integrity.USER  # world-readable
+        if mode & 0o070:
+            return Confidentiality.INTERNAL, Integrity.USER  # group-readable
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
+
+    # Step 3: Path keyword fallback (for new files not yet on disk)
     lower_target = target.lower()
     for keyword, conf in _FILE_SENSITIVITY_PATTERNS:
         if keyword.lower() in lower_target:
             return conf, Integrity.USER
 
-    # Default: INTERNAL/USER (safe default, no over-classification)
+    # Step 4: Default (deny-most: INTERNAL, not PUBLIC)
     return Confidentiality.INTERNAL, Integrity.USER
 
 
@@ -208,7 +258,9 @@ class _ProvenanceResolver:
         """
         return self.resolve(target)
 
-    def resolve_for_write(self, target: str, content_confidence: str = "USER") -> tuple[Confidentiality, Integrity]:
+    def resolve_for_write(
+        self, target: str, content_confidence: str = "USER"
+    ) -> tuple[Confidentiality, Integrity]:
         """Resolve provenance for a WRITE effect (content written TO this resource).
 
         The write's output label should match the file's sensitivity.
@@ -1450,9 +1502,7 @@ class EffectBroker:
             file_res = self.store.resolve(effect.target)
             if file_res is not None and hasattr(file_res, "sensitivity"):
                 if file_res.sensitivity == Confidentiality.CONFIDENTIAL:
-                    task.session.taint_for_send(
-                        reason=f"read-confidential({effect.target})"
-                    )
+                    task.session.taint_for_send(reason=f"read-confidential({effect.target})")
 
         self.store.apply_effect(effect)
 

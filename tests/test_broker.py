@@ -13,7 +13,6 @@ from effect_broker.lattice import Confidentiality, Integrity
 from effect_broker.mediation import MediationVerdict, Mediator, ToolSpec
 from effect_broker.model import (
     AGENT,
-    ApprovedRequest,
     BROKER,
     USER,
     Capability,
@@ -26,7 +25,7 @@ from effect_broker.model import (
     LabelException,
     Task,
 )
-from effect_broker.ledger import LedgerVerdict, UnknownLedgerResult
+from effect_broker.ledger import UnknownLedgerResult
 from effect_broker.traces import build
 
 CHAIN = (USER, AGENT, BROKER)

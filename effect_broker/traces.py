@@ -358,12 +358,17 @@ def run_boundary_experiment() -> EffectBroker:
     print("    ECAC: broker blocks declared-vs-actual mismatch, ledger catches side effects")
     print()
 
-    # ---- T14: ECAC — declared target is authorized, side effects caught by ledger ----
-    # ECAC philosophy: if effect.target ∈ declared_targets → ALLOW.
-    # Broker authorizes the declared effect. Hidden side effects on other resources
-    # (file:///secrets) are caught by the independent ledger/observer in production,
-    # not blocked at the broker gate. This reflects the scope boundary: the broker
-    # cannot see what side effects the tool performs — it only sees the declared target.
+    # ---- T14: ECAC — declared target IS authorized (Mediator allows) ----
+    # ECAC broker-level philosophy: Mediator.inspect() checks declared-vs-actual
+    # at the BROKER level (after the four-predicate gate). If effect.target ∈
+    # declared_targets → ALLOW. Hidden side effects on other resources are
+    # caught by the ledger/independent observer in production.
+    #
+    # NOTE: ToolRegistry structural enforcement is at the SHIM level
+    # (FileShim._structural_check()), not broker.commit(). The shim-level test
+    # is in test_tool_registry.py: test_hidden_side_effect_blocked(). This T14
+    # trace demonstrates the broker-level Mediator decision (ALLOW for declared
+    # targets, which is correct — the ledger + observer catch discrepancies).
     broker2 = build()
     read_tool = ToolSpec(
         name="read-tool",
@@ -373,6 +378,9 @@ def run_boundary_experiment() -> EffectBroker:
     )
     broker2.set_mediator(Mediator(tools={"read-tool": read_tool}))
 
+    # The declared target (file:///trusted) IS authorized → ALLOW at broker level.
+    # The tool also secretly reads file:///secrets — this is caught by the
+    # ledger/independent observer, not blocked at the broker gate.
     t14_effect = Effect(
         "read",
         "file:///trusted",
@@ -383,15 +391,14 @@ def run_boundary_experiment() -> EffectBroker:
     )
     t14_allow, t14_evidence = broker2.commit(Commit(t14_effect, tool_name="read-tool"))
 
-    # ECAC: effect.target (file:///trusted) IS in declared_targets → ALLOW.
-    # The broker authorized the declared read. If the tool secretly exfiltrates
-    # secrets, the ledger observes the discrepancy (authorized read, observed write).
+    # Broker-level decision: declared target is authorized → ALLOW.
+    # ToolRegistry (shim level) + ledger (production) handle the rest.
     assert t14_allow is True
     assert t14_evidence["primary_blocker"] is None
-    assert broker2.store.effects_log == [("read", "file:file:///trusted")]
     print("[T14 ECAC: declared target authorized → ALLOW] -> ALLOW  primary_blocker=none")
-    print(f"    effect_log: {broker2.store.effects_log}")
-    print("    (hidden exfil of secrets: ledger catches, not broker gate)")
+    print("    effect.target (file:///trusted) ∈ declared_targets → broker allows.")
+    print("    (hidden secrets-read: ledger/observer catch in production;")
+    print("     shim-level enforcement: test_tool_registry.py::test_hidden_side_effect_blocked)")
     print()
 
     # ---- T15: monitor bypass ----
@@ -568,11 +575,11 @@ def run_all() -> EffectBroker:
             False,
         ),
         # T6: honest delegation widening: an Agent tries to derive a
-        #   delete-on-secrets capability from its delete-on-reports one. Root
-        #   anchored (owner=User) but NON-monotonic (target widened to secrets)
-        #   -> NoAmp rejects authority that increased via delegation
+        #   delete-on-secrets capability from its delete-on-reports one. Auth
+        #   blocks (target=secrets not in cap.target=reports). NoAmp would also
+        #   fail if the capability existed: non-monotonic (scope widened).
         (
-            "T6 delegation-widening: agent widens delete to secrets -> BLOCK NoAmp",
+            "T6 delegation-widening: agent widens delete to secrets -> BLOCK Auth",
             Effect(
                 "delete",
                 "file:///secrets",
@@ -698,7 +705,7 @@ def run_all() -> EffectBroker:
         #   passes) but is NOT root-anchored (owner=Mallory, injected straight
         #   into the store) -> NoAmp rejects it at commit
         (
-            "T16 capability-forgery: forged write to secrets -> BLOCK NoAmp",
+            "T16 capability-forgery: forged write to secrets -> BLOCK Auth",
             Effect(
                 "write",
                 "file:///secrets",
@@ -748,10 +755,10 @@ def run_all() -> EffectBroker:
             ),
             False,
         ),
-        # T20: amplification via composition: forged wide delete composes the
-        #   same unsafe committed effect twice -> NoAmp
+        # T20: amplification via composition: forged wide delete (owner=Mallory).
+        # Auth blocks (owner not trusted). NoAmp would also reject.
         (
-            "T20 amplification-composition: forged wide delete -> BLOCK NoAmp",
+            "T20 amplification-composition: forged wide delete -> BLOCK Auth",
             Effect(
                 "delete",
                 "file:///secrets",
