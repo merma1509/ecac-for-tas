@@ -160,7 +160,7 @@ tests/
                    │    → executor.execute()                        │
                    │    → broker.gate() → apply_effect()            │
                    │                                                │
-                   │  PATH B: tool shim callers (TCOBB)             │
+                   │  PATH B: tool shim callers (TCOBB — multi-process)   │
                    │    RealFileShim.write(path, content)           │
                    │    RealEmailShim.send(sender, rcpt, body)      │
                    │    → derives effect from REAL OS/SMTP state    │
@@ -169,13 +169,17 @@ tests/
                    └────────────────────────────────────────────────┘
 ```
 
-**Key property — TCOBB (The Only Code That Can Bypass):**
+**Key property — TCOBB (The Only Code That Can Bypass, multi-process mode only):**
 `RealFileShim` and `RealEmailShim` are the **only** code that calls `open()`,
 `os.write()`, `smtplib`, and `imaplib`. The tool never touches these directly.
 The shim derives effects from **real OS / SMTP / IMAP state** (not from tool
 declarations), so the tool cannot forge outcomes.
 
-**BCC detection (RealEmailShim):**
+> **Same-process mode caveat:** In `mode="same-process"`, the broker holds a
+> direct reference to `RestrictedResourceStore`. Direct mutation via
+> `broker.store._files._data[key] = X` bypasses the shim entirely. The ledger
+> detects this as `UNKNOWN` (never "safe"). Production deployments MUST use
+> `mode="multi-process"`. See "Honest limitations" below.
 
 ```bash
 1. RSET-only SMTP probe → RCPT TO for every declared recipient
@@ -264,16 +268,23 @@ at the broker→tool boundary.
 
 ## Findings
 
+> **TL;DR:** The invariant is machine-checkable. The multi-process mode achieves
+> genuine TCOBB and true isolation. Same-process mode is a development prototype
+> where direct store mutation is possible (ledger returns `UNKNOWN`, not `safe`).
+> Production deployments MUST use `mode="multi-process"`.
+
 - **The invariant is expressible and machine-checkable.** Per-predicate evidence
-  (including `primary_blocker`) is produced for every commit.
+  (including `primary_blocker`) is produced for every commit decision.
 - **Single mutation path (ADR-003).** `IsolatedExecutor.apply_effect()` is the sole
   call site for `_apply_effect()`. Both `broker.commit()` callers and shim callers
   (Path A / Path B) unify in `executor.execute()`. The ledger observes the complete
   lifecycle through one execution path.
-- **TCOBB — The Only Code That Can Bypass.** `RealFileShim` and `RealEmailShim`
-  are the only code that calls `open()`, `os.write()`, `smtplib`, `imaplib`. The
-  tool never touches these directly. Effects are derived from **real OS/SMTP state**,
-  not from tool declarations, so the tool cannot forge outcomes.
+- **TCOBB — The Only Code That Can Bypass (multi-process mode).** In `mode="multi-process"`,
+  `RealFileShim` and `RealEmailShim` are the only code that calls `open()`, `os.write()`,
+  `smtplib`, and `imaplib`. The tool never touches these directly. Effects are derived
+  from **real OS/SMTP state**, so the tool cannot forge outcomes. In `mode="same-process"`,
+  direct store mutation is possible — the ledger returns `UNKNOWN`, not `safe`. See
+  "Honest limitations" below.
 - **Real SMTP BCC detection.** `RealEmailShim._parse_bcc_from_smtp()` opens a real
   SMTP connection, calls `RCPT TO` for every declared recipient, reads the per-recipient
   SMTP responses, then issues `RSET` to abort the transaction (no message queued).
@@ -296,45 +307,37 @@ at the broker→tool boundary.
   `Fresh` replay.
 - **BCC scope enforcement.** `check_noamp()` verifies that every BCC/CC
   recipient's domain label is contained in the capability's scope. A grant
-
   for `internal@corp.com` does not authorize BCC to `attacker@evil.com` unless
   `additional_targets` explicitly includes it.
 
-## Comparative evaluation: M1 vs M2 vs M3
+## Comparative evaluation (M1/M2/M3) — limitations
 
-All three modes evaluated on T1–T20 + R1 (run `uv run python eval_comparison.py`):
+`eval_comparison.py` runs a comparative evaluation of ECAC against tool-call
+allowlisting (M1) and argument-provenance checking (M2). The comparison has
+important limitations that the README's original table overstated:
 
-| Mode | Mechanism                        | Blocks            | Catch rate |
-| ---- | -------------------------------- | ----------------- | ---------- |
-| M1   | tool-call allowlist              | 0/21              | 0%         |
-| M2   | argument provenance (PACT-style) | 1/21              | 5%         |
-| M3   | ECAC effect-complete gate        | **18/18 attacks** | **100%**   |
+| Mode | Mechanism                        | What it evaluates                           |
+| ---- | -------------------------------- | ------------------------------------------- |
+| M1   | tool-call allowlist              | Stub checker (mode1_tool_call.py)           |
+| M2   | argument provenance (PACT-style) | Stub checker (mode2_argument_provenance.py) |
+| M3   | ECAC effect-complete gate        | Full broker (same-process mode)             |
 
-M3 catches **17 attacks that M1 and M2 miss entirely**, including:
+- **M1/M2 stubs are not production implementations.** Both are minimal stub
+  checkers in `effect_broker/modes/`. They demonstrate the architectural
+  distinction (tool-level vs effect-level enforcement) but are not peer systems.
+- **M3 runs in same-process mode.** The 22 trace tests and `eval_comparison.py`
+  all use `EffectBroker(mode="same-process")`. This means direct store mutation
+  is possible — TCOBB does not fully hold. Production deployments require
+  `mode="multi-process"`.
+- **18/18 vs 0/21 vs 1/21 catch rates are not peer-reviewed.** These numbers
+  reflect the same-process model and stub comparators. They are evidence for
+  design, not a validated security evaluation. See "298 tests ≠ real confinement"
+  in Honest limitations.
 
-- **Capability laundering** (T5): M1/M2 allow because the tool name is on the
-  allowlist; M3 blocks because FlowOK detects the capability was derived from an
-  untrusted source.
-- **Confidential-data leakage** (T7): M1/M2 allow because arguments are locally
-  sound; M3 blocks because FlowOK detects the confidentiality violation from a
-  trusted source to an external sink.
-- **Stale approval / replay** (T9, T10, R1): M1/M2 cannot detect temporal misuse;
-  M3 blocks because `Fresh` checks commit-time validity.
-- **Declass/endorse abuse** (T11, T12): M1/M2 cannot verify the exception was
-  broker-granted; M3 blocks because the broker records and validates every grant.
-- **BCC recipient spoofing** (T18): M1/M2 allow because the primary recipient is
-  valid; M3 blocks because FlowOK checks all `additional_targets` including BCC/CC.
-- **Amplification via composition** (T20): M1/M2 allow because individual steps
-  are valid; M3 blocks because NoAmp verifies the entire delegation chain is
-  monotonic.
-- **Capability forgery** (T16): M1/M2 allow because forged capabilities match
-  right+target; M3 blocks because NoAmp verifies `owner = "User"`.
-- **BCC scope bypass**: M1/M2 allow because the primary To address is valid; M3
-  blocks BCC to `attacker@evil.com` via RSET-only SMTP probe (kill-criterion).
-
-**M3 allows what M1/M2 also allow:** T1 (benign read), T14 (hidden side effect on
-declared target — ECAC philosophy: broker authorizes declared target, ledger
-catches undisclosed side effects in production).
+The qualitative distinctions (capability laundering, confidential-data leakage,
+stale/replay, BCC scope) are architecturally sound and tested by the trace
+suite in the same-process model. `eval_comparison.py` demonstrates the approach
+but is not a peer-reviewed security evaluation.
 
 ## Honest limitations
 
