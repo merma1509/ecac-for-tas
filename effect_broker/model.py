@@ -75,7 +75,7 @@ class CommitGateResult:
 
 @dataclass
 class Session:
-    """A task's logical clock and per-task revocation/replay state.
+    """A task's logical clock and per-task revocation/replay state + taint tracking.
 
     FIXED: Session.live=False now BLOCKs all commits in check_fresh().
     Closing a session explicitly revokes the task's authority ceiling.
@@ -84,10 +84,26 @@ class Session:
     is terminal: the task's authority ceiling is invalidated until explicitly
     re-registered with a new session by the broker (not by directly setting live).
 
-    NOTE: `live` is a property wrapping a private _live field. Direct assignment
-    (task.session.live = False) goes through the setter, which enforces the
-    terminal-closure invariant. The _ever_closed flag is per-instance state that
-    persists once the session has been closed.
+    TAINT TRACKING (for inter-effect composition):
+      A session becomes "tainted" when it reads CONFIDENTIAL data. A tainted
+      session can still send emails, but ONLY with an explicit broker-recorded
+      declass exception — FlowOK blocks the send with "session-taint" reason.
+      This prevents the read-secrets→send-attack without requiring taint
+      tracking on data VALUES (which needs language-level support).
+
+      The taint is session-scoped: it applies to ALL sends within the session,
+      even from different effects. This is a conservative design — it may
+      require explicit declass for legitimate workflows where a task reads
+      confidential data and then sends a related email (e.g. HR tool reads
+      payroll file and emails the summary to the employee).
+
+      To lift taint for a legitimate workflow, the broker must record a
+      declass exception via grant_label_exception() BEFORE the send commit.
+      The declass must specify the complete target set (no partial declass).
+
+      FlowOK now checks both:
+        1. Provenance labels (per-effect, as before)
+        2. Session taint (cross-effect, new)
     """
 
     session_id: str
@@ -98,6 +114,12 @@ class Session:
     # Private state
     _live: bool = True
     _ever_closed: bool = field(default=False, repr=False)
+
+    # Taint tracking: session-level taint from reading CONFIDENTIAL data.
+    # Set when a read effect reads a CONFIDENTIAL file. Cleared only when
+    # an explicit declass exception is recorded by the broker (not by LLM).
+    _tainted: bool = field(default=False, repr=False)
+    _taint_reason: str = field(default="", repr=False)  # human-readable reason
 
     @property
     def live(self) -> bool:
@@ -118,6 +140,26 @@ class Session:
         self._live = value
         if value is False:
             self._ever_closed = True
+
+    @property
+    def tainted(self) -> bool:
+        """True if this session has read CONFIDENTIAL data without declass."""
+        return self._tainted
+
+    def taint_for_send(self, reason: str = "") -> None:
+        """Mark the session as tainted (confidential data was read).
+
+        After taint, any send effect is blocked by FlowOK unless a broker-recorded
+        declass exception exists. The reason describes what was read.
+        """
+        self._tainted = True
+        if reason:
+            self._taint_reason = reason
+
+    def clear_taint(self) -> None:
+        """Clear taint (only after broker records a declass exception)."""
+        self._tainted = False
+        self._taint_reason = ""
 
 
 @dataclass(frozen=True)
@@ -309,6 +351,8 @@ class LabelException:
                           primary target. An empty set means no extra targets.
     - etype:             operation type this applies to ("*" = any). If None, the
                           exception applies to any etype.
+    - task_id:           task this exception is scoped to. If None, valid in any task.
+                          For session-taint clearing, this must match the current task.
     """
 
     kind: str  # "declass" | "endorse"
@@ -319,6 +363,7 @@ class LabelException:
     nonce: str
     additional_targets: frozenset[str] = frozenset()  # extra targets (BCC, etc.)
     etype: str | None = None  # operation type, or None for any
+    task_id: TaskId | None = None  # task scope; None = any task
 
     def matches_effect(self, effect: Effect) -> bool:
         """True if this exception applies to the given effect.
@@ -350,6 +395,12 @@ class LabelException:
         effect_targets = effect.complete_targets()
         if not (effect_targets <= authorized_targets):
             return False
+
+        # Task scope check: if task_id is set, it must match
+        if self.task_id is not None:
+            effect_task_id = effect.task_id or "default"
+            if effect_task_id != self.task_id:
+                return False
 
         return True
 

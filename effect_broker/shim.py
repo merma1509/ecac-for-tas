@@ -40,6 +40,7 @@ from .executor import IsolatedExecutor
 
 if TYPE_CHECKING:
     from .broker import EffectBroker
+    from .tool_registry import ToolRegistry
 
 T = TypeVar("T")
 
@@ -83,13 +84,22 @@ class FileShim:
     In a real isolated deployment: the ONLY path from tool code to external state.
     In this same-process model: the structured path with accidental-bypass prevention.
 
+    Structural enforcement (ToolRegistry):
+      Every tool MUST declare its capabilities upfront via ToolDeclaration.
+      Before building an Effect, the shim checks:
+        - operation (right) ∈ declared_rights
+        - target ∈ declared_targets
+        - extra targets ∈ declared_targets
+      If not → SecurityError BEFORE the Effect is built → no ledger entry.
+
     For each call, the shim:
-      1. Derives the EXACT effect from real state (not the tool's declaration)
+      1. Structural check: operation + target ∈ tool's declared capabilities
+      2. Derives the EXACT effect from real state (not the tool's declaration)
          — including ALL extra_resources in known_targets
-      2. Submits it to the broker gate via IsolatedExecutor.execute()
-      3. The executor's EffectObserver records authorized vs. observed effects
-      4. Raises SecurityError if broker BLOCKs
-      5. On ALLOW: store.apply_effect() handles ALL targets (primary + extra)
+      3. Submits it to the broker gate via IsolatedExecutor.execute()
+      4. The executor's EffectObserver records authorized vs. observed effects
+      5. Raises SecurityError if broker BLOCKs
+      6. On ALLOW: store.apply_effect() handles ALL targets (primary + extra)
 
     NOTE: In the same-process model, direct store mutation is still theoretically
     possible (store._files._data[...] = X). The read-only dict proxies prevent
@@ -106,11 +116,16 @@ class FileShim:
         broker: EffectBroker,
         task_id: str = "default",
         tool_name: str = "untrusted-tool",
+        registry: ToolRegistry | None = None,
     ) -> None:
         self.broker = broker
         self.task_id = task_id
         self.tool_name = tool_name
         self.op_log: list[ShimOp] = []
+        # Structural enforcement: tool capability declarations
+        # If registry is set, the shim checks each operation against the
+        # tool's declared rights/targets BEFORE building the Effect.
+        self._registry = registry
 
         # IsolatedExecutor
         # All mutations go through executor.execute() — the single mutation path.
@@ -120,23 +135,61 @@ class FileShim:
             task_id=task_id,
         )
 
+    def _set_registry(self, registry: ToolRegistry) -> None:
+        """Attach a ToolRegistry for structural enforcement (T13/T14)."""
+        self._registry = registry
+
     # ---- public shim API (untrusted tool calls these) ----
+    def _structural_check(
+        self, operation: str, target: str, extra: frozenset[str] = frozenset()
+    ) -> None:
+        """Structural enforcement: operation must be in tool's declared capabilities.
+
+        Called at the START of each shim operation, BEFORE the Effect is built.
+        This prevents undeclared operations from even reaching the broker gate.
+
+        If registry is None: permissive mode (unknown tools allowed).
+        If strict=True in registry: unknown tools raise SecurityError.
+        """
+        if self._registry is None:
+            return  # permissive mode: no structural check
+        ok, reason = self._registry.check_operation_by_name(
+            self.tool_name, operation, target, extra
+        )
+        if not ok:
+            raise SecurityError(f"[{self.tool_name}] structural-blocked: {reason}")
+
     def read(self, path: str) -> str:
-        """Read a file. The shim derives the read effect and submits to broker."""
+        """Read a file. The shim derives the read effect and submits to broker.
+
+        Structural check: operation "read" must be in tool's declared rights
+        and target must be in declared_targets.
+        """
+        self._structural_check("read", path)
         return self._commit_op(
             ShimOp(operation="read", resource=path, tool_name=self.tool_name),
             action=lambda: self._do_read(path),
         )
 
     def write(self, path: str, content: bytes) -> None:
-        """Write a file. The shim submits the write effect to the broker."""
+        """Write a file. The shim submits the write effect to the broker.
+
+        Structural check: operation "write" must be in tool's declared rights
+        and target must be in declared_targets (T14: prevents hidden write).
+        """
+        self._structural_check("write", path)
         self._commit_op(
             ShimOp(operation="write", resource=path, tool_name=self.tool_name),
             action=lambda: self._do_write(path, content),
         )
 
     def delete(self, path: str) -> None:
-        """Delete a file."""
+        """Delete a file.
+
+        Structural check: operation "delete" must be in tool's declared rights
+        and target must be in declared_targets.
+        """
+        self._structural_check("delete", path)
         self._commit_op(
             ShimOp(operation="delete", resource=path, tool_name=self.tool_name),
             action=lambda: self._do_delete(path),
@@ -148,8 +201,12 @@ class FileShim:
         ALL recipients are included in the Effect's known_targets.
         The broker validates the complete set {recipient} ∪ {extra_recipients}.
         BCC delivery only happens through store.apply_effect() — not in _do_send.
+
+        Structural check: operation "send" must be in tool's declared rights
+        and all targets (primary + BCC) must be in declared_targets.
         """
         extra = frozenset(extra_recipients.values())
+        self._structural_check("send", recipient, extra)
         self._commit_op(
             ShimOp(
                 operation="send",
@@ -272,20 +329,40 @@ class FileShim:
         target: str,
         extra: frozenset[str] = frozenset(),
     ) -> str:
-        """Find a capability covering (right, target) for the tool's holder.
+        """Find a capability covering (right, target) and return its ACTUAL nonce.
 
-        The returned nonce includes BCC targets so each complete target set
-        gets a separate observer entry (different from another send with
-        the same primary but different BCC recipients).
+        Lookup priority:
+          1. Exact (right, target) match
+          2. Wildcard: capability with target="*" covers any target
+          3. Domain-level: for email targets, find capability whose target
+             is a domain pattern or "*" covering the same domain label
+
+        The returned nonce is the actual registered nonce in broker.capabilities.
+        This nonce must exist in broker.capabilities for Auth to succeed.
+
+        BCC extras are validated by NoAmp's extra-target check, NOT by
+        nonce differentiation. The capability nonce identifies the CAPABILITY,
+        not the specific BCC variant.
         """
-        holder = self.tool_name
-        for _nonce, cap in self.broker.capabilities.items():
-            if cap.holder == holder and cap.right == right and cap.target == target:
-                return self._derive_nonce(right, target, extra)
-        # Try broker-level capability
-        for _nonce, cap in self.broker.capabilities.items():
+        # Primary: exact (holder, right, target) match
+        for nonce, cap in self.broker.capabilities.items():
+            if cap.holder == self.tool_name and cap.right == right and cap.target == target:
+                return nonce
+        # Fallback: EffectBroker holder (shim acts as broker for tool)
+        for nonce, cap in self.broker.capabilities.items():
             if cap.holder == "EffectBroker" and cap.right == right and cap.target == target:
-                return self._derive_nonce(right, target, extra)
+                return nonce
+        # Wildcard match: capability with target="*" covers any target
+        for nonce, cap in self.broker.capabilities.items():
+            if cap.holder == self.tool_name and cap.right == right and cap.target == "*":
+                return nonce
+        for nonce, cap in self.broker.capabilities.items():
+            if cap.holder == "EffectBroker" and cap.right == right and cap.target == "*":
+                return nonce
+        # Last resort: any capability with matching (right, target)
+        for nonce, cap in self.broker.capabilities.items():
+            if cap.right == right and cap.target == target:
+                return nonce
         return f"no-cap-{right}-{target}"
 
     def _do_read(self, path: str) -> str:

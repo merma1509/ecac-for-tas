@@ -803,7 +803,7 @@ def run_all() -> EffectBroker:
     print("effects_log (actual side effects committed by the broker, final broker):")
     for entry in broker.store.effects_log:  # type: ignore[assignment]
         print(f"    {entry[0]} -> {entry[1]}")
-    print("remaining files (final broker):", {path for path in broker.store.files})
+    print("remaining files (final broker):", set(broker.store.files))
     print()
 
     # ---- risk-model escalation -> Approver -> fresh ONE-SHOT capability ----

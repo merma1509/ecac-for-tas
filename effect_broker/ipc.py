@@ -605,15 +605,23 @@ class LedgerProcessHandle:
         import sys
         import time
 
-        ecac_root = Path(__file__).parent
-        script = ecac_root / "ledger_process.py"
+        # Use -m to run as a module so effect_broker imports resolve correctly.
+        # Change to the package root so -m resolves effect_broker as a package.
+        ecac_root = Path(__file__).parent.parent  # project root (contains effect_broker/)
         if self._socket_path.exists():
             self._socket_path.unlink()
         self._proc = subprocess.Popen(
-            [sys.executable, str(script), "--socket", str(self._socket_path)],
+            [
+                sys.executable,
+                "-m",
+                "effect_broker.ledger_process",
+                "--socket",
+                str(self._socket_path),
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            cwd=str(ecac_root),
         )
         # Wait for socket file to appear (proves bind() succeeded).
         # After the file exists, wait 500ms for the accept loop to fully start.

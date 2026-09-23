@@ -47,7 +47,7 @@ format: ## Auto-format effect_broker in place with ruff
 typecheck: ## Type-check effect_broker with mypy (strict)
 	uv run mypy effect_broker/
 
-## Run the full pytest suite (225 tests, 16 files)
+## Run the full pytest suite (all test files)
 test: ## Run the full pytest suite (all test files)
 	PYTHONPATH=. uv run pytest tests/
 
