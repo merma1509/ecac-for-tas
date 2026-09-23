@@ -185,17 +185,28 @@ ATTACK_COVERAGE: dict[str, tuple[str, str]] = {
 }
 
 """
-T14 note: The four-predicate gate alone does NOT prevent T14 (hidden side effect).
-This is because the tool declares "read" on file:///reports, the effect is "write"
-on the same target — the capability covers "write", the derivation is valid,
-the flow is valid, the scope covers the target, the nonce is fresh.
+T13: Tool declares one target, accesses a different one (false MCP description).
+  Addressed by: ToolRegistry._structural_check — operation must match declared rights.
+  Even if the tool claims "read only", the shim enforces that "write" is blocked.
 
-T14 requires STRUCTURAL enforcement (ToolRegistry): the tool must declare
-its capabilities upfront, and any undeclared operation raises SecurityError
-before the Effect is built.
+T14: Tool declares read(file:///reports), secretly writes(file:///reports) as side effect.
+  Addressed by: ToolRegistry._structural_check — operation "write" must be in declared rights.
+  Before: tool builds Effect with etype="write" on a target declared as "read-only" →
+  ToolRegistry raises SecurityError BEFORE the Effect is built → no ledger entry.
 
-Architecture: ToolRegistry (structural) + Four-predicate gate (semantic)
-  = Complete enforcement against T13 and T14.
+  Architecture: ToolRegistry (structural enforcement BEFORE Effect construction)
+  + IndependentEffectLedger (verifies post-commit that effect_log matches op_log).
+  = Complete enforcement against T14: prevents undeclared writes, detects any that slip through.
+
+T15: Monitoring/audit tool tries to bypass the mediation point.
+  Addressed by: IsolatedExecutor (sole mutation path) — ALL effects, even from "audit" tools,
+  must go through executor.execute(). A tool that claims to be an "audit tool" still
+  cannot bypass the executor. Policy: a tool that is registered as an audit tool
+  has restricted scope, and NoAmp's ceiling check limits its targets.
+
+  Remaining: if an adversarial tool somehow achieves process-level code execution,
+  it could bypass the shim. This is the SAME-PROCESS LIMITATION — addressed by
+  deploying in an isolated process/enclave.
 """
 
 
@@ -224,20 +235,31 @@ LIMITATIONS OF THIS PROOF SKETCH:
    UnknownObserverResult — this is "unknown, not safe" by design, but it means
    complete mediation cannot be formally verified without process isolation.
 
-5. TOOL-DECLARED CAPABILITIES: ToolRegistry enforces structural constraints
-   based on tool self-declarations. If a tool lies about its capabilities,
-   ToolRegistry is bypassed. In production, tool declarations should come from
-   a trusted manifest (MCP tool schema), not from tool self-description.
+5. TOOL-DECLARED CAPABILITIES: ToolRegistry enforces structural constraints.
+   In production, tool declarations must come from a trusted manifest (e.g. MCP
+   tool schema verified by system administrator), NOT from tool self-description.
+   The broker's `_find_capability()` still uses metadata-based capability lookup
+   (ToolRegistry adds structural enforcement on top, not in place of it).
 
 6. HOLD-OUT EVALUATION: The 20 trace attacks in eval_comparison.py were
    designed with knowledge of the implementation. A proper held-out evaluation
    (evaluation.py) requires traces designed by an independent evaluation team
    with NO knowledge of the current implementation.
 
-7. FORMAL PROOF: This is a sketch, not a machine-checked proof (Coq/Isabelle).
-   The argument structure is sound, but there may be gaps in the reasoning.
-   A machine-checked proof would require formalizing the lattice, capability
-   derivation, and effect model in a proof assistant.
+7. FORMAL PROOF: This is a structured sketch, not a machine-checked proof.
+   TLA+ spec (proof.py → TLA+ directory) provides a more formal basis for
+   refinement proofs. Coq/Isabelle formalization deferred (significant effort
+   for marginal additional assurance at this stage).
+
+8. CROSS-TASK COMPOSITION: Session Taint prevents intra-task composition attacks
+   (read-secrets→send-internal). Cross-task composition (effect in Task A flows
+   into Task B) is NOT tracked — requires task-level isolation beyond process
+   isolation. Deferred.
+
+9. PROVENANCE: Labels are derived from path patterns (simulating OS metadata).
+   Real provenance would require integration with language-level taint tracking
+   (PACT/CaMeL) or OS-level file metadata (SELinux contexts, Windows labels).
+   Current derivation is traceable and auditable, but not from a real system.
 """
 
 

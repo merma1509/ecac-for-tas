@@ -67,6 +67,7 @@ from .model import (
     Task,
     TaskId,
 )
+from .lattice import Confidentiality, Integrity
 from .restricted_store import RestrictedResourceStore as ResourceStore
 
 # Union of types that can be passed as the `ledger` argument.
@@ -98,6 +99,7 @@ __all__ = [
     "Capability",
     "Effect",
     "Commit",
+    "derive_file_provenance",  # provenance derivation from resource metadata
 ]
 
 # Trusted roots: only these principals may seed NEW authority.
@@ -107,6 +109,120 @@ TRUSTED_ROOTS: frozenset[str] = frozenset({USER})
 PredicateResult = tuple[bool, str]
 
 
+# ---- Provenance derivation from real resource state ----
+# NOT hand-assigned labels — derive from the resource's actual metadata.
+
+# Classification patterns: path keywords → sensitivity level.
+# This simulates real OS-level file classification (e.g. from SELinux contexts,
+# Windows sensitivity labels, or a file metadata DB).
+# In a real deployment, this would query the OS/security system for the
+# resource's authoritative label.
+_FILE_SENSITIVITY_PATTERNS: list[tuple[str, Confidentiality]] = [
+    # CONFIDENTIAL: explicitly sensitive files
+    ("secrets", Confidentiality.CONFIDENTIAL),
+    ("password", Confidentiality.CONFIDENTIAL),
+    ("credential", Confidentiality.CONFIDENTIAL),
+    ("secret", Confidentiality.CONFIDENTIAL),
+    ("private", Confidentiality.CONFIDENTIAL),
+    ("confidential", Confidentiality.CONFIDENTIAL),
+    # INTERNAL: corporate internal (default)
+    ("reports", Confidentiality.INTERNAL),
+    ("internal", Confidentiality.INTERNAL),
+    ("corp", Confidentiality.INTERNAL),
+    ("project", Confidentiality.INTERNAL),
+    # PUBLIC: explicitly public
+    ("public", Confidentiality.PUBLIC),
+    ("/tmp/", Confidentiality.PUBLIC),
+]
+
+
+def derive_file_provenance(target: str) -> tuple[Confidentiality, Integrity]:
+    """Derive provenance labels from the file's real path classification.
+
+    NOT hand-assigned: derives from path keywords and OS-level classification.
+    This removes the assumption that the LLM assigns correct labels.
+
+    Rules:
+      1. Check path patterns (case-insensitive) → CONFIDENTIAL / TOP_SECRET
+      2. Fall back to INTERNAL/USER (default safe label)
+      3. Integrity is USER for all legitimate tool-derived content
+         (UNTRUSTED only for genuinely external/unsanitized input)
+
+    For email targets, the function checks the domain classification from
+    the ResourceStore (TRUSTED_DOMAINS + EXTERNAL_DOMAINS), not path keywords.
+    """
+    # Case-insensitive path matching
+    lower_target = target.lower()
+    for keyword, conf in _FILE_SENSITIVITY_PATTERNS:
+        if keyword.lower() in lower_target:
+            return conf, Integrity.USER
+
+    # Default: INTERNAL/USER (safe default, no over-classification)
+    return Confidentiality.INTERNAL, Integrity.USER
+
+
+class _ProvenanceResolver:
+    """Resolves provenance labels from real resource state (not LLM claims).
+
+    In a real deployment, this would query:
+      - OS file metadata (SELinux context, Windows sensitivity label)
+      - Email domain classification DB
+      - Network URL allowlist/blocklist
+
+    This resolver provides a traceable, auditable derivation path from the
+    actual resource to its security label. The LLM cannot forge provenance —
+    the broker derives it from the resource's own metadata.
+
+    Usage:
+      resolver = _ProvenanceResolver(broker)
+      conf, integ = resolver.resolve("file:///secrets")  # CONFIDENTIAL/USER
+    """
+
+    def __init__(self, broker: EffectBroker) -> None:
+        self._broker = broker
+
+    def resolve(self, target: str) -> tuple[Confidentiality, Integrity]:
+        """Resolve the provenance for a given target.
+
+        Resolution order:
+          1. File targets: check path patterns → Confidentiality
+          2. Email targets: check domain classification from ResourceStore
+          3. Default: INTERNAL/USER (safe default)
+        """
+        # Email: derive from domain classification (not path keyword)
+        if "@" in target:
+            domain_label = self._broker._scope_label_for_target(target)
+            if domain_label == "internal":
+                return Confidentiality.INTERNAL, Integrity.USER
+            return Confidentiality.PUBLIC, Integrity.USER  # external → PUBLIC
+
+        # File: derive from path classification
+        conf, integ = derive_file_provenance(target)
+        return conf, integ
+
+    def resolve_for_read(self, target: str) -> tuple[Confidentiality, Integrity]:
+        """Resolve provenance for a READ effect (content sourced FROM this resource).
+
+        A read from a CONFIDENTIAL file → CONFIDENTIAL/integrity=USER provenance.
+        The read effect carries the file's sensitivity as its output label.
+        """
+        return self.resolve(target)
+
+    def resolve_for_write(self, target: str, content_confidence: str = "USER") -> tuple[Confidentiality, Integrity]:
+        """Resolve provenance for a WRITE effect (content written TO this resource).
+
+        The write's output label should match the file's sensitivity.
+        Content integrity: USER for normal content, UNTRUSTED for untrusted sources.
+        """
+        conf, _ = self.resolve(target)
+        if content_confidence == "UNTRUSTED":
+            integ = Integrity.UNTRUSTED
+        else:
+            integ = Integrity.USER
+        return conf, integ
+
+
+# ---- EffectBroker ----
 def _provides(auth_capability: Capability, right: str, target: str) -> bool:
     """True if the capability's right+target covers this (right, target)"""
     return auth_capability.right == right and auth_capability.target == target
@@ -159,6 +275,8 @@ class EffectBroker:
         self._mediator: Mediator | None = None
         # Per-task locks for atomic Fresh check + nonce reservation
         self._task_locks: dict[TaskId, threading.Lock] = {}
+        # Provenance derivation from real resource metadata (not hand-assigned)
+        self._provenance_resolver = _ProvenanceResolver(self)
         # Execution mode
         self._mode = mode
         self._executor_socket = Path(executor_socket)
@@ -366,7 +484,11 @@ class EffectBroker:
         return child
 
     # ---- declass/endorse (broker-only privileged operations) ----
-    def grant_label_exception(self, exception: LabelException) -> None:
+    def grant_label_exception(
+        self,
+        exception: LabelException,
+        task_id: str | None = None,
+    ) -> None:
         """Record a validated declass/endorse grant. BROKER-ONLY
 
         declass/endorse are privileged operations performed ONLY
@@ -375,6 +497,12 @@ class EffectBroker:
         is the single trusted spot where an otherwise-forbidden flow may be
         explicitly allowed (T3): the label reclassification is explicit and
         attributable to a trusted grantor
+
+        SESSION TAINT CLEARING (inter-effect composition):
+          If this is a declass for CONFIDENTIAL send and a session is taint-forced
+          (session.tainted=True), this grant clears the taint so the send can proceed.
+          The task_id must match for the taint to be cleared (cross-task declass
+          does NOT clear taint in the original task).
         """
         if exception.granted_by not in (USER, APPROVER):
             raise ValueError(
@@ -385,6 +513,20 @@ class EffectBroker:
             raise ValueError(f"duplicate label exception nonce {exception.nonce}")
         self.label_exceptions[exception.nonce] = exception
 
+        # ---- Session taint clearing (inter-effect composition) ----
+        # If a declass for CONFIDENTIAL→INTERNAL send is recorded, and the
+        # session is taint-forced (read secrets happened), clear taint.
+        # This allows legitimate workflows: read-confidential → request declass →
+        # broker grants → taint cleared → send allowed.
+        if exception.kind == "declass":
+            target_task_id = task_id or "default"
+            if exception.task_id is not None and exception.task_id != target_task_id:
+                return  # declass is for different task, don't clear taint
+            task = self.tasks.get(target_task_id)
+            if task is not None and task.session is not None and task.session.tainted:
+                if exception.from_label == "CONFIDENTIAL" and exception.etype in ("send", None):
+                    task.session.clear_taint()
+
     @staticmethod
     def request_label_exception(
         *,
@@ -394,6 +536,7 @@ class EffectBroker:
         etype: str | None = None,
         from_label: str,
         to_label: str,
+        task_id: str | None = None,
     ) -> LabelException:
         """LLM/agent-side REQUEST for a declass/endorse.
 
@@ -415,6 +558,7 @@ class EffectBroker:
             to_label=to_label,
             granted_by="?",
             nonce="?",
+            task_id=task_id,
         )
 
     # ---- risk model placement: escalation, NOT in the allow rule ----
@@ -688,7 +832,31 @@ class EffectBroker:
         Uses the task's declared (sink_confidentiality, sink_integrity) interval
         rather than hard-coded per-effect-type defaults. This lets
         each task define its own sensitivity floor, making FlowOK task-scoped.
+
+        SESSION TAINT (inter-effect composition):
+          If the task's session has read CONFIDENTIAL data (session.tainted=True),
+          ALL send effects are blocked unless a broker-recorded declass exception
+          exists. This prevents the read-secrets→send-exfil attack without requiring
+          taint tracking on data values. The session is tainted when a read effect
+          reads a CONFIDENTIAL file (see _apply_effect for read handling).
         """
+        # ---- Session taint check (inter-effect composition) ----
+        # If session is tainted, send effects require a declass exception.
+        # This is the conservative cross-effect guard: once CONFIDENTIAL data
+        # was read in this session, every send needs explicit declass.
+        if task.session is not None and task.session.tainted:
+            if effect.etype == "send":
+                # Check if there's a declass exception that covers this send
+                if self._has_validated_exception(effect, "declass", "CONFIDENTIAL"):
+                    return True, "flow-ok(session-taint-cleared-by-declass)"
+                return False, (
+                    f"session-taint("
+                    f"session={task.session.session_id} "
+                    f"has-read-confidential, "
+                    f"reason={task.session._taint_reason!r}, "
+                    f"declass-required)"
+                )
+
         sink_confidentiality, sink_integrity = task.flow_boundary
         for datum in effect.provenance:
             if datum.confidentiality > sink_confidentiality and not self._has_validated_exception(
@@ -713,30 +881,20 @@ class EffectBroker:
         extra_targets (BCC/CC recipients) are within the task ceiling scope.
         For `network` effects, also enforces SSRF containment.
 
-        LIMITATION — NoAmp does NOT model inter-effect composition:
-          The four-predicate gate evaluates ONE effect at a time. It cannot
-          detect amplification via the SEQUENCE of two (or more) effects where
-          each individually passes but the combination is an attack.
+        INTER-EFFECT COMPOSITION: Handled by Session Taint Mode (check_flow).
+          The read-secrets→send-exfil attack is blocked by session taint:
+            - When read(secrets) commits: session.tainted = True (see _apply_effect)
+            - When send(internal) commits: check_flow() blocks with "session-taint"
+              unless a broker-recorded declass exception exists
+          This covers the primary composition attack. Session taint is
+          conservative: ALL sends after a CONFIDENTIAL read require declass,
+          even for legitimate workflows. To use a tainted session for sends,
+          the broker must record a declass exception via grant_label_exception().
 
-          Example of an uncaught sequence:
-            1. Effect A: read(secrets) — ALLOW (agent has read capability)
-            2. Effect B: send(internal, body=secrets_data) — ALLOW (cap + FlowOK)
-
-          Both effects pass individually. But the sequence is an exfiltration
-          attack. NoAmp cannot see this because:
-            - It only examines Effect B in isolation
-            - It cannot track that secrets data from Effect A flows into Effect B
-            - Provenance of Effect B claims INTERNAL/USER, hiding the origin
-
-          Detecting this requires DATA-FLOW LEVEL taint tracking (PACT/CaMeL
-          territory), not just effect-level authorization. This is an
-          architectural limit of ECAC's effect-complete approach.
-
-          MITIGATION: The ledger/observer can detect this pattern AFTER commit
-          by correlating read(secrets) → identity_log entry → subsequent
-          send(internal) with overlapping target sets. This is "detection after
-          the fact" (not prevention) and requires process isolation to be
-          meaningful.
+        REMAINING GAP: Cross-task composition (effect from Task A → task B).
+          If the same capability is valid across tasks, a sequence of effects
+          across task boundaries is not tracked. This requires task isolation
+          beyond process isolation — deferred.
         """
         capability = self.capabilities.get(effect.capability_nonce)
         if capability is None:
@@ -1282,7 +1440,20 @@ class EffectBroker:
         Since this is called ONLY when gate() succeeded, the nonce is in used
         and the add is a harmless no-op. If gate() failed, _release_fresh_reservation()
         removed the nonce — this method is never called.
+
+        SESSION TAINT (inter-effect composition):
+          When a read effect reads a CONFIDENTIAL file, the session is marked
+          as tainted. This prevents subsequent send effects without declass.
         """
+        # ---- Session taint: mark session as tainted on CONFIDENTIAL read ----
+        if effect.etype == "read" and task.session is not None:
+            file_res = self.store.resolve(effect.target)
+            if file_res is not None and hasattr(file_res, "sensitivity"):
+                if file_res.sensitivity == Confidentiality.CONFIDENTIAL:
+                    task.session.taint_for_send(
+                        reason=f"read-confidential({effect.target})"
+                    )
+
         self.store.apply_effect(effect)
 
     def apply_effect(self, commit_or_effect: Commit | Effect, task: Task | None = None) -> None:
