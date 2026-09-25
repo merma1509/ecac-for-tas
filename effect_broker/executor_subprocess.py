@@ -50,11 +50,28 @@ import json
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
 from pathlib import Path
 from typing import Any
+
+
+def _derive_confidentiality_from_mode(mode_int: int) -> str:
+    """Derive confidentiality from Unix permission bits (mirrors shim_real.py).
+
+    Runs in subprocess so taint detection uses real OS state:
+      Owner-only  (mode & 0o007 == 0)   → CONFIDENTIAL
+      Group-readable (mode & 0o070 != 0) → INTERNAL
+      World-readable (mode & 0o004 != 0) → PUBLIC
+      Other                                → PUBLIC
+    """
+    if mode_int & 0o007 == 0:
+        return "CONFIDENTIAL"
+    if mode_int & 0o070 != 0:
+        return "INTERNAL"
+    return "PUBLIC"
 
 # ---- Store: only mutable state in THIS process ----
 class IsolatedStore:
@@ -326,6 +343,111 @@ class ExecutorServer:
         finally:
             conn.close()
 
+    def _handle_apply_commit(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Handle atomic commit: Fresh check + nonce reserve + apply_effect.
+
+        This implements the atomic commit protocol from the session sync fix:
+        1. Load A's session snapshot (used nonces, revoked, logical_time, taint)
+        2. Fresh check in subprocess: replay detection + revoked check
+        3. If Fresh: apply_effect to IsolatedStore, track taint on CONFIDENTIAL read
+        4. Return session_update with updated state (B→A sync)
+
+        Args:
+            payload: {
+                "effect": effect dict,
+                "task_id": str,
+                "session_snapshot": A's session state,
+                "reserve_nonce": bool
+            }
+
+        Returns:
+            {"status": "ok", "observed_targets": [...], "session_update": {...}}
+            or {"status": "blocked", "blocker": "Fresh", "reason": "replay|revoked|expired"}
+        """
+        effect = payload.get("effect", {})
+        task_id = payload.get("task_id", "default")
+        snapshot = payload.get("session_snapshot", {})
+        reserve_nonce = payload.get("reserve_nonce", True)
+
+        # Get or create subprocess session mirror for this task
+        session = self._session_states.get(task_id, {})
+        if not session:
+            session = dict(snapshot)  # Start from A's snapshot
+            self._session_states[task_id] = session
+
+        # CRITICAL: Fresh check in subprocess using A's snapshot
+        nonce = effect.get("capability_nonce")
+
+        if reserve_nonce and nonce:
+            # Check replay (nonce in A's used set)
+            if nonce in session.get("used", []):
+                return {
+                    "ok": True,
+                    "status": "blocked",
+                    "blocker": "Fresh",
+                    "reason": "replay",
+                    "task_id": task_id,
+                }
+
+            # Check global revocation (nonce in A's revoked set)
+            if nonce in session.get("revoked", []):
+                return {
+                    "ok": True,
+                    "status": "blocked",
+                    "blocker": "Fresh",
+                    "reason": "revoked",
+                    "task_id": task_id,
+                }
+
+        # Apply effect to IsolatedStore
+        try:
+            obs_targets = self._store.apply_effect(effect)
+
+            # Track taint: if read CONFIDENTIAL file, mark session as tainted
+            if effect.get("etype") == "read":
+                target = effect.get("target", "")
+                # Check if target is marked CONFIDENTIAL in subprocess store
+                file_entry = self._store._files.get(target)
+                if file_entry and file_entry.sensitivity and hasattr(file_entry.sensitivity, 'name'):
+                    if file_entry.sensitivity.name == "CONFIDENTIAL":
+                        if not session.get("tainted"):
+                            session["tainted"] = True
+                            session["_taint_reason"] = f"read-confidential({target})"
+                            self._session_states[task_id] = session
+
+            # Reserve nonce if requested (B's local reservation)
+            if reserve_nonce and nonce:
+                if "used" not in session:
+                    session["used"] = list(snapshot.get("used", []))
+                session["used"] = list(session.get("used", [])) + [nonce]
+
+            # Build session update for A (B→A sync)
+            session_update = {
+                "used": session.get("used", list(snapshot.get("used", []))),
+                "logical_time": session.get("logical_time", snapshot.get("logical_time", 0.0)),
+                "tainted": session.get("tainted", snapshot.get("tainted", False)),
+                "_taint_reason": session.get("_taint_reason", ""),
+            }
+
+            return {
+                "ok": True,
+                "status": "ok",
+                "observed_targets": list(obs_targets),
+                "session_update": session_update,
+                "task_id": task_id,
+            }
+
+        except Exception as e:
+            # Rollback nonce reservation on failure
+            if reserve_nonce and nonce and nonce in session.get("used", []):
+                session["used"] = [n for n in session["used"] if n != nonce]
+            return {
+                "ok": True,
+                "status": "error",
+                "reason": str(e),
+                "task_id": task_id,
+            }
+
     def _handle_real_effect(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Handle real OS/SMTP operations in subprocess (APPLY_EFFECT).
 
@@ -342,16 +464,61 @@ class ExecutorServer:
         try:
             if op == "real_read":
                 path = payload["path"]
+                st = os.stat(path)
                 with open(path, "rb") as f:
                     content = f.read()
-                return {"ok": True, "content": base64.b64encode(content).decode(), "path": path}
+                # Derive confidentiality from REAL OS permission bits (same heuristic
+                # as shim_real.py). If the file is owner-only, it is CONFIDENTIAL —
+                # reading it taints the session (read-secrets → send-block attack).
+                confidentiality = _derive_confidentiality_from_mode(st.st_mode)
+                session_update: dict[str, Any] = {}
+                if confidentiality == "CONFIDENTIAL":
+                    task_id = payload.get("task_id", "default")
+                    session = self._session_states.get(task_id, {})
+                    # Set taint in subprocess mirror (B) so sync_session returns it to A
+                    if not session.get("tainted"):
+                        session = dict(session)  # copy
+                        session["tainted"] = True
+                        session["_taint_reason"] = f"real-read-confidential({path})"
+                        self._session_states[task_id] = session
+                    session_update = session
+                return {
+                    "ok": True,
+                    "content": base64.b64encode(content).decode(),
+                    "path": path,
+                    "confidentiality": confidentiality,
+                    "session_update": session_update,
+                }
 
             elif op == "real_write":
                 path = payload["path"]
                 content = base64.b64decode(payload["content"])
                 with open(path, "wb") as f:
                     f.write(content)
-                return {"ok": True, "path": path}
+                # Derive confidentiality of the written file from real mode bits.
+                # A newly written file may have umask-applied permissions;
+                # if it is owner-only (0o600), it is CONFIDENTIAL.
+                try:
+                    st = os.stat(path)
+                    confidentiality = _derive_confidentiality_from_mode(st.st_mode)
+                except OSError:
+                    confidentiality = "INTERNAL"
+                session_update: dict[str, Any] = {}
+                if confidentiality == "CONFIDENTIAL":
+                    task_id = payload.get("task_id", "default")
+                    session = self._session_states.get(task_id, {})
+                    if not session.get("tainted"):
+                        session = dict(session)
+                        session["tainted"] = True
+                        session["_taint_reason"] = f"real-write-confidential({path})"
+                        self._session_states[task_id] = session
+                    session_update = session
+                return {
+                    "ok": True,
+                    "path": path,
+                    "confidentiality": confidentiality,
+                    "session_update": session_update,
+                }
 
             elif op == "real_delete":
                 path = payload["path"]
@@ -361,6 +528,17 @@ class ExecutorServer:
             elif op == "real_stat":
                 path = payload["path"]
                 st = os.stat(path)
+                confidentiality = _derive_confidentiality_from_mode(st.st_mode)
+                session_update: dict[str, Any] = {}
+                if confidentiality == "CONFIDENTIAL":
+                    task_id = payload.get("task_id", "default")
+                    session = self._session_states.get(task_id, {})
+                    if not session.get("tainted"):
+                        session = dict(session)
+                        session["tainted"] = True
+                        session["_taint_reason"] = f"real-stat-confidential({path})"
+                        self._session_states[task_id] = session
+                    session_update = session
                 return {
                     "ok": True,
                     "stat": {
@@ -372,6 +550,8 @@ class ExecutorServer:
                         "st_gid": int(st.st_gid),
                         "st_mode_int": int(st.st_mode),
                     },
+                    "confidentiality": confidentiality,
+                    "session_update": session_update,
                 }
 
             elif op == "real_listdir":
@@ -546,6 +726,11 @@ class ExecutorServer:
                 for user in mailboxes:
                     self._store._unsafe_bootstrap_mailbox(user)
                 return {"ok": True}
+
+            case ExecutorRequest.APPLY_COMMIT:
+                # Atomic commit protocol: Fresh check + nonce reserve + apply_effect
+                # This runs entirely in the subprocess for consistency guarantees.
+                return self._handle_apply_commit(payload)
 
             case ExecutorRequest.APPLY_EFFECT:
                 return self._handle_real_effect(payload)
