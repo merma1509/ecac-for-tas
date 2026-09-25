@@ -1204,11 +1204,23 @@ class EffectBroker:
 
         return True, f"fresh(t_session={task.session.logical_time})"
 
-    def _atomic_fresh_check(self, effect: Effect, task: Task) -> tuple[PredicateResult, bool]:
-        """Thread-safe Fresh check: atomically checks and RESERVES the nonce.
+    def _atomic_fresh_check(
+        self,
+        effect: Effect,
+        task: Task,
+        reserve_nonce: bool = True,
+    ) -> tuple[PredicateResult, bool]:
+        """Thread-safe Fresh check: atomically checks and (optionally) RESERVES the nonce.
 
         Returns ((ok, evidence), nonce_reserved). If the caller (gate()) fails
         after reservation, it MUST call _release_fresh_reservation() to roll back.
+
+        Args:
+            effect: The effect to check
+            task: The task context
+            reserve_nonce: If True, atomically reserve the nonce in session.used.
+                         Set to False for multi-process mode where the subprocess
+                         handles nonce reservation via APPLY_COMMIT.
 
         This closes the race:
           Thread 1: check_fresh() reads used=∅ -> PASS
@@ -1228,8 +1240,13 @@ class EffectBroker:
                 # Atomic reservation: add nonce while holding the lock.
                 # No other thread can check or reserve this nonce until we release.
                 # session is always set: Task.__post_init__ creates a default one.
-                task.session.used.add(effect.capability_nonce)  # type: ignore[union-attr]
-                return result, True
+                #
+                # For multi-process mode (SubprocessExecutor), skip reservation here
+                # because the subprocess handles it via APPLY_COMMIT.
+                if reserve_nonce:
+                    task.session.used.add(effect.capability_nonce)  # type: ignore[union-attr]
+                    return result, True
+                return result, False
             return result, False
 
     def _release_fresh_reservation(self, effect: Effect, task: Task) -> None:
@@ -1305,11 +1322,19 @@ class EffectBroker:
         self,
         commit: Commit,
         mediation: MediationVerdict | None = None,
+        reserve_nonce: bool = True,
     ) -> CommitGateResult:
         """Phase 1: Evaluate the four-predicate gate. No state mutation.
 
         Returns CommitGateResult with allow/evidence. Does NOT apply any effect.
         The executor calls this, then calls apply_effect() on can_apply=True.
+
+        Args:
+            commit: The commit to gate
+            mediation: Optional pre-built boundary mediation verdict
+            reserve_nonce: If True, reserve the nonce atomically in session.used.
+                          Set to False for multi-process mode where the subprocess
+                          handles nonce reservation via APPLY_COMMIT.
 
         This split enables independent observer verification:
         - observer records authorized effects from gate result
@@ -1378,11 +1403,14 @@ class EffectBroker:
                     can_apply=False,
                 )
 
-        # Atomic Fresh check: check AND reserve the nonce atomically.
+        # Atomic Fresh check: check AND (optionally) reserve the nonce atomically.
         # This prevents double-commit with the same nonce under concurrency.
         # nonce_reserved = True means Fresh passed AND the nonce is now in used.
         # If we fail the gate AFTER reserving, we MUST release (see rollback below).
-        fresh_result, nonce_reserved = self._atomic_fresh_check(effect, task)
+        
+        # For multi-process mode (SubprocessExecutor), reserve_nonce=False because
+        # the subprocess handles nonce reservation via APPLY_COMMIT protocol.
+        fresh_result, nonce_reserved = self._atomic_fresh_check(effect, task, reserve_nonce)
 
         predicate_results: dict[str, PredicateResult] = {
             "Auth": self.check_auth(effect, task),
