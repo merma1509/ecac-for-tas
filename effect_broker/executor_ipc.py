@@ -41,7 +41,9 @@ class ExecutorRequest(Enum):
 
     EXECUTE = auto()  # Apply an simulated effect (internal store only)
     APPLY_EFFECT = auto()  # Apply an effect with REAL OS/SMTP operations (moved from broker)
+    APPLY_COMMIT = auto()  # Atomic commit: Fresh check + nonce reserve + apply_effect in subprocess, returns session_update
     SYNC_SESSION = auto()  # Sync session state from broker to subprocess (used, revoked, taint, clock)
+    GET_SESSION = auto()  # Get session state from subprocess to broker (B→A, no overwrite)
     READ_STORE = auto()  # Observer reads actual store state for verification
     READ_EMAILS = auto()  # Observer reads emails for duplicate accounting
     READ_FILES = auto()  # Observer reads files
@@ -286,6 +288,48 @@ class ProcessExecutorClient:
         resp.pop("ok", None)
         return cast(dict[str, Any], resp)
 
+    def apply_commit(
+        self,
+        effect_dict: dict[str, Any],
+        task_id: str,
+        session_snapshot: dict[str, Any],
+        reserve_nonce: bool = True,
+    ) -> dict[str, Any]:
+        """Atomic commit: Fresh check + nonce reserve + apply in subprocess.
+
+        This implements the atomic commit protocol from the session sync fix:
+        1. Subprocess receives A's session snapshot
+        2. Fresh check (replay + revoked) in subprocess using A's snapshot
+        3. If Fresh: nonce reserved, effect applied, taint tracked
+        4. Returns session_update with updated state
+
+        Args:
+            effect_dict: Serialized effect to apply
+            task_id: Task ID for session tracking
+            session_snapshot: A's session state at gate time
+            reserve_nonce: Whether to reserve the nonce in the subprocess
+
+        Returns:
+            Success: {"status": "ok", "observed_targets": [...], "session_update": {...}}
+            Blocked: {"status": "blocked", "blocker": "Fresh", "reason": "replay|revoked|expired"}
+            Error: {"status": "error", "reason": str}
+        """
+        with self._lock:
+            resp = send_and_receive(
+                self._path,
+                ExecutorRequest.APPLY_COMMIT,
+                {
+                    "effect": effect_dict,
+                    "task_id": task_id,
+                    "session_snapshot": session_snapshot,
+                    "reserve_nonce": reserve_nonce,
+                },
+            )
+        if not resp.get("ok"):
+            raise RuntimeError(f"Apply commit error: {resp.get('error')}")
+        resp.pop("ok", None)
+        return cast(dict[str, Any], resp)
+
     def read_store(self) -> dict[str, Any]:
         """Read the complete executor store state (for independent observer)."""
         with self._lock:
@@ -355,26 +399,28 @@ class ProcessExecutorClient:
     # These methods send REAL file/SMTP operations to the subprocess,
     # ensuring actual I/O happens in the isolated process, not in broker.
 
-    def real_file_read(self, path: str) -> dict[str, Any]:
+    def real_file_read(self, path: str, task_id: str = "default") -> dict[str, Any]:
         """Read a real file in the executor subprocess.
 
-        Returns: {"ok": bool, "content": bytes | None, "error": str | None}
+        Returns: {"ok": bool, "content": bytes | None, "confidentiality": str,
+                  "session_update": dict, "error": str | None}
         """
         with self._lock:
             resp = send_and_receive(
                 self._path,
                 ExecutorRequest.APPLY_EFFECT,
-                {"op": "real_read", "path": path},
+                {"op": "real_read", "path": path, "task_id": task_id},
             )
         if not resp.get("ok"):
             raise RuntimeError(f"Real file read error: {resp.get('error')}")
         resp.pop("ok", None)
         return cast(dict[str, Any], resp)
 
-    def real_file_write(self, path: str, content: bytes) -> dict[str, Any]:
+    def real_file_write(self, path: str, content: bytes, task_id: str = "default") -> dict[str, Any]:
         """Write content to a real file in the executor subprocess.
 
-        Returns: {"ok": bool, "error": str | None}
+        Returns: {"ok": bool, "path": str, "confidentiality": str,
+                  "session_update": dict, "error": str | None}
         """
         import base64
 
@@ -382,14 +428,14 @@ class ProcessExecutorClient:
             resp = send_and_receive(
                 self._path,
                 ExecutorRequest.APPLY_EFFECT,
-                {"op": "real_write", "path": path, "content": base64.b64encode(content).decode()},
+                {"op": "real_write", "path": path, "content": base64.b64encode(content).decode(), "task_id": task_id},
             )
         if not resp.get("ok"):
             raise RuntimeError(f"Real file write error: {resp.get('error')}")
         resp.pop("ok", None)
         return cast(dict[str, Any], resp)
 
-    def real_file_delete(self, path: str) -> dict[str, Any]:
+    def real_file_delete(self, path: str, task_id: str = "default") -> dict[str, Any]:
         """Delete a real file in the executor subprocess.
 
         Returns: {"ok": bool, "error": str | None}
@@ -398,30 +444,31 @@ class ProcessExecutorClient:
             resp = send_and_receive(
                 self._path,
                 ExecutorRequest.APPLY_EFFECT,
-                {"op": "real_delete", "path": path},
+                {"op": "real_delete", "path": path, "task_id": task_id},
             )
         if not resp.get("ok"):
             raise RuntimeError(f"Real file delete error: {resp.get('error')}")
         resp.pop("ok", None)
         return cast(dict[str, Any], resp)
 
-    def real_file_stat(self, path: str) -> dict[str, Any]:
+    def real_file_stat(self, path: str, task_id: str = "default") -> dict[str, Any]:
         """Stat a real file in the executor subprocess.
 
-        Returns: {"ok": bool, "stat": dict | None, "error": str | None}
+        Returns: {"ok": bool, "stat": dict | None, "confidentiality": str,
+                  "session_update": dict, "error": str | None}
         """
         with self._lock:
             resp = send_and_receive(
                 self._path,
                 ExecutorRequest.APPLY_EFFECT,
-                {"op": "real_stat", "path": path},
+                {"op": "real_stat", "path": path, "task_id": task_id},
             )
         if not resp.get("ok"):
             raise RuntimeError(f"Real file stat error: {resp.get('error')}")
         resp.pop("ok", None)
         return cast(dict[str, Any], resp)
 
-    def real_file_listdir(self, path: str) -> dict[str, Any]:
+    def real_file_listdir(self, path: str, task_id: str = "default") -> dict[str, Any]:
         """List a real directory in the executor subprocess.
 
         Returns: {"ok": bool, "entries": list[str] | None, "error": str | None}
@@ -430,7 +477,7 @@ class ProcessExecutorClient:
             resp = send_and_receive(
                 self._path,
                 ExecutorRequest.APPLY_EFFECT,
-                {"op": "real_listdir", "path": path},
+                {"op": "real_listdir", "path": path, "task_id": task_id},
             )
         if not resp.get("ok"):
             raise RuntimeError(f"Real file listdir error: {resp.get('error')}")
