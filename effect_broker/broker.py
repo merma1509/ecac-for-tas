@@ -1587,3 +1587,73 @@ class EffectBroker:
             authorized_records[(tid, nonce)] = targets
 
         return self._ledger_backend.verify_all(authorized_records)
+
+    # ---- Real shim factory (IPC-aware) ----
+    # In multi-process mode, shims MUST route real I/O through the subprocess.
+    # These factory methods wire the IPC client into the shim automatically.
+
+    def create_real_file_shim(
+        self,
+        task_id: str = "default",
+        tool_name: str = "untrusted-tool",
+    ) -> "RealFileShim":
+        """Create a RealFileShim with IPC routing in multi-process mode.
+
+        In multi-process mode, real file I/O happens in the executor subprocess
+        (not in the broker process). The IPC client is extracted from the
+        SubprocessExecutor.
+
+        In same-process mode, ipc_client is None and the shim uses direct
+        OS calls (legacy behavior).
+        """
+        from .shim_real import RealFileShim
+
+        shim = RealFileShim(broker=self, task_id=task_id, tool_name=tool_name)
+
+        if self._mode == "multi-process" and self._executor is not None:
+            # Wire IPC client from SubprocessExecutor into the shim
+            from .executor import SubprocessExecutor
+
+            if isinstance(self._executor, SubprocessExecutor):
+                shim.ipc_client = self._executor._client
+
+        return shim
+
+    def create_real_email_shim(
+        self,
+        task_id: str = "default",
+        tool_name: str = "untrusted-tool",
+        smtp_host: str = "localhost",
+        smtp_port: int = 25,
+        imap_host: str = "localhost",
+        imap_port: int = 993,
+    ) -> "RealEmailShim":
+        """Create a RealEmailShim with IPC routing in multi-process mode.
+
+        In multi-process mode, real SMTP/IMAP happens in the executor subprocess
+        (not in the broker process). The IPC client is extracted from the
+        SubprocessExecutor.
+
+        In same-process mode, ipc_client is None and the shim uses direct
+        smtplib/imaplib calls (legacy behavior).
+        """
+        from .shim_email import RealEmailShim
+
+        shim = RealEmailShim(
+            broker=self,
+            task_id=task_id,
+            tool_name=tool_name,
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            imap_host=imap_host,
+            imap_port=imap_port,
+        )
+
+        if self._mode == "multi-process" and self._executor is not None:
+            # Wire IPC client from SubprocessExecutor into the shim
+            from .executor import SubprocessExecutor
+
+            if isinstance(self._executor, SubprocessExecutor):
+                shim.ipc_client = self._executor._client
+
+        return shim
