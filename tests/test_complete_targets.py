@@ -738,11 +738,15 @@ class TestLedgerVerdictUnknownAfterCrash:
     In the same-process model, a "crash" means the broker process restarts
     with a fresh session (session.used = ∅). Fresh cannot block the retry
     (nonce lost), but the ledger must return UNKNOWN — not false SAFE.
-    This is the "unknown, not safe" guarantee.
+    This is the "unknown, not safe" guarantee
     """
 
     def test_verify_confirmed_blocked_after_session_preserved(self) -> None:
-        """Session preserved: Fresh blocks retry. Ledger returns CONFIRMED_BLOCKED."""
+        """Session preserved: Fresh blocks retry. Ledger returns CONFIRMED_COMMITTED.
+
+        After fix: committed takes precedence over blocked. The effect WAS
+        applied (first commit succeeded), so CONFIRMED_COMMITTED is correct.
+        """
         from effect_broker.ledger import LedgerVerdict
 
         broker = build()
@@ -780,10 +784,11 @@ class TestLedgerVerdictUnknownAfterCrash:
         assert ev2["primary_blocker"] == "Fresh"
         assert "replay" in ev2["predicates"]["Fresh"]
 
-        # Ledger: committed obs + BLOCKED obs → CONFIRMED_BLOCKED
+        # Ledger: committed takes precedence → CONFIRMED_COMMITTED
+        # The effect was applied (first commit), subsequent blocked retries don't change this
         verdict = broker._local_ledger.verify(task.task_id, effect.capability_nonce)
-        assert verdict == LedgerVerdict.CONFIRMED_BLOCKED, (
-            f"Expected CONFIRMED_BLOCKED after Fresh replay, got {verdict}"
+        assert verdict == LedgerVerdict.CONFIRMED_COMMITTED, (
+            f"Expected CONFIRMED_COMMITTED (effect was applied), got {verdict}"
         )
 
     def test_verify_unknown_when_obs_exceeds_auth(self) -> None:

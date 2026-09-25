@@ -989,7 +989,9 @@ class TestOverObservedIsUnknown:
         verdict = broker.ledger.verify(task_id, nonce)
         assert isinstance(verdict, UnknownLedgerResult)
         assert "over-observed" in verdict.reason
-        assert "obs_count=2" in verdict.reason
+        # Now reports committed_count (count of committed obs, not total obs)
+        # because blocked entries don't count toward the limit
+        assert "committed_count=2" in verdict.reason
 
 
 class TestUnknownLedgerResultIsNotSafe:
