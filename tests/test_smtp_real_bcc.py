@@ -12,11 +12,12 @@ Tests use a real aiosmtpd SMTP server (port 9025) to verify:
   6. IPC-mode clean send
 
 Run with: pytest tests/test_smtp_real_bcc.py -v
-Requires: aiosmtpd (pip install aiosmtpd)
+Requires: aiosmtpd (pip install aiosmtpd), pytest-asyncio
 """
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from pathlib import Path
@@ -24,75 +25,82 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+import pytest_asyncio
 
 # ---- SMTP server fixture ----
-@pytest.fixture
-def smtp_server(tmp_path: Path) -> Any:
+@pytest.fixture(scope="session")
+def smtp_server(request: Any) -> Any:
     """Start a real aiosmtpd SMTP server on port 9025.
 
     Accepts all recipients (code 250) and records them. This lets tests
     verify that the shim's RSET-only probe correctly discovers recipients
     and that RSET aborts the transaction (no message is stored after RSET).
+
+    Uses aiosmtpd.controller.UnthreadedController.start()/stop() which
+    manages its own internal thread and asyncio loop correctly — no conflicts
+    with pytest-asyncio. Session-scoped so all tests share the same instance.
+    Uses 127.0.0.1 explicitly to avoid IPv6 resolution issues on macOS.
     """
     try:
-        import aiosmtpd.controller
-        from aiosmtpd.smtp import SMTP
+        import aiosmtpd.controller  # noqa: F401
     except ImportError:
         pytest.skip("aiosmtpd not installed")
 
     class _InboxHandler:
-        """Records RCPT TO calls and data, supports RSET."""
+        """Records RCPT TO calls and data, supports RSET (async hook API).
+
+        aiosmtpd 1.4.6 calls hooks via _call_handler_hook(hook_name, *smtp_args):
+          - handle_RCPT: hook(session, envelope, *args) where args=(envelope, address, options)
+          - handle_RSET:  hook(session, envelope, *args) where args=(envelope,) [SMTP passes arg]
+          - handle_DATA:   hook(session, envelope) — no SMTP args
+          - handle_CHUNKING: hook(session, envelope, *args)
+        """
 
         def __init__(self) -> None:
             self.rcpt_log: list[str] = []
             self.data_log: list[bytes] = []
-            self._data_mode = False
 
-        def handle_RSET(self, handler: Any) -> None:
+        async def handle_RCPT(self, session: Any, envelope: Any, *args: Any) -> str:
+            """Called after SMTP RCPT TO. Records the address."""
+            # args: (envelope, address_str, options_list) — address is last real arg
+            if len(args) >= 2:
+                self.rcpt_log.append(args[-2])
+            return "250 OK"
+
+        async def handle_DATA(self, session: Any, envelope: Any) -> str:
+            """Called after DATA body. Records message content."""
+            self.data_log.append(envelope.content)
+            return "250 OK"
+
+        async def handle_RSET(self, session: Any, envelope: Any, *args: Any) -> str:
+            """Called on RSET. Clears the per-session recipient log."""
             self.rcpt_log.clear()
-            self._data_mode = False
             return "250 OK"
 
-        def handle_RCPT(self, handler: Any, to: str) -> tuple[int, str]:
-            self.rcpt_log.append(to)
-            return "250 OK"
-
-        def handle_DATA(self, handler: Any) -> str:
-            self._data_mode = True
-            return "354 OK"
-
-        def handle_CHUNKING(self, handler: Any, chunk_size: str) -> tuple[int, str]:
+        async def handle_CHUNKING(
+            self, session: Any, envelope: Any, *args: Any
+        ) -> str:
+            """Reject oversized messages."""
             return "552 Message exceeds fixed maximum message size"
 
     handler = _InboxHandler()
 
-    class _CustomSMTP(SMTP):
-        """Override to capture the handler for testing."""
+    from aiosmtpd.controller import Controller
 
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            super().__init__(*args, **kwargs)
-            self._test_handler = handler  # type: ignore[attr-defined]
-
-        def _handle_RCPT(
-            self, handler: Any, to: str, options: list[str]
-        ) -> tuple[int, str]:
-            return handler.handle_RCPT(self, to)
-
-        def _handle_RSET(self, handler: Any) -> str:
-            return handler.handle_RSET(handler)
-
-    controller = aiosmtpd.controller.UnthreadedController(
-        hostname="localhost",
-        port=9025,
+    controller = Controller(
         handler=handler,
-        smtp_factory=_CustomSMTP,
+        hostname="127.0.0.1",
+        port=9025,
+        ready_timeout=10.0,
     )
     controller.start()
-    time.sleep(0.1)  # let server bind
 
-    yield handler
+    # Clean up when the test session ends
+    def stop_server() -> None:
+        controller.stop()
 
-    controller.stop()
+    request.addfinalizer(stop_server)
+    return handler
 
 
 # ---- Test helpers ----
@@ -139,7 +147,7 @@ class TestBCCSameProcess:
         The MTA accepts all and records them. RSET aborts so no DATA occurs.
         No message should be delivered.
         """
-        from effect_broker.shim_email import RealEmailShim, SMTPError
+        from effect_broker.shim_email import RealEmailShim
 
         broker = _make_broker()
         shim = RealEmailShim(
@@ -189,7 +197,7 @@ class TestBCCSameProcess:
         shim._smtp_probe = bcc_probe  # type: ignore[method-assign]
 
         with pytest.raises(EmailSecurityError, match="BCC bypass detected"):
-            shim.send("user@corp.com", "internal@corp.com")
+            shim.send("user@corp.com", "internal@corp.com", body="")
 
         # No message should have been sent (blocked before broker.commit)
         assert len(smtp_server.data_log) == 0
@@ -216,7 +224,7 @@ class TestBCCSameProcess:
             return recipients, recipients, frozenset()
 
         shim._smtp_probe = clean_probe  # type: ignore[method-assign]
-        shim.send("user@corp.com", "internal@corp.com", "Test body")
+        shim.send("user@corp.com", "internal@corp.com", body="Test body")
 
         # Data was delivered
         assert len(smtp_server.data_log) == 1
@@ -363,7 +371,7 @@ class TestBCCMultiProcess:
         shim._smtp_probe = bcc_probe  # type: ignore[method-assign]
 
         with pytest.raises(EmailSecurityError, match="BCC bypass"):
-            shim.send("user@corp.com", "internal@corp.com")
+            shim.send("user@corp.com", "internal@corp.com", body="")
 
         # No message queued — blocked at BCC check, BEFORE broker.commit
         assert len(smtp_server.data_log) == 0
