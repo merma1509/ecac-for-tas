@@ -23,6 +23,7 @@ that has no filesystem access except via a whitelisted wrapper.
 
 from __future__ import annotations
 
+import base64
 import os
 import pathlib
 import re
@@ -36,6 +37,7 @@ from .model import Commit, Data, Effect, EffectTarget
 
 if TYPE_CHECKING:
     from .broker import EffectBroker
+    from .executor_ipc import ProcessExecutorClient
 
 T = TypeVar("T")
 
@@ -85,6 +87,10 @@ class RealFileShim:
 
     # Operational log — independent observer record
     ops: list[ShimOp] = field(default_factory=list)
+
+    # IPC client for multi-process mode (set by broker)
+    # When set, real I/O goes through subprocess, not direct OS calls
+    ipc_client: "ProcessExecutorClient | None" = None
 
     # Path normalization regex — canonicalizes paths to prevent traversal
     _NORMALIZE_RE = re.compile(r"/+")
@@ -390,14 +396,14 @@ class RealFileShim:
     ) -> str:
         """Derive a UNIQUE nonce per effect for freshness tracking.
 
-        The returned nonce is unique per target path, allowing multiple writes
-        to different files to each pass freshness checks. It's registered as
-        an alias of the base capability in _op().
+        The returned nonce is unique per (op_type, target) combination,
+        allowing multiple operations (read, write, delete) to the same file
+        to each pass freshness checks independently.
         """
         base = self._base_capability_nonce(op_type, primary)
-        # Derive unique nonce: include last 40 chars of path for per-effect uniqueness
+        # Derive unique nonce: include op_type + last 40 chars of path for per-effect uniqueness
         path_suffix = primary[7:] if primary.startswith("file://") else primary
-        return f"{base}|{path_suffix[-40:]}"
+        return f"{base}|{op_type}|{path_suffix[-40:]}"
 
     def _derive_nonce(self, right: str, primary: str, extras: frozenset[str]) -> str:
         """Derive a label key for this complete target set (for logging/tracking only)."""
@@ -525,7 +531,75 @@ class RealFileShim:
                 f"No OS state changed."
             )
 
-            # ALLOWed: perform the real OS operation
+        # ALLOWed: route through IPC in multi-process mode, local fallback otherwise
+        if self.ipc_client is not None:
+            # IPC mode: real I/O happens in the isolated subprocess
+            post_exists, post_content = self._stat_post(path, canon)
+            try:
+                if op_type == "write":
+                    assert content is not None
+                    self.ipc_client.real_file_write(canon, content)
+                    op.post_exists = True
+                    op.post_content = content
+                    self.ops.append(op)
+                    return cast(T, None)
+
+                elif op_type == "read":
+                    result = self.ipc_client.real_file_read(canon)
+                    data = base64.b64decode(result["content"])
+                    op.post_exists = True
+                    op.post_content = data
+                    self.ops.append(op)
+                    return cast(T, data)
+
+                elif op_type == "stat":
+                    result = self.ipc_client.real_file_stat(canon)
+                    stat_result = os.stat(canon)  # local fallback for os.stat_result type
+                    op.post_exists = post_exists
+                    op.post_content = post_content
+                    self.ops.append(op)
+                    return cast(T, stat_result)
+
+                elif op_type == "listdir":
+                    result = self.ipc_client.real_file_listdir(canon)
+                    entries = result.get("entries", [])
+                    op.post_exists = post_exists
+                    op.post_content = post_content
+                    self.ops.append(op)
+                    return cast(T, entries)
+
+                elif op_type == "exists":
+                    exists_result = os.path.exists(canon)
+                    op.post_exists = exists_result
+                    op.post_content = post_content
+                    self.ops.append(op)
+                    return cast(T, exists_result)
+
+                elif op_type == "delete":
+                    self.ipc_client.real_file_delete(canon)
+                    op.post_exists = False
+                    op.post_content = post_content
+                    self.ops.append(op)
+                    return cast(T, None)
+
+                else:
+                    raise ValueError(f"Unknown op type: {op_type}")
+
+            except FileNotFoundError as ex:
+                raise OSError(f"File not found: {canon}") from ex
+            except PermissionError as ex:
+                raise OSError(f"Permission denied: {canon}") from ex
+            except OSError as ex:
+                raise OSError(
+                    f"[{self.tool_name}] {op_type} on {canon} OS ERROR after ALLOW: {ex}. "
+                    f"Broker said ALLOW but subprocess rejected. Treat as security event."
+                ) from ex
+            except Exception as ex:
+                raise RuntimeError(
+                    f"[{self.tool_name}] {op_type} on {canon} IPC ERROR after ALLOW: {ex}"
+                ) from ex
+
+        # Same-process / single-threaded mode: local direct OS calls
         try:
             if op_type == "write":
                 assert content is not None, "write called with None content"
