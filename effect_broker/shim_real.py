@@ -104,7 +104,31 @@ class RealFileShim:
         self.broker = broker
         self.task_id = task_id
         self.tool_name = tool_name
-        self.ops = []
+        self.ops: list[ShimOp] = []
+
+    def _sync_session_from_subprocess(self, session_update: dict[str, Any]) -> None:
+        """Apply session state updates from subprocess to broker session.
+
+        Called after each IPC real I/O operation. The subprocess derives
+        taint from real permission bits (CONFIDENTIAL files) and returns
+        the updated session state. We propagate it to the broker so that
+        subsequent send effects are blocked (session-taint).
+
+        This is the B→A direction of bidirectional session sync, resolving
+        the taint-drift gap in multi-process mode.
+        """
+        if not session_update:
+            return
+        task = self.broker.tasks.get(self.task_id)
+        if task is None or task.session is None:
+            return
+        if session_update.get("tainted"):
+            task.session._tainted = True
+            task.session._taint_reason = session_update.get(
+                "_taint_reason", "subprocess-real-io"
+            )
+        if session_update.get("logical_time", 0) > task.session.logical_time:
+            task.session.logical_time = session_update["logical_time"]
 
     # ---- Public tool-facing API ----
     def read(self, path: str) -> bytes:
@@ -538,30 +562,38 @@ class RealFileShim:
             try:
                 if op_type == "write":
                     assert content is not None
-                    self.ipc_client.real_file_write(canon, content)
+                    result = self.ipc_client.real_file_write(canon, content, self.task_id)
+                    # session_update may carry taint from CONFIDENTIAL write
+                    if result.get("session_update"):
+                        self._sync_session_from_subprocess(result["session_update"])
                     op.post_exists = True
                     op.post_content = content
                     self.ops.append(op)
                     return cast(T, None)
 
                 elif op_type == "read":
-                    result = self.ipc_client.real_file_read(canon)
+                    result = self.ipc_client.real_file_read(canon, self.task_id)
                     data = base64.b64decode(result["content"])
+                    # session_update carries taint from CONFIDENTIAL read
+                    if result.get("session_update"):
+                        self._sync_session_from_subprocess(result["session_update"])
                     op.post_exists = True
                     op.post_content = data
                     self.ops.append(op)
                     return cast(T, data)
 
                 elif op_type == "stat":
-                    result = self.ipc_client.real_file_stat(canon)
+                    result = self.ipc_client.real_file_stat(canon, self.task_id)
                     stat_result = os.stat(canon)  # local fallback for os.stat_result type
+                    if result.get("session_update"):
+                        self._sync_session_from_subprocess(result["session_update"])
                     op.post_exists = post_exists
                     op.post_content = post_content
                     self.ops.append(op)
                     return cast(T, stat_result)
 
                 elif op_type == "listdir":
-                    result = self.ipc_client.real_file_listdir(canon)
+                    result = self.ipc_client.real_file_listdir(canon, self.task_id)
                     entries = result.get("entries", [])
                     op.post_exists = post_exists
                     op.post_content = post_content
@@ -576,7 +608,7 @@ class RealFileShim:
                     return cast(T, exists_result)
 
                 elif op_type == "delete":
-                    self.ipc_client.real_file_delete(canon)
+                    self.ipc_client.real_file_delete(canon, self.task_id)
                     op.post_exists = False
                     op.post_content = post_content
                     self.ops.append(op)
