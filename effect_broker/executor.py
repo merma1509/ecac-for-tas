@@ -290,7 +290,19 @@ class SubprocessExecutor:
         )
 
         if allow:
-            # Phase 2: apply in subprocess via IPC
+            # Phase 2a: sync session state to subprocess.
+            # This keeps the subprocess's session mirror up-to-date so it can
+            # perform independent Fresh checks and maintain an audit trail.
+            task = gate_result.task
+            session = task.session
+            if session is not None and self._client is not None:
+                from .executor_ipc import session_state_to_dict
+                self._client.sync_session(
+                    task.task_id,
+                    session_state_to_dict(session),
+                )
+
+            # Phase 2b: apply in subprocess via IPC
             if self._client is None:
                 raise RuntimeError("SubprocessExecutor: no IPC client available")
 
