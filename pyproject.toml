@@ -30,6 +30,7 @@ packages = ["effect_broker"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q -W ignore::UserWarning"
+asyncio_mode = "auto"
 
 [tool.mypy]
 python_version = "3.11"
