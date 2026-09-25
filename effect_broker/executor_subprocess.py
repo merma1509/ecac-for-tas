@@ -4,7 +4,7 @@ ARCHITECTURE
 ────────────
 This process runs in ISOLATION from the broker. It is the ONLY component
 that can mutate external state (files, emails, mailboxes). All state
-mutation goes through here — no other process can touch the store directly.
+mutation goes through here — no other process can touch the store directly
 
     ┌────────────────┐  execute(Effect)  ┌─────────────────────────┐
     │  broker        │ ─────────────────►│  executor_subprocess    │
@@ -15,12 +15,12 @@ mutation goes through here — no other process can touch the store directly.
     │  - Approval    │ ◄──────────────── │                         │
     └────────────────┘                   └─────────────────────────┘
                                                         │
-                                    read_store() ───────┘
-                                     (for observer)
-                                    ┌────────────────┐
-                                    │  Ledger        │
-                                    │  Process 3     │
-                                    └────────────────┘
+                                        read_store() ───┘
+                                        (for observer)
+                                        ┌────────────────┐
+                                        │  Ledger        │
+                                        │  Process 3     │
+                                        └────────────────┘
 
 ISOLATION GUARANTEES
 ────────────────────
@@ -57,8 +57,6 @@ from pathlib import Path
 from typing import Any
 
 # ---- Store: only mutable state in THIS process ----
-
-
 class IsolatedStore:
     """The sole mutable store — ONLY lives in this subprocess.
 
@@ -238,6 +236,7 @@ class ExecutorServer:
     ) -> None:
         self._path = Path(socket_path)
         self._store: IsolatedStore | None = None
+        self._session_states: dict[str, dict[str, Any]] = {}  # task_id → session state
         self._ready_event = ready_event
         self._shutdown = threading.Event()
         self._server: socket.socket | None = None
@@ -327,6 +326,175 @@ class ExecutorServer:
         finally:
             conn.close()
 
+    def _handle_real_effect(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Handle real OS/SMTP operations in subprocess (APPLY_EFFECT).
+
+        This is where REAL file I/O and SMTP operations happen — in the
+        isolated subprocess, NOT in the broker process.
+        """
+        import base64
+        import smtplib
+
+        op = payload.get("op", "")
+        SMTP_HOST = os.environ.get("ECAC_SMTP_HOST", "localhost")
+        SMTP_PORT = int(os.environ.get("ECAC_SMTP_PORT", "1025"))
+
+        try:
+            if op == "real_read":
+                path = payload["path"]
+                with open(path, "rb") as f:
+                    content = f.read()
+                return {"ok": True, "content": base64.b64encode(content).decode(), "path": path}
+
+            elif op == "real_write":
+                path = payload["path"]
+                content = base64.b64decode(payload["content"])
+                with open(path, "wb") as f:
+                    f.write(content)
+                return {"ok": True, "path": path}
+
+            elif op == "real_delete":
+                path = payload["path"]
+                os.remove(path)
+                return {"ok": True, "path": path}
+
+            elif op == "real_stat":
+                path = payload["path"]
+                st = os.stat(path)
+                return {
+                    "ok": True,
+                    "stat": {
+                        "mode": oct(st.st_mode),
+                        "size": st.st_size,
+                        "st_ino": int(st.st_ino),
+                        "st_dev": int(st.st_dev),
+                        "st_uid": int(st.st_uid),
+                        "st_gid": int(st.st_gid),
+                        "st_mode_int": int(st.st_mode),
+                    },
+                }
+
+            elif op == "real_listdir":
+                path = payload["path"]
+                entries = os.listdir(path)
+                return {"ok": True, "entries": entries}
+
+            elif op == "real_smtp_send":
+                sender = payload["sender"]
+                recipients = payload["recipients"]
+                body = payload["body"]
+                # RSET probe: check each recipient first
+                actual_recipients: list[str] = []
+                bcc_detected: list[str] = []
+                smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
+                try:
+                    for rcpt in recipients:
+                        code, _ = smtp.rcpt(rcpt)
+                        if code == 250:
+                            actual_recipients.append(rcpt)
+                        else:
+                            bcc_detected.append(rcpt)
+                    smtp.rset()
+                finally:
+                    smtp.quit()
+                if bcc_detected:
+                    return {"ok": True, "bcc_detected": bcc_detected}
+                # Real send
+                smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
+                try:
+                    smtp.sendmail(sender, recipients, body)
+                finally:
+                    smtp.quit()
+                return {"ok": True, "delivered": actual_recipients}
+
+            elif op == "real_smtp_probe":
+                # RSET-only probe for BCC detection — happens ENTIRELY in subprocess.
+                # No message is queued; this just discovers actual MTA recipients.
+                sender = payload["sender"]
+                recipients = payload["recipients"]
+                actual_accepted: list[str] = []
+                bcc_detected: list[str] = []
+                smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
+                try:
+                    for rcpt in recipients:
+                        code, _ = smtp.rcpt(rcpt)
+                        if code == 250:
+                            actual_accepted.append(rcpt)
+                        else:
+                            bcc_detected.append(rcpt)
+                    smtp.rset()  # Abort — no message queued
+                finally:
+                    smtp.quit()
+                return {
+                    "ok": True,
+                    "declared": recipients,
+                    "actual_accepted": actual_accepted,
+                    "bcc_detected": bcc_detected,
+                }
+
+            elif op == "real_imap_read_inbox":
+                # Real IMAP read_inbox — happens ENTIRELY in subprocess.
+                # This ensures IMAP operations (IMAP4_SSL, SELECT, SEARCH, FETCH)
+                # happen in the isolated subprocess, not in the broker process.
+                import imaplib
+
+                user = payload["user"]
+                imap_host = payload.get("imap_host", "localhost")
+                imap_port = payload.get("imap_port", 993)
+                imap_user = payload.get("imap_user")
+                imap_password = payload.get("imap_password")
+                imap_use_tls = payload.get("imap_use_tls", True)
+
+                messages: list[str] = []
+                total_size = 0
+                try:
+                    if imap_use_tls:
+                        mailbox: imaplib.IMAP4_SSL = imaplib.IMAP4_SSL(imap_host, imap_port)  # type: ignore[assignment]
+                    else:
+                        mailbox = imaplib.IMAP4(imap_host, imap_port)  # type: ignore[assignment]
+                    try:
+                        if imap_user and imap_password:
+                            mailbox.login(imap_user, imap_password)
+                        status, _ = mailbox.select("INBOX")
+                        if status != "OK":
+                            return {
+                                "ok": True,
+                                "result": {
+                                    "message_ids": [],
+                                    "total_size": 0,
+                                    "error": f"SELECT INBOX failed: {status}",
+                                },
+                            }
+                        _, msg_ids = mailbox.search(None, "ALL")
+                        ids = msg_ids[0].split() if msg_ids[0] else []
+                        for mid in ids:
+                            _, data = mailbox.fetch(mid, "(RFC822)")
+                            if data and data[0]:
+                                raw = data[0][1] if isinstance(data[0], tuple) else data[0]
+                                total_size += len(raw)
+                        messages = [mid.decode() for mid in ids]
+                    finally:
+                        mailbox.logout()
+                except Exception as ex:
+                    return {
+                        "ok": True,
+                        "message_ids": [],
+                        "total_size": 0,
+                        "error": str(ex),
+                    }
+                return {
+                    "ok": True,
+                    "message_ids": messages,
+                    "total_size": total_size,
+                    "error": None,
+                }
+
+            return {"ok": False, "error": f"Unknown op: {op}"}
+
+        except Exception as e:
+            import traceback
+            return {"ok": False, "error": str(e) or repr(e) or "unknown", "trace": traceback.format_exc()}
+
     def _dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
         from effect_broker.executor_ipc import ExecutorRequest
 
@@ -344,32 +512,28 @@ class ExecutorServer:
                 obs_targets = self._store.apply_effect(effect_dict)
                 return {
                     "ok": True,
-                    "result": {
-                        "observed_targets": list(obs_targets),
-                        "effects_log": list(self._store.effects_log),
-                    },
+                    "observed_targets": list(obs_targets),
+                    "effects_log": list(self._store.effects_log),
                 }
 
             case ExecutorRequest.READ_STORE:
                 return {
                     "ok": True,
-                    "result": {
-                        "files": self._store.list_files(),
-                        "emails": self._store.list_emails(),
-                        "mailboxes": self._store.list_mailboxes(),
-                        "effects_log": self._store.read_effects_log(),
-                        "identity_log": self._store.read_identity_log(),
-                    },
+                    "files": self._store.list_files(),
+                    "emails": self._store.list_emails(),
+                    "mailboxes": self._store.list_mailboxes(),
+                    "effects_log": self._store.read_effects_log(),
+                    "identity_log": self._store.read_identity_log(),
                 }
 
             case ExecutorRequest.READ_FILES:
-                return {"ok": True, "result": {"files": self._store.list_files()}}
+                return {"ok": True, "files": self._store.list_files()}
 
             case ExecutorRequest.READ_EMAILS:
-                return {"ok": True, "result": {"emails": self._store.list_emails()}}
+                return {"ok": True, "emails": self._store.list_emails()}
 
             case ExecutorRequest.READ_MAILBOXES:
-                return {"ok": True, "result": {"mailboxes": self._store.list_mailboxes()}}
+                return {"ok": True, "mailboxes": self._store.list_mailboxes()}
 
             case ExecutorRequest.BOOTSTRAP:
                 files = payload.get("files", [])
@@ -381,11 +545,31 @@ class ExecutorServer:
                 mailboxes = payload.get("mailboxes", [])
                 for user in mailboxes:
                     self._store._unsafe_bootstrap_mailbox(user)
-                return {"ok": True, "result": True}
+                return {"ok": True}
+
+            case ExecutorRequest.APPLY_EFFECT:
+                return self._handle_real_effect(payload)
+
+            case ExecutorRequest.SYNC_SESSION:
+                # Sync session state from broker to subprocess.
+                # Subprocess maintains its own mirror of session state for:
+                # 1. Independent Fresh checking (replay prevention)
+                # 2. Audit trail of session state at each execution
+                # 3. Independent verification for ledger
+                task_id = payload.get("task_id", "default")
+                session_state = payload.get("session_state", {})
+                self._session_states[task_id] = session_state
+                # Return subprocess's current view of session state
+                return {
+                    "ok": True,
+                    "task_id": task_id,
+                    "session_snapshot": self._session_states.get(task_id, {}),
+                    "all_tasks": list(self._session_states.keys()),
+                }
 
             case ExecutorRequest.SHUTDOWN:
                 self._shutdown_requested = True
-                return {"ok": True, "result": True}
+                return {"ok": True}
 
 
 class ExecutorProcessHandle:
