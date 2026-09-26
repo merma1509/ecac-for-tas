@@ -158,14 +158,16 @@ class TestRealProvenanceSubprocess:
             if socket_path.exists():
                 socket_path.unlink()
 
-    @pytest.mark.skip(reason="Skipped due to /var→/private symlink + gate() vs commit() nonce reservation divergence on macOS. Mode-bit provenance derivation tested in TestContentProvenance via cap_for_tool fixture.")
     def test_provenance_derivation_uses_real_mode_bits(self, tmp_path: Path) -> None:
         """Shim derives Confidentiality/Integrity from real mode bits.
 
         File permissions control confidentiality. The shim reads real stat
         and derives labels, not accepting LLM claims.
+        
+        Note: Uses same-process mode (same as subprocess path) since RealFileShim
+        delegates to subprocess for real stat() calls.
         """
-        from effect_broker.lattice import Confidentiality
+        from effect_broker.lattice import Confidentiality, Integrity
         from effect_broker.shim_real import RealFileShim
 
         from effect_broker.broker import EffectBroker
@@ -188,6 +190,8 @@ class TestRealProvenanceSubprocess:
                 expiry=float("inf"),
                 nonce="cap-mode",
             ),
+            # Allow CONFIDENTIAL provenance from shim (derived from permission bits)
+            flow_boundary=(Confidentiality.CONFIDENTIAL, Integrity.USER),
         )
         broker.register_task(task)
         broker.capabilities["cap-mode"] = Capability(
@@ -204,8 +208,9 @@ class TestRealProvenanceSubprocess:
         test_file.write_text("private content")
         test_file.chmod(0o600)
         # Use .resolve() for the URI so scope label matches canonical path
+        resolved_path = str(test_file.resolve())
         broker.store._unsafe_bootstrap_file(
-            f"file://{test_file.resolve()}", Confidentiality.CONFIDENTIAL
+            f"file://{resolved_path}", Confidentiality.CONFIDENTIAL
         )
 
         shim = RealFileShim(broker, task_id="mode-test", tool_name="mode-tool")
