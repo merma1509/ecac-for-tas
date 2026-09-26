@@ -9,15 +9,15 @@ from __future__ import annotations
 from effect_broker.broker import EffectBroker
 from effect_broker.lattice import Confidentiality, Integrity
 from effect_broker.model import (
+    APPROVER,
+    BROKER,
+    USER,
     Capability,
     Commit,
     Data,
     Effect,
     LabelException,
     Task,
-    USER,
-    APPROVER,
-    BROKER,
 )
 from effect_broker.traces import build
 
@@ -603,7 +603,7 @@ class TestSessionTaintInterEffectComposition:
         assert task.session.tainted is True
 
         # Broker records a declass exception (user approved)
-        declass = EffectBroker.request_label_exception(
+        _unused_declass = EffectBroker.request_label_exception(
             kind="declass",
             target="internal@corp.com",
             from_label="CONFIDENTIAL",
@@ -846,7 +846,7 @@ class TestProvenanceDerivation:
     def test_internal_path_is_internal(self) -> None:
         """file:///internal/doc → INTERNAL/USER (keyword "internal" in path)."""
         from effect_broker.broker import derive_file_provenance
-        from effect_broker.lattice import Confidentiality, Integrity
+        from effect_broker.lattice import Confidentiality
 
         conf, integ = derive_file_provenance("file:///internal/strategy-2025")
         assert conf == Confidentiality.INTERNAL, f"Expected INTERNAL, got {conf}"
@@ -876,7 +876,7 @@ class TestProvenanceDerivation:
         resolver = broker._provenance_resolver
         conf, integ = resolver.resolve("alice@corp.com")
         # corp.com is in TRUSTED_DOMAINS → internal domain → INTERNAL
-        assert conf == Confidentiality.INTERNAL, f"Expected INTERNAL for corp.com domain, got {conf}"
+        assert conf == Confidentiality.INTERNAL, f"Expected INTERNAL for corp.com domain, got {conf}"  # noqa: E501
         assert integ == Integrity.USER
 
     def test_email_external_domain_is_public(self) -> None:
@@ -905,9 +905,10 @@ class TestRealOSProvenance:
 
     def test_owner_only_file_is_confidential(self, tmp_path) -> None:
         """File with mode 0o600 → CONFIDENTIAL (reads real permission bits)."""
+        import os
+
         from effect_broker.broker import derive_file_provenance
         from effect_broker.lattice import Confidentiality
-        import os
 
         # Create file with owner-only permissions
         f = tmp_path / "random-test-file"
@@ -921,9 +922,10 @@ class TestRealOSProvenance:
 
     def test_world_readable_file_is_public(self, tmp_path) -> None:
         """File with mode 0o644 → PUBLIC (world-readable)."""
+        import os
+
         from effect_broker.broker import derive_file_provenance
         from effect_broker.lattice import Confidentiality
-        import os
 
         f = tmp_path / "public-doc.txt"
         f.write_text("public content")
@@ -936,9 +938,10 @@ class TestRealOSProvenance:
 
     def test_group_readable_file_is_internal(self, tmp_path) -> None:
         """File with mode 0o640 → INTERNAL (group-readable, not world)."""
+        import os
+
         from effect_broker.broker import derive_file_provenance
         from effect_broker.lattice import Confidentiality
-        import os
 
         f = tmp_path / "group-report.txt"
         f.write_text("internal data")
@@ -975,9 +978,10 @@ class TestRealOSProvenance:
 
     def test_derive_file_provenance_reads_real_permission_bits(self, tmp_path) -> None:
         """derive_file_provenance() reads real os.stat() permission bits, not keywords."""
+        import os
+
         from effect_broker.broker import derive_file_provenance
         from effect_broker.lattice import Confidentiality
-        import os
 
         # A file with a "random" name but owner-only permissions → CONFIDENTIAL
         # This proves the kernel reads real permission bits (not the name)

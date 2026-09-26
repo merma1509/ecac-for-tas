@@ -46,7 +46,7 @@ from __future__ import annotations
 import os
 import threading
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from .executor import IsolatedExecutor, SubprocessExecutor
 from .executor_ipc import ProcessExecutorClient
@@ -70,6 +70,12 @@ from .model import (
     TaskId,
 )
 from .restricted_store import RestrictedResourceStore as ResourceStore
+from .tool_registry import ToolDeclaration, ToolRegistry
+
+if TYPE_CHECKING:
+    from .shim_email import RealEmailShim
+    from .shim_real import RealFileShim
+
 
 # Union of types that can be passed as the `ledger` argument.
 # Local: IndependentEffectLedger (wrapped in LocalLedgerBackend internally).
@@ -329,6 +335,13 @@ class EffectBroker:
         self._task_locks: dict[TaskId, threading.Lock] = {}
         # Provenance derivation from real resource metadata (not hand-assigned)
         self._provenance_resolver = _ProvenanceResolver(self)
+        # ToolRegistry: structural enforcement layer (T14 hidden side effects, T13)
+        # In strict mode, tools must be pre-registered with declared rights/targets.
+        # In permissive mode (default), unknown tools are allowed (limitation).
+        self.tool_registry: "ToolRegistry | None" = None  # noqa: UP037, F821
+        self._registry_strict: bool = False
+        # L4: Send rate limiting per session (0 = unlimited)
+        self._max_sends_per_session: int = 0
         # Execution mode
         self._mode = mode
         self._executor_socket = Path(executor_socket)
@@ -360,6 +373,74 @@ class EffectBroker:
 
         # Bootstrap the subprocess store with the broker's existing resources
         self._bootstrap_executor_store(client)
+
+    def set_tool_registry(self, strict: bool = False) -> "ToolRegistry":  # noqa: UP037, F821
+        """Enable structural enforcement via ToolRegistry.
+
+        This is the L3 fix for T14 (hidden side effects). When enabled,
+        gate() checks that tool operations are within declared capabilities
+        BEFORE evaluating the four-predicate gate.
+
+        Args:
+            strict: If True, unknown tools are BLOCKed. If False, allowed
+                   (documented limitation — see Honest Limitation L3).
+
+        Returns:
+            The created ToolRegistry for declarative setup.
+
+        Example:
+            broker.set_tool_registry(strict=True)
+            broker.tool_registry.declare(ToolDeclaration(...))
+        """
+
+        self.tool_registry = ToolRegistry(strict=strict)
+        self._registry_strict = strict
+        return self.tool_registry
+
+    def register_tool(self, declaration: ToolDeclaration) -> None:
+        """Register a tool's declared capabilities.
+
+        Must be called AFTER set_tool_registry().
+        Raises RuntimeError if registry is not enabled.
+        """
+        if self.tool_registry is None:
+            raise RuntimeError(
+                "Cannot register tool: ToolRegistry not enabled. "
+                "Call broker.set_tool_registry() first."
+            )
+        self.tool_registry.declare(declaration)
+
+    def set_send_rate_limit(self, max_sends: int) -> None:
+        """Set the maximum number of sends allowed per session.
+
+        L4 fix: Prevents amplification via composition (many small sends exfiltrate
+        more data than individually authorized). When max_sends is reached,
+        check_noamp() blocks subsequent sends with "send-rate-limit" reason.
+
+        This is a SESSION-SCOPED limit. Each task has its own session, so the
+        limit applies per-task. A task can send up to max_sends emails before
+        being blocked. A new task/session starts fresh (send_count = 0).
+
+        For production, set this based on expected workflow:
+          - max_sends=5: Conservative (prevents bulk exfil)
+          - max_sends=10: Moderate (allows reasonable workflows)
+          - max_sends=0: Unlimited (disable rate limiting — not recommended)
+
+        Example:
+            broker.set_send_rate_limit(max_sends=5)  # Max 5 sends per session
+            broker.grant_root(...)  # Now each session limited to 5 sends
+        """
+        if max_sends < 0:
+            raise ValueError(f"max_sends must be >= 0, got {max_sends}")
+        self._max_sends_per_session = max_sends
+
+    def _apply_send_rate_limit_to_session(self, task: Task) -> None:
+        """Apply the broker's send rate limit to a task's session.
+
+        Called when creating a new session or when a task is registered.
+        """
+        if self._max_sends_per_session > 0 and task.session is not None:
+            task.session.set_max_sends(self._max_sends_per_session)
 
     def _bootstrap_executor_store(self, client: ProcessExecutorClient) -> None:
         """Bootstrap the subprocess store with resources from broker's same-process store.
@@ -394,6 +475,31 @@ class EffectBroker:
             if isinstance(executor, SubprocessExecutor):
                 executor.shutdown()
             self._mode = "shutdown"  # prevent double-shutdown
+
+    def bootstrap_subprocess(
+        self,
+        files: list[dict[str, str]] | None = None,
+        emails: list[dict[str, str]] | None = None,
+        mailboxes: list[str] | None = None,
+    ) -> None:
+        """Bootstrap the subprocess store with additional resources post-startup.
+
+        Normally, resources in the broker's same-process store are transferred
+        to the subprocess at startup via _bootstrap_executor_store(). This
+        method lets tests add resources to the subprocess store directly via
+        IPC, after the broker and subprocess are already running.
+
+        Args:
+            files: list of {"path": "...", "sensitivity": "CONFIDENTIAL|INTERNAL|PUBLIC"}
+            emails: list of {"address": "...", "domain": "INTERNAL|EXTERNAL"}
+            mailboxes: list of mailbox usernames
+        """
+        if self._mode != "multi-process":
+            raise RuntimeError("bootstrap_subprocess() only works in multi-process mode")
+        executor = self._executor
+        if isinstance(executor, SubprocessExecutor):
+            if hasattr(executor, "_client") and executor._client is not None:
+                executor._client.bootstrap(files=files, emails=emails, mailboxes=mailboxes)
 
     def set_mediator(self, mediator: Mediator) -> None:
         """Attach a Mediator (the enforcement shim) to this broker"""
@@ -493,6 +599,9 @@ class EffectBroker:
                     f"Re-registering a used task would allow replay attacks."
                 )
         self.tasks[task.task_id] = task
+
+        # Apply send rate limit to new sessions
+        self._apply_send_rate_limit_to_session(task)
 
     def get_task(self, task_id: TaskId) -> Task | None:
         """Look up a registered task."""
@@ -885,11 +994,19 @@ class EffectBroker:
         rather than hard-coded per-effect-type defaults. This lets
         each task define its own sensitivity floor, making FlowOK task-scoped.
 
+        CONFIDENTIALITY CHECK applies only to OUTPUT effects (write/send/delete/
+        network). Read effects are INPUT operations — they pull data INTO the
+        session, not push it OUT to a sink. Blocking reads of CONFIDENTIAL files
+        would make the system unusable (you can't read any confidential doc).
+        The read→send amplification attack is handled by SESSION TAINT (see below).
+
+        INTEGRITY CHECK applies only to OUTPUT effects as well.
+
         SESSION TAINT (inter-effect composition):
           If the task's session has read CONFIDENTIAL data (session.tainted=True),
           ALL send effects are blocked unless a broker-recorded declass exception
           exists. This prevents the read-secrets→send-exfil attack without requiring
-          taint tracking on data values. The session is tainted when a read effect
+          taint tracking on data VALUES. The session is tainted when a read effect
           reads a CONFIDENTIAL file (see _apply_effect for read handling).
         """
         # ---- Session taint check (inter-effect composition) ----
@@ -910,20 +1027,27 @@ class EffectBroker:
                 )
 
         sink_confidentiality, sink_integrity = task.flow_boundary
-        for datum in effect.provenance:
-            if datum.confidentiality > sink_confidentiality and not self._has_validated_exception(
-                effect, "declass", datum.confidentiality.name
-            ):
-                return False, (
-                    f"conf-leak({datum.name}:"
-                    f"{datum.confidentiality.name}>{sink_confidentiality.name})"
-                )
-            if datum.integrity < sink_integrity and not self._has_validated_exception(
-                effect, "endorse", datum.integrity.name
-            ):
-                return False, (
-                    f"low-integrity({datum.name}:{datum.integrity.name}<{sink_integrity.name})"
-                )
+
+        # Only check output effects. Reads are inputs — they pull data INTO the
+        # session and should not be blocked for reading confidential data.
+        # The read→send attack is handled by session taint above.
+        is_output_effect = effect.etype in ("write", "send", "delete", "network")
+
+        if is_output_effect:
+            for datum in effect.provenance:
+                sens = datum.confidentiality > sink_confidentiality
+                decl = self._has_validated_exception(effect, "declass", datum.confidentiality.name)
+                if sens and not decl:
+                    return False, (
+                        f"conf-leak({datum.name}:"
+                        f"{datum.confidentiality.name}>{sink_confidentiality.name})"
+                    )
+                low = datum.integrity < sink_integrity
+                endo = self._has_validated_exception(effect, "endorse", datum.integrity.name)
+                if low and not endo:
+                    return False, (
+                        f"low-integrity({datum.name}:{datum.integrity.name}<{sink_integrity.name})"
+                    )
         return True, "flow-ok"
 
     def check_noamp(self, effect: Effect, task: Task) -> PredicateResult:
@@ -1057,6 +1181,14 @@ class EffectBroker:
                             f"ssrf containment failed: url-domain={url_domain} "
                             f"not in cap-scope={capability.scope}"
                         )
+
+        # L4 FIX: Send rate limiting for inter-effect amplification prevention.
+        # Blocks when session exceeds max_sends_per_session. This prevents the
+        # "many small sends exfiltrate data" attack pattern.
+        if effect.etype == "send" and task.session is not None:
+            allowed, reason = task.session.increment_send_count()
+            if not allowed:
+                return False, reason
 
         return True, f"composition-ok(ceiling-scope={task.ceiling.scope})"
 
@@ -1204,11 +1336,23 @@ class EffectBroker:
 
         return True, f"fresh(t_session={task.session.logical_time})"
 
-    def _atomic_fresh_check(self, effect: Effect, task: Task) -> tuple[PredicateResult, bool]:
-        """Thread-safe Fresh check: atomically checks and RESERVES the nonce.
+    def _atomic_fresh_check(
+        self,
+        effect: Effect,
+        task: Task,
+        reserve_nonce: bool = True,
+    ) -> tuple[PredicateResult, bool]:
+        """Thread-safe Fresh check: atomically checks and (optionally) RESERVES the nonce.
 
         Returns ((ok, evidence), nonce_reserved). If the caller (gate()) fails
         after reservation, it MUST call _release_fresh_reservation() to roll back.
+
+        Args:
+            effect: The effect to check
+            task: The task context
+            reserve_nonce: If True, atomically reserve the nonce in session.used.
+                         Set to False for multi-process mode where the subprocess
+                         handles nonce reservation via APPLY_COMMIT.
 
         This closes the race:
           Thread 1: check_fresh() reads used=∅ -> PASS
@@ -1228,8 +1372,13 @@ class EffectBroker:
                 # Atomic reservation: add nonce while holding the lock.
                 # No other thread can check or reserve this nonce until we release.
                 # session is always set: Task.__post_init__ creates a default one.
-                task.session.used.add(effect.capability_nonce)  # type: ignore[union-attr]
-                return result, True
+                #
+                # For multi-process mode (SubprocessExecutor), skip reservation here
+                # because the subprocess handles it via APPLY_COMMIT.
+                if reserve_nonce:
+                    task.session.used.add(effect.capability_nonce)  # type: ignore[union-attr]
+                    return result, True
+                return result, False
             return result, False
 
     def _release_fresh_reservation(self, effect: Effect, task: Task) -> None:
@@ -1305,11 +1454,19 @@ class EffectBroker:
         self,
         commit: Commit,
         mediation: MediationVerdict | None = None,
+        reserve_nonce: bool = True,
     ) -> CommitGateResult:
         """Phase 1: Evaluate the four-predicate gate. No state mutation.
 
         Returns CommitGateResult with allow/evidence. Does NOT apply any effect.
         The executor calls this, then calls apply_effect() on can_apply=True.
+
+        Args:
+            commit: The commit to gate
+            mediation: Optional pre-built boundary mediation verdict
+            reserve_nonce: If True, reserve the nonce atomically in session.used.
+                          Set to False for multi-process mode where the subprocess
+                          handles nonce reservation via APPLY_COMMIT.
 
         This split enables independent observer verification:
         - observer records authorized effects from gate result
@@ -1334,6 +1491,7 @@ class EffectBroker:
                 )
                 task = Task(task_id="default", owner=USER, ceiling=default_ceiling)
                 self.tasks[task.task_id] = task
+                self._apply_send_rate_limit_to_session(task)
 
         assert task.session is not None, "Task must have a session (set by __post_init__)"
 
@@ -1378,11 +1536,43 @@ class EffectBroker:
                     can_apply=False,
                 )
 
-        # Atomic Fresh check: check AND reserve the nonce atomically.
+        # Atomic Fresh check: check AND (optionally) reserve the nonce atomically.
         # This prevents double-commit with the same nonce under concurrency.
         # nonce_reserved = True means Fresh passed AND the nonce is now in used.
         # If we fail the gate AFTER reserving, we MUST release (see rollback below).
-        fresh_result, nonce_reserved = self._atomic_fresh_check(effect, task)
+
+        # For multi-process mode (SubprocessExecutor), reserve_nonce=False because
+        # the subprocess handles nonce reservation via APPLY_COMMIT protocol.
+        fresh_result, nonce_reserved = self._atomic_fresh_check(effect, task, reserve_nonce)
+
+        # L3 FIX: Structural enforcement (T14 hidden side effects, T13 false description)
+        # This is Layer 2 above the four-predicate gate (Layer 1).
+        # ToolRegistry must be enabled via set_tool_registry() and tools pre-registered.
+        if self.tool_registry is not None and commit.tool_name is not None:
+            structural_ok, structural_reason = self.tool_registry.check_operation(
+                commit.tool_name, effect
+            )
+            if not structural_ok:
+                # Structural failures are terminal — don't run four-predicate gate
+                return CommitGateResult(
+                    allow=False,
+                    evidence={
+                        "allow": False,
+                        "primary_blocker": "Structural",
+                        "predicates": {
+                            "Structural": structural_reason,
+                            "Auth": "skipped",
+                            "FlowOK": "skipped",
+                            "NoAmp": "skipped",
+                            "Fresh": "skipped",
+                        },
+                        "boundary_stop": None,
+                        "approval_binding": None,
+                    },
+                    effect=effect,
+                    task=task,
+                    can_apply=False,
+                )
 
         predicate_results: dict[str, PredicateResult] = {
             "Auth": self.check_auth(effect, task),
@@ -1587,3 +1777,73 @@ class EffectBroker:
             authorized_records[(tid, nonce)] = targets
 
         return self._ledger_backend.verify_all(authorized_records)
+
+    # ---- Real shim factory (IPC-aware) ----
+    # In multi-process mode, shims MUST route real I/O through the subprocess.
+    # These factory methods wire the IPC client into the shim automatically.
+
+    def create_real_file_shim(
+        self,
+        task_id: str = "default",
+        tool_name: str = "untrusted-tool",
+    ) -> RealFileShim:
+        """Create a RealFileShim with IPC routing in multi-process mode.
+
+        In multi-process mode, real file I/O happens in the executor subprocess
+        (not in the broker process). The IPC client is extracted from the
+        SubprocessExecutor.
+
+        In same-process mode, ipc_client is None and the shim uses direct
+        OS calls (legacy behavior).
+        """
+        from .shim_real import RealFileShim
+
+        shim = RealFileShim(broker=self, task_id=task_id, tool_name=tool_name)
+
+        if self._mode == "multi-process" and self._executor is not None:
+            # Wire IPC client from SubprocessExecutor into the shim
+            from .executor import SubprocessExecutor
+
+            if isinstance(self._executor, SubprocessExecutor):
+                shim.ipc_client = self._executor._client
+
+        return shim
+
+    def create_real_email_shim(
+        self,
+        task_id: str = "default",
+        tool_name: str = "untrusted-tool",
+        smtp_host: str = "localhost",
+        smtp_port: int = 25,
+        imap_host: str = "localhost",
+        imap_port: int = 993,
+    ) -> RealEmailShim:
+        """Create a RealEmailShim with IPC routing in multi-process mode.
+
+        In multi-process mode, real SMTP/IMAP happens in the executor subprocess
+        (not in the broker process). The IPC client is extracted from the
+        SubprocessExecutor.
+
+        In same-process mode, ipc_client is None and the shim uses direct
+        smtplib/imaplib calls (legacy behavior).
+        """
+        from .shim_email import RealEmailShim
+
+        shim = RealEmailShim(
+            broker=self,
+            task_id=task_id,
+            tool_name=tool_name,
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            imap_host=imap_host,
+            imap_port=imap_port,
+        )
+
+        if self._mode == "multi-process" and self._executor is not None:
+            # Wire IPC client from SubprocessExecutor into the shim
+            from .executor import SubprocessExecutor
+
+            if isinstance(self._executor, SubprocessExecutor):
+                shim.ipc_client = self._executor._client
+
+        return shim

@@ -23,6 +23,8 @@ Design rationale:
 
 from __future__ import annotations
 
+import threading
+import types
 import warnings
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -54,13 +56,13 @@ class _FilesView(Mapping[str, File]):
         self._store = store
 
     def __getitem__(self, key: str) -> File:
-        return self._store._files._data[key]
+        return self._store._read_files()[key]
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self._store._files._data)
+        return iter(self._store._read_files())
 
     def __len__(self) -> int:
-        return len(self._store._files._data)
+        return len(self._store._read_files())
 
 
 class _EmailsView(Mapping[str, Email]):
@@ -70,13 +72,13 @@ class _EmailsView(Mapping[str, Email]):
         self._store = store
 
     def __getitem__(self, key: str) -> Email:
-        return self._store._emails._data[key]
+        return self._store._read_emails()[key]
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self._store._emails._data)
+        return iter(self._store._read_emails())
 
     def __len__(self) -> int:
-        return len(self._store._emails._data)
+        return len(self._store._read_emails())
 
 
 class _MailboxesView(Mapping[str, Mailbox]):
@@ -86,13 +88,13 @@ class _MailboxesView(Mapping[str, Mailbox]):
         self._store = store
 
     def __getitem__(self, key: str) -> Mailbox:
-        return self._store._mailboxes._data[key]
+        return self._store._read_mailboxes()[key]
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self._store._mailboxes._data)
+        return iter(self._store._read_mailboxes())
 
     def __len__(self) -> int:
-        return len(self._store._mailboxes._data)
+        return len(self._store._read_mailboxes())
 
 
 # Store initialization helper
@@ -151,6 +153,10 @@ class RestrictedResourceStore:
         self._mailboxes = _mailboxes
         self.effects_log: list[tuple[str, str]] = []
         self.identity_log: list[frozenset[str]] = []
+        self._effects_log_base: tuple[tuple[str, str], ...] = ()
+        self._identity_log_base: tuple[frozenset[str], ...] = ()
+        self._sealed = False
+        self._lock = threading.RLock()  # Guards seal state and all mutations
 
         # Public read-only views (pass self so they read live data)
         self.files = _FilesView(self)
@@ -162,30 +168,137 @@ class RestrictedResourceStore:
     # After that, all mutations go through apply_effect().
 
     def _unsafe_bootstrap_file(self, path: str, sensitivity: Confidentiality) -> None:
-        """BOOTSTRAP ONLY: pre-populate a file resource before broker runs."""
-        self._files._data[path] = File(path, sensitivity)
+        """BOOTSTRAP ONLY: pre-populate a file resource before broker runs.
+
+        Temporarily unlocks the store if sealed (test/setup use only).
+        Re-seals after bootstrap to maintain the invariant.
+        """
+        was_sealed = self._sealed
+        if was_sealed:
+            self._unlock()
+        try:
+            self._files._data[path] = File(path, sensitivity)
+        finally:
+            if was_sealed:
+                self._seal()
 
     def _unsafe_bootstrap_email(self, address: str, domain: Domain) -> None:
         """BOOTSTRAP ONLY: pre-populate an email resource before broker runs."""
-        self._emails._data[address] = Email(address, domain)
+        was_sealed = self._sealed
+        if was_sealed:
+            self._unlock()
+        try:
+            self._emails._data[address] = Email(address, domain)
+        finally:
+            if was_sealed:
+                self._seal()
 
     def _unsafe_bootstrap_mailbox(self, user: str) -> None:
         """BOOTSTRAP ONLY: pre-populate a mailbox before broker runs."""
-        self._mailboxes._data[user] = Mailbox(user)
+        was_sealed = self._sealed
+        if was_sealed:
+            self._unlock()
+        try:
+            self._mailboxes._data[user] = Mailbox(user)
+        finally:
+            if was_sealed:
+                self._seal()
+
+    def _seal(self) -> None:
+        """LOCK the store: freeze all internal dicts as read-only.
+
+        After calling _seal(), any attempt to mutate _files._data,
+        _emails._data, or _mailboxes._data will raise TypeError or
+        AttributeError. The only path for state change is apply_effect().
+
+        Call this after bootstrap completes and before the broker starts
+        accepting effects. This is advisory in same-process mode
+        (Python can't truly prevent __dict__ replacement), but raises
+        the bar from accidental to deliberate bypass, and makes the
+        attack surface explicit.
+
+        Thread-safe: uses the store's own lock.
+        """
+        self._lock.acquire()
+        try:
+            self._sealed = True
+            # Replace mutators with ones that raise
+            self._files._data = types.MappingProxyType(self._files._data)  # type: ignore[assignment]
+            self._emails._data = types.MappingProxyType(self._emails._data)  # type: ignore[assignment]
+            self._mailboxes._data = types.MappingProxyType(self._mailboxes._data)  # type: ignore[assignment]
+            # Freeze effects_log and identity_log as tuple views (append only)
+            self._effects_log_base = tuple(self.effects_log)
+            self._identity_log_base = tuple(self.identity_log)
+        finally:
+            self._lock.release()
+
+    def _unlock(self) -> None:
+        """UNLOCK the store: restore mutability (use only in tests)."""
+        self._lock.acquire()
+        try:
+            self._sealed = False
+            # Restore mutable dicts from the base tuples
+            self._files._data = dict(self._files._data)
+            self._emails._data = dict(self._emails._data)
+            self._mailboxes._data = dict(self._mailboxes._data)
+            # Restore append-only lists from base
+            self.effects_log = list(self._effects_log_base)
+            self.identity_log = list(self._identity_log_base)
+        finally:
+            self._lock.release()
+
+    def _check_not_sealed(self) -> None:
+        """Assert store is not sealed. Raises RuntimeError if sealed."""
+        if self._sealed:
+            raise RuntimeError(
+                "SAME-PROCESS BYPASS ATTEMPT: RestrictedResourceStore is sealed. "
+                "Direct mutation of internal state is not allowed. "
+                "Use broker.commit() to mutate state."
+            )
+
+    def _read_files(self) -> Mapping[str, File]:
+        """Return the files dict for reading (works even when sealed)."""
+        return self._files._data
+
+    def _read_emails(self) -> Mapping[str, Email]:
+        """Return the emails dict for reading (works even when sealed)."""
+        return self._emails._data
+
+    def _read_mailboxes(self) -> Mapping[str, Mailbox]:
+        """Return the mailboxes dict for reading (works even when sealed)."""
+        return self._mailboxes._data
+
+    def _mutable_files(self) -> dict[str, File]:
+        """Return the files dict for writing. Raises on sealed store."""
+        self._check_not_sealed()
+        return self._files._data
+
+    def _mutable_emails(self) -> dict[str, Email]:
+        """Return the emails dict for writing. Raises on sealed store."""
+        self._check_not_sealed()
+        return self._emails._data
+
+    def _mutable_mailboxes(self) -> dict[str, Mailbox]:
+        """Return the mailboxes dict for writing. Raises on sealed store."""
+        self._check_not_sealed()
+        return self._mailboxes._data
 
     # ---- Single mutation point ----
-
     def resolve(self, target: str) -> Resource | None:
         """Look up a resource by its target string (id)"""
-        if target in self._files._data:
-            return self._files._data[target]
-        if target in self._emails._data:
-            return self._emails._data[target]
-        if target in self._mailboxes._data:
-            return self._mailboxes._data[target]
-        if target.startswith("http://") or target.startswith("https://"):
-            return self._url_for(target)
-        return None
+        self._lock.acquire()
+        try:
+            if target in self._read_files():
+                return self._read_files()[target]
+            if target in self._read_emails():
+                return self._read_emails()[target]
+            if target in self._read_mailboxes():
+                return self._read_mailboxes()[target]
+            if target.startswith("http://") or target.startswith("https://"):
+                return self._url_for(target)
+            return None
+        finally:
+            self._lock.release()
 
     def _url_for(self, uri: str) -> URL:
         """Resolve a URI string to a URL resource."""
@@ -213,8 +326,9 @@ class RestrictedResourceStore:
         in identity_log.
         """
         for addr in all_targets:
-            if addr in self._emails._data:
-                resource = self._emails._data[addr]
+            emails = self._mutable_emails()
+            if addr in emails:
+                resource = emails[addr]
             else:
                 # Infer domain from address
                 if "@" in addr:
@@ -227,11 +341,12 @@ class RestrictedResourceStore:
                 else:
                     inferred_domain = Domain.EXTERNAL
                 resource = Email(addr, inferred_domain)
-                self._emails._data[addr] = resource
+                emails[addr] = resource
 
             # Deliver to the sender's outbox
             local = addr.split("@")[0]
-            mb = self._mailboxes._data.setdefault(local, Mailbox(local))
+            mailboxes = self._mutable_mailboxes()
+            mb = mailboxes.setdefault(local, Mailbox(local))
             body = ""
             if effect.metadata.get("body"):
                 body = f": {effect.metadata['body']}"
@@ -242,7 +357,7 @@ class RestrictedResourceStore:
     def mailbox_for(self, email: Email) -> Mailbox:
         """Resolve an email address to its owner's mailbox (address → user)."""
         local = email.address.split("@")[0]
-        return self._mailboxes._data.setdefault(local, Mailbox(local))
+        return self._mutable_mailboxes().setdefault(local, Mailbox(local))
 
     def apply_effect(self, effect: Effect) -> None:
         """Mutate external state for a committed (allowed) effect.
@@ -250,6 +365,9 @@ class RestrictedResourceStore:
         THIS IS THE SOLE PATH for external state mutation. Every call
         appends to effects_log and identity_log, enabling the observer
         to verify complete mediation.
+
+        Thread-safe: holds store lock during mutation.
+        Raises RuntimeError if the store is sealed (bypass attempt).
 
         Semantics:
           - write/delete: files (dynamically resolved if not bootstrapped)
@@ -262,6 +380,15 @@ class RestrictedResourceStore:
         effect for the observer. For real file I/O, see RealFileShim which
         calls actual OS operations before committing to the broker.
         """
+        self._lock.acquire()
+        try:
+            self._check_not_sealed()
+            self._apply_effect_inner(effect)
+        finally:
+            self._lock.release()
+
+    def _apply_effect_inner(self, effect: Effect) -> None:
+        """Inner apply_effect body — called while holding the store lock."""
         target_id = effect.target
         resource = self.resolve(target_id)
 
@@ -269,12 +396,10 @@ class RestrictedResourceStore:
         # bootstrapped. This allows the shim to create new files without
         # pre-registering every path in the store.
         if resource is None and target_id.startswith("file://"):
-            # Derive sensitivity from the effect's provenance, or default INTERNAL
             conf = self._derive_confidentiality_from_effect(effect)
             resource = File(target_id, conf)
-            self._files._data[target_id] = resource
+            self._mutable_files()[target_id] = resource
         elif resource is None:
-            # For other resource types, still require bootstrapping
             raise KeyError(f"effect targets unknown resource: {target_id}")
 
         # Build complete set of resources this effect touches
@@ -290,7 +415,7 @@ class RestrictedResourceStore:
         all_targets_frozen = frozenset(all_targets)
 
         if effect.etype == "delete" and isinstance(resource, File):
-            del self._files._data[target_id]
+            del self._mutable_files()[target_id]
             self.effects_log.append(("delete", f"file:{target_id}"))
             self.identity_log.append(all_targets_frozen)
 

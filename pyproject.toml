@@ -8,7 +8,9 @@ license = { text = "MIT" }
 authors = [{ name = "Niyonshuti Martin" }]
 keywords = ["agent-security", "tool-agents", "authority", "information-flow", "capabilities", "mcp"]
 
-dependencies = []
+dependencies = [
+    "pytest-asyncio>=1.4.0",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -28,6 +30,7 @@ packages = ["effect_broker"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q -W ignore::UserWarning"
+asyncio_mode = "auto"
 
 [tool.mypy]
 python_version = "3.11"

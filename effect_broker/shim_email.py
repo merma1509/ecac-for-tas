@@ -25,6 +25,7 @@ from .model import Data, Effect, EffectTarget
 
 if TYPE_CHECKING:
     from .broker import EffectBroker
+    from .executor_ipc import ProcessExecutorClient
 
 
 @dataclass
@@ -80,6 +81,10 @@ class RealEmailShim:
 
     # Independent observer record
     ops: list[EmailOp] = field(default_factory=list)
+
+    # IPC client for multi-process mode (set by broker)
+    # When set, real SMTP/IMAP goes through subprocess, not direct calls
+    ipc_client: ProcessExecutorClient | None = None
 
     def __init__(
         self,
@@ -153,12 +158,36 @@ class RealEmailShim:
         return raw, msg["Subject"], len(raw)
 
     def _smtp_send(self, sender: str, recipients: frozenset[str], raw_message: bytes) -> list[str]:
-        """Send raw bytes via real SMTP. Returns list of recipients accepted by MTA."""
+        """Send raw bytes via real SMTP. Returns list of recipients accepted by MTA.
+
+        In multi-process mode (ipc_client set), routes through subprocess IPC.
+        Otherwise uses direct smtplib calls (same-process mode).
+        """
+        # IPC mode: real SMTP happens in the isolated subprocess
+        if self.ipc_client is not None:
+            try:
+                result = self.ipc_client.real_smtp_send(
+                    sender,
+                    list(recipients),
+                    raw_message.decode("utf-8", errors="replace"),
+                )
+                delivered: list[str] = result.get("delivered", [])
+                return delivered
+            except RuntimeError as ex:
+                raise SMTPError(f"SMTP IPC error: {ex}") from ex
+
+        # Same-process mode: direct smtplib calls
         try:
             server = self._open_smtp()
             try:
                 # Establish the mail transaction (RSET to reset any prior state)
                 server.rset()
+                # RSET clears the session state, need to re-EHLO
+                try:
+                    server.ehlo()
+                except smtplib.SMTPServerDisconnected:
+                    server.connect(self.smtp_host, self.smtp_port)
+                    server.ehlo()
                 server.mail(sender)
                 # RCPT TO for each — this is where BCC detection happens
                 rcpt_results = self._smtp_rcpt_to(server, recipients)
@@ -172,13 +201,73 @@ class RealEmailShim:
         except smtplib.SMTPException as ex:
             raise SMTPError(f"SMTP error: {ex}") from ex
 
+    def _imap_read_inbox(self, user: str) -> tuple[list[str], int]:
+        """Read inbox via real IMAP. Returns (message_ids, total_size).
+
+        In multi-process mode (ipc_client set), routes through subprocess IPC.
+        Otherwise uses direct imaplib calls (same-process mode).
+        """
+        # IPC mode: real IMAP happens in the isolated subprocess
+        if self.ipc_client is not None:
+            try:
+                result = self.ipc_client.real_imap_read_inbox(
+                    user=user,
+                    imap_host=self.imap_host,
+                    imap_port=self.imap_port,
+                    imap_user=self.imap_user,
+                    imap_password=self.imap_password,
+                    imap_use_tls=True,
+                )
+                message_ids = result.get("message_ids", [])
+                total_size = result.get("total_size", 0)
+                error = result.get("error")
+                if error:
+                    raise EmailSecurityError(
+                        f"[{self.tool_name}] IMAP error reading inbox: {error}"
+                    )
+                return message_ids, total_size
+            except RuntimeError as ex:
+                raise SMTPError(f"IMAP IPC error: {ex}") from ex
+
+        # Same-process mode: direct imaplib calls
+        messages: list[str] = []
+        total_size = 0
+        try:
+            # IMAP4_SSL on port 993 (TLS-wrapped)
+            with imaplib.IMAP4_SSL(self.imap_host, self.imap_port) as mailbox:
+                if self.imap_user and self.imap_password:
+                    mailbox.login(self.imap_user, self.imap_password)
+                # SELECT INBOX
+                status, _ = mailbox.select("INBOX")
+                if status != "OK":
+                    raise EmailSecurityError(
+                        f"[{self.tool_name}] IMAP SELECT INBOX failed: {status}"
+                    )
+                # Search all messages (ALL = all messages in selected mailbox)
+                _, msg_ids = mailbox.search(None, "ALL")
+                ids = msg_ids[0].split() if msg_ids[0] else []
+                # Fetch each message as RFC822 for content analysis
+                for mid in ids:
+                    _, data = mailbox.fetch(mid, "(RFC822)")
+                    if data and data[0]:
+                        raw = data[0][1] if isinstance(data[0], tuple) else data[0]
+                        total_size += len(raw)
+                messages = [mid.decode() for mid in ids]
+        except imaplib.IMAP4.error as ex:
+            raise EmailSecurityError(f"[{self.tool_name}] IMAP error reading inbox: {ex}") from ex
+        except Exception as ex:
+            raise EmailSecurityError(f"[{self.tool_name}] read_inbox failed: {ex}") from ex
+
+        return messages, total_size
+
     def _open_smtp(self) -> smtplib.SMTP:
         """Open an SMTP connection to the configured MTA. Returns connected socket."""
+        timeout = 5.0  # 5 second timeout for connection
         if self.use_tls:
             # SMTP_SSL is a subclass of SMTP; cast to satisfy return type annotation
-            server: smtplib.SMTP = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port)
+            server: smtplib.SMTP = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=timeout)
         else:
-            server = smtplib.SMTP(self.smtp_host, self.smtp_port)
+            server = smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=timeout)
         if self.smtp_user and self.smtp_password:
             server.login(self.smtp_user, self.smtp_password)
         return server
@@ -201,23 +290,44 @@ class RealEmailShim:
             results[rcpt] = (code, msg)
         return results
 
-    def _parse_bcc_from_smtp(
-        self,
-        sender: str,
-        declared: frozenset[str],
+    def _smtp_probe(
+        self, sender: str, recipients: frozenset[str]
     ) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
-        """Probe the MTA to discover actual recipients via SMTP RCPT TO.
+        """Probe MTA to discover actual recipients via SMTP RCPT TO.
 
-        Returns (declared_recipients, actual_recipients, bcc_detected).
+        Returns (declared_recipients, actual_accepted, bcc_detected).
+
+        In multi-process mode, the RSET probe happens in the isolated subprocess
+        (not in the broker process). This ensures BCC detection is confined
+        within the subprocess boundary.
 
         BCC detection: after RSET (no DATA), the MTA accepted recipients are
         the ACTUAL set. Any accepted recipient not in declared is a BCC attempt.
         """
-        declared_set = declared  # callers must pass the complete declared set
+        # IPC mode: RSET probe happens in the isolated subprocess
+        if self.ipc_client is not None:
+            try:
+                result = self.ipc_client.real_smtp_probe(sender, list(recipients))
+                declared_fro = frozenset(result.get("declared", list(recipients)))
+                actual_fro = frozenset(result.get("actual_accepted", []))
+                bcc_fro = frozenset(result.get("bcc_detected", []))
+                return declared_fro, actual_fro, bcc_fro
+            except RuntimeError as ex:
+                raise SMTPError(f"BCC probe IPC error: {ex}") from ex
+
+        # Same-process mode: direct smtplib RSET probe
+        declared_set = recipients
         try:
             server = self._open_smtp()
             try:
                 server.rset()
+                # RSET clears the SMTP session state, so we need to EHLO again
+                try:
+                    server.ehlo()
+                except smtplib.SMTPServerDisconnected:
+                    # Some servers disconnect after RSET — reconnect and EHLO
+                    server.connect(self.smtp_host, self.smtp_port)
+                    server.ehlo()
                 server.mail(sender)
                 rcpt_results = self._smtp_rcpt_to(server, declared_set)
                 actual_accepted: frozenset[str] = frozenset(
@@ -257,12 +367,12 @@ class RealEmailShim:
             sender, canon_recipient, body, **extra_recipients
         )
 
-        # Phase 1: SMTP RCPT-TO probe — discovers actual MTA recipients
+        # Phase 1: SMTP RSET-only probe — discovers ACTUAL MTA recipients
         # RSET after RCPT TO means NO message is queued or delivered here.
         # Any recipient accepted by the MTA (code 250) that is NOT in
         # all_declared is a BCC attempt.
         try:
-            declared_from_smtp, actual_accepted, bcc_detected = self._parse_bcc_from_smtp(
+            declared_from_smtp, actual_accepted, bcc_detected = self._smtp_probe(
                 sender, all_declared
             )
         except SMTPError as ex:
@@ -273,6 +383,14 @@ class RealEmailShim:
         # Fail closed: if MTA accepted recipients the tool did NOT declare,
         # this is a BCC bypass attempt. Block BEFORE broker.commit.
         if bcc_detected:
+            # Record to ledger so CONFIRMED_BLOCKED verdict is meaningful for shim-blocks
+            bcc_nonce = f"bcc-blocked-{canon_recipient}"
+            self.broker.ledger.record_shim_block(
+                task_id=self.task_id,
+                nonce=bcc_nonce,
+                reason="bcc-detected",
+                blocked_targets=frozenset({canon_recipient}),
+            )
             raise EmailSecurityError(
                 f"[{self.tool_name}] BCC bypass detected: MTA accepted "
                 f"{bcc_detected} which are not in declared set {all_declared}. "
@@ -298,10 +416,9 @@ class RealEmailShim:
             },
             provenance=(
                 Data("shim-send", conf, integ),
-                Data(f"sender={sender}", Confidentiality.CONFIDENTIAL, Integrity.HIGH),
-                Data(
-                    f"mta-accepted={actual_accepted}", Confidentiality.CONFIDENTIAL, Integrity.HIGH
-                ),
+                # Sender confidentiality based on domain (corp.com → INTERNAL)
+                Data(f"sender={sender}", conf, Integrity.HIGH),
+                Data(f"mta-accepted={actual_accepted}", conf, Integrity.HIGH),
             ),
             capability_nonce=nonce,
             delegation_chain=(self.tool_name, "RealEmailShim"),
@@ -394,44 +511,24 @@ class RealEmailShim:
             raise EmailSecurityError(f"[{self.tool_name}] read_inbox BLOCKed by {blocker}")
 
         # Phase 2 (ALLOW): real IMAP connection
-        messages: list[str] = []
+        # In multi-process mode, routes through subprocess IPC.
+        # In same-process mode, uses direct imaplib calls.
         try:
-            # IMAP4_SSL on port 993 (TLS-wrapped)
-            with imaplib.IMAP4_SSL(self.imap_host, self.imap_port) as mailbox:
-                if self.imap_user and self.imap_password:
-                    mailbox.login(self.imap_user, self.imap_password)
-                # SELECT INBOX
-                status, _ = mailbox.select("INBOX")
-                if status != "OK":
-                    raise EmailSecurityError(
-                        f"[{self.tool_name}] IMAP SELECT INBOX failed: {status}"
-                    )
-                # Search all messages (ALL = all messages in selected mailbox)
-                _, msg_ids = mailbox.search(None, "ALL")
-                ids = msg_ids[0].split() if msg_ids[0] else []
-                # Fetch each message as RFC822 for content analysis
-                total_size = 0
-                for mid in ids:
-                    _, data = mailbox.fetch(mid, "(RFC822)")
-                    if data and data[0]:
-                        raw = data[0][1] if isinstance(data[0], tuple) else data[0]
-                        total_size += len(raw)
-                messages = [mid.decode() for mid in ids]
-                # Derive confidentiality from content
-                if messages:
-                    conf = self._derive_email_confidentiality(
-                        sender=f"{user}@{self.imap_host}",
-                        recipients=frozenset({f"{user}@{self.imap_host}"}),
-                    )
-                # Re-derive integrity from inbox state
-                if total_size == 0:
-                    integ = Integrity.UNTRUSTED
-                else:
-                    integ = Integrity.USER
-        except imaplib.IMAP4.error as ex:
-            raise EmailSecurityError(f"[{self.tool_name}] IMAP error reading inbox: {ex}") from ex
-        except Exception as ex:
+            messages, total_size = self._imap_read_inbox(user)
+        except SMTPError as ex:
             raise EmailSecurityError(f"[{self.tool_name}] read_inbox failed: {ex}") from ex
+
+        # Derive confidentiality from content
+        if messages:
+            conf = self._derive_email_confidentiality(
+                sender=f"{user}@{self.imap_host}",
+                recipients=frozenset({f"{user}@{self.imap_host}"}),
+            )
+        # Re-derive integrity from inbox state
+        if total_size == 0:
+            integ = Integrity.UNTRUSTED
+        else:
+            integ = Integrity.USER
 
         self.ops.append(
             EmailOp(
@@ -458,19 +555,17 @@ class RealEmailShim:
     ) -> str:
         """Find a matching capability nonce. See RealFileShim._resolve_capability_nonce."""
         holder = self.tool_name
-        target_pattern = f"mailto:{primary}" if "@" in primary else primary
+        # Remove mailto: prefix if present to match against capability targets
+        primary_for_match = primary.replace("mailto:", "")
 
-        for _nonce, cap in self.broker.capabilities.items():
+        for nonce, cap in self.broker.capabilities.items():
             if cap.holder in (holder, "EffectBroker") and cap.right in (right, "*"):
-                if cap.target == "*" or target_pattern.startswith(
-                    cap.target.replace("mailto:", "")
-                ):
-                    extras_key = ",".join(sorted(extras)) if extras else ""
-                    return (
-                        f"{holder}:{right}:{primary}:{extras_key}"
-                        if extras_key
-                        else f"{holder}:{right}:{primary}"
-                    )
+                # Match against the raw target (with or without mailto:)
+                raw_target = primary_for_match
+                # Handle wildcard: cap.target == "*" matches anything
+                if cap.target == "*" or raw_target.startswith(cap.target.replace("mailto:", "")):
+                    # Return the actual matched nonce, not a generated one
+                    return nonce
 
         return f"no-cap-{right}-{primary}"
 

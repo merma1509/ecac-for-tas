@@ -23,19 +23,21 @@ that has no filesystem access except via a whitelisted wrapper.
 
 from __future__ import annotations
 
+import base64
 import os
 import pathlib
 import re
 import stat
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from .lattice import Confidentiality, Integrity
 from .model import Commit, Data, Effect, EffectTarget
 
 if TYPE_CHECKING:
     from .broker import EffectBroker
+    from .executor_ipc import ProcessExecutorClient
 
 T = TypeVar("T")
 
@@ -86,6 +88,10 @@ class RealFileShim:
     # Operational log — independent observer record
     ops: list[ShimOp] = field(default_factory=list)
 
+    # IPC client for multi-process mode (set by broker)
+    # When set, real I/O goes through subprocess, not direct OS calls
+    ipc_client: ProcessExecutorClient | None = None
+
     # Path normalization regex — canonicalizes paths to prevent traversal
     _NORMALIZE_RE = re.compile(r"/+")
 
@@ -98,7 +104,29 @@ class RealFileShim:
         self.broker = broker
         self.task_id = task_id
         self.tool_name = tool_name
-        self.ops = []
+        self.ops: list[ShimOp] = []
+
+    def _sync_session_from_subprocess(self, session_update: dict[str, Any]) -> None:
+        """Apply session state updates from subprocess to broker session.
+
+        Called after each IPC real I/O operation. The subprocess derives
+        taint from real permission bits (CONFIDENTIAL files) and returns
+        the updated session state. We propagate it to the broker so that
+        subsequent send effects are blocked (session-taint).
+
+        This is the B→A direction of bidirectional session sync, resolving
+        the taint-drift gap in multi-process mode.
+        """
+        if not session_update:
+            return
+        task = self.broker.tasks.get(self.task_id)
+        if task is None or task.session is None:
+            return
+        if session_update.get("tainted"):
+            task.session._tainted = True
+            task.session._taint_reason = session_update.get("_taint_reason", "subprocess-real-io")
+        if session_update.get("logical_time", 0) > task.session.logical_time:
+            task.session.logical_time = session_update["logical_time"]
 
     # ---- Public tool-facing API ----
     def read(self, path: str) -> bytes:
@@ -174,6 +202,10 @@ class RealFileShim:
         The tool CANNOT set these labels -- the shim derives them from the
         actual file metadata and content. This is kill-criterion #3 resolved:
         FlowOK uses shim-resolved labels, not LLM-claimed labels.
+
+        Priority for EXISTING files being read:
+          1. Permission bits for CONFIDENTIAL signal (owner-only access = OS-enforced)
+          2. Content-based keywords (last resort for non-confidential files)
         """
         # For NEW file writes: derive from path, NOT content
         # Content scanning would cause false CONFIDENTIAL labels for
@@ -182,13 +214,21 @@ class RealFileShim:
         if not pre_exists and op_type == "write":
             conf = self._derive_path_confidentiality(path)
             integ = Integrity.USER
-        # Existing file being read: derive from content
-        elif content is not None and op_type == "read":
-            conf = self._derive_content_confidentiality(content)
-            integ = Integrity.USER
-        # Read-only on existing file
+        # Existing file being read: check permission bits FIRST for CONFIDENTIAL
+        # Permission bits are OS-enforced and cannot be influenced by content.
+        # Owner-only access (0o600) is the definitive CONFIDENTIAL signal.
+        # We don't override with PUBLIC from bits — that's too restrictive;
+        # instead we rely on content keywords for non-confidential files.
         elif pre_exists and op_type in ("read", "stat"):
-            conf = self._derive_path_confidentiality(path)
+            path_conf = self._derive_path_confidentiality(path)
+            if path_conf == Confidentiality.CONFIDENTIAL:
+                # Owner-only access is the definitive CONFIDENTIAL signal
+                conf = Confidentiality.CONFIDENTIAL
+            elif content is not None:
+                # Not definitively restricted — use content as last resort
+                conf = self._derive_content_confidentiality(content)
+            else:
+                conf = Confidentiality.INTERNAL
             integ = Integrity.USER
         # Fallback
         else:
@@ -390,14 +430,14 @@ class RealFileShim:
     ) -> str:
         """Derive a UNIQUE nonce per effect for freshness tracking.
 
-        The returned nonce is unique per target path, allowing multiple writes
-        to different files to each pass freshness checks. It's registered as
-        an alias of the base capability in _op().
+        The returned nonce is unique per (op_type, target) combination,
+        allowing multiple operations (read, write, delete) to the same file
+        to each pass freshness checks independently.
         """
         base = self._base_capability_nonce(op_type, primary)
-        # Derive unique nonce: include last 40 chars of path for per-effect uniqueness
+        # Derive unique nonce: include op_type + last 40 chars of path for per-effect uniqueness
         path_suffix = primary[7:] if primary.startswith("file://") else primary
-        return f"{base}|{path_suffix[-40:]}"
+        return f"{base}|{op_type}|{path_suffix[-40:]}"
 
     def _derive_nonce(self, right: str, primary: str, extras: frozenset[str]) -> str:
         """Derive a label key for this complete target set (for logging/tracking only)."""
@@ -525,7 +565,83 @@ class RealFileShim:
                 f"No OS state changed."
             )
 
-            # ALLOWed: perform the real OS operation
+        # ALLOWed: route through IPC in multi-process mode, local fallback otherwise
+        if self.ipc_client is not None:
+            # IPC mode: real I/O happens in the isolated subprocess
+            post_exists, post_content = self._stat_post(path, canon)
+            try:
+                if op_type == "write":
+                    assert content is not None
+                    result = self.ipc_client.real_file_write(canon, content, self.task_id)
+                    # session_update may carry taint from CONFIDENTIAL write
+                    if result.get("session_update"):
+                        self._sync_session_from_subprocess(result["session_update"])
+                    op.post_exists = True
+                    op.post_content = content
+                    self.ops.append(op)
+                    return cast(T, None)
+
+                elif op_type == "read":
+                    result = self.ipc_client.real_file_read(canon, self.task_id)
+                    data = base64.b64decode(result["content"])
+                    # session_update carries taint from CONFIDENTIAL read
+                    if result.get("session_update"):
+                        self._sync_session_from_subprocess(result["session_update"])
+                    op.post_exists = True
+                    op.post_content = data
+                    self.ops.append(op)
+                    return cast(T, data)
+
+                elif op_type == "stat":
+                    result = self.ipc_client.real_file_stat(canon, self.task_id)
+                    stat_result = os.stat(canon)  # local fallback for os.stat_result type
+                    if result.get("session_update"):
+                        self._sync_session_from_subprocess(result["session_update"])
+                    op.post_exists = post_exists
+                    op.post_content = post_content
+                    self.ops.append(op)
+                    return cast(T, stat_result)
+
+                elif op_type == "listdir":
+                    result = self.ipc_client.real_file_listdir(canon, self.task_id)
+                    entries = result.get("entries", [])
+                    op.post_exists = post_exists
+                    op.post_content = post_content
+                    self.ops.append(op)
+                    return cast(T, entries)
+
+                elif op_type == "exists":
+                    exists_result = os.path.exists(canon)
+                    op.post_exists = exists_result
+                    op.post_content = post_content
+                    self.ops.append(op)
+                    return cast(T, exists_result)
+
+                elif op_type == "delete":
+                    self.ipc_client.real_file_delete(canon, self.task_id)
+                    op.post_exists = False
+                    op.post_content = post_content
+                    self.ops.append(op)
+                    return cast(T, None)
+
+                else:
+                    raise ValueError(f"Unknown op type: {op_type}")
+
+            except FileNotFoundError as ex:
+                raise OSError(f"File not found: {canon}") from ex
+            except PermissionError as ex:
+                raise OSError(f"Permission denied: {canon}") from ex
+            except OSError as ex:
+                raise OSError(
+                    f"[{self.tool_name}] {op_type} on {canon} OS ERROR after ALLOW: {ex}. "
+                    f"Broker said ALLOW but subprocess rejected. Treat as security event."
+                ) from ex
+            except Exception as ex:
+                raise RuntimeError(
+                    f"[{self.tool_name}] {op_type} on {canon} IPC ERROR after ALLOW: {ex}"
+                ) from ex
+
+        # Same-process / single-threaded mode: local direct OS calls
         try:
             if op_type == "write":
                 assert content is not None, "write called with None content"

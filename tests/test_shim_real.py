@@ -17,8 +17,7 @@ import tempfile
 
 import pytest
 
-from effect_broker.broker import EffectBroker
-from effect_broker.lattice import Confidentiality, Integrity
+from effect_broker.lattice import Confidentiality
 from effect_broker.model import Capability, Task
 from effect_broker.shim_real import RealFileShim, SecurityError
 from effect_broker.traces import build
@@ -205,7 +204,7 @@ class TestRealFileShimBasic:
             (f"{tmpdir}//double//slash", f"{base}"),
             (f"{tmpdir}/../{os.path.basename(tmpdir)}/file.txt", f"{base}/file.txt"),
         ]
-        for raw, expected in cases:
+        for raw, _expected in cases:
             canon = shim._canonical_path(raw)
             assert canon.startswith(base), f"Canonical {canon} must be inside sandbox {base}"
 
@@ -246,7 +245,6 @@ class TestRealFileShimSecurity:
         assert os.path.exists(path)
 
         # Verify: ledger has NO entry for this effect (bypass detection)
-        from effect_broker.ledger import UnknownLedgerResult
 
         # Check ledger: no authorization record for this direct write
         # The ledger was not consulted — this is the bypass

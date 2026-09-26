@@ -10,19 +10,14 @@ The core LedgerBackend interface is tested in-process below.
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
-from unittest.mock import patch
 
 import pytest
 
 from effect_broker.ipc import (
-    LedgerBackend,
     LedgerProcessServer,
     LedgerRequest,
-    LedgerResponse,
     LocalLedgerBackend,
     ProcessLedgerClient,
     _parse_response,
@@ -187,7 +182,7 @@ class TestLedgerProcessServerDispatch:
 
             resp = server._dispatch({
                 "kind": "RECORD_OBSERVATION",
-                "payload": {"task_id": "t", "nonce": "n", "observed_targets": ["a"], "source": "test"},
+                "payload": {"task_id": "t", "nonce": "n", "observed_targets": ["a"], "source": "test"},  # noqa: E501
             })
             assert resp["ok"] is True
             assert server._ledger.observation_count == 1
@@ -695,3 +690,154 @@ class TestBrokerWithProcessLedgerClient:
             server_thread.join(timeout=2.0)
             if socket_path.exists():
                 socket_path.unlink(missing_ok=True)
+
+
+class TestSessionSyncIPC:
+    """Tests for SYNC_SESSION IPC between broker and executor subprocess."""
+
+    def test_sync_session_stores_state_in_subprocess(self) -> None:
+        """SYNC_SESSION request stores session state in executor's _session_states."""
+        import threading
+        from pathlib import Path
+
+        from effect_broker.executor_subprocess import ExecutorServer
+
+        socket_path = Path("/tmp/test-sync-session.sock")
+        if socket_path.exists():
+            socket_path.unlink()
+
+        ready = threading.Event()
+        server = ExecutorServer(socket_path, ready_event=ready)
+        server_thread = threading.Thread(target=server.run, daemon=True)
+        server_thread.start()
+        ready.wait(timeout=5.0)
+
+        try:
+            from effect_broker.executor_ipc import ProcessExecutorClient, session_state_to_dict
+            from effect_broker.model import Session
+
+            client = ProcessExecutorClient(socket_path)
+
+            # Create a mock session state
+            session = Session(session_id="task-1")
+            session.logical_time = 10.0
+            session.used = frozenset({"nonce-1", "nonce-2"})
+            session.revoked = frozenset({"revoked-1"})
+            session.taint_for_send("test reason")  # sets _tainted = True
+            session.live = True
+
+            # Sync session state to subprocess
+            result = client.sync_session(
+                "task-1",
+                session_state_to_dict(session),
+            )
+
+            assert result["task_id"] == "task-1"
+            assert result["session_snapshot"]["session_id"] == "task-1"
+            assert result["session_snapshot"]["logical_time"] == 10.0
+            assert set(result["session_snapshot"]["used"]) == {"nonce-1", "nonce-2"}
+            assert result["session_snapshot"]["revoked"] == ["revoked-1"]
+            assert result["session_snapshot"]["tainted"] is True
+            assert result["session_snapshot"]["live"] is True
+            assert result["all_tasks"] == ["task-1"]
+
+        finally:
+            server.stop()
+            server_thread.join(timeout=2.0)
+            if socket_path.exists():
+                socket_path.unlink()
+
+    def test_sync_session_handles_multiple_tasks(self) -> None:
+        """SYNC_SESSION stores state per-task_id, multiple tasks coexist."""
+        import threading
+        from pathlib import Path
+
+        from effect_broker.executor_subprocess import ExecutorServer
+
+        socket_path = Path("/tmp/test-sync-multi-task.sock")
+        if socket_path.exists():
+            socket_path.unlink()
+
+        ready = threading.Event()
+        server = ExecutorServer(socket_path, ready_event=ready)
+        server_thread = threading.Thread(target=server.run, daemon=True)
+        server_thread.start()
+        ready.wait(timeout=5.0)
+
+        try:
+            from effect_broker.executor_ipc import ProcessExecutorClient, session_state_to_dict
+            from effect_broker.model import Session
+
+            client = ProcessExecutorClient(socket_path)
+
+            # Sync two different tasks
+            session1 = Session(session_id="task-A")
+            session1.logical_time = 5.0
+            session1.used = frozenset({"cap-A"})
+
+            session2 = Session(session_id="task-B")
+            session2.logical_time = 12.0
+            session2.used = frozenset({"cap-B", "cap-C"})
+            session2.taint_for_send("test reason for task-B")
+
+            _unused_result1 = client.sync_session("task-A", session_state_to_dict(session1))
+            result2 = client.sync_session("task-B", session_state_to_dict(session2))
+
+            # After both syncs, all_tasks should include both tasks
+            # Check in result2 which is the latest snapshot
+            assert set(result2["all_tasks"]) == {"task-A", "task-B"}
+
+            # After syncing task-B, subprocess's "current view" is task-B's state
+            # (since we synced task-B last). Check that task-A was also stored.
+            assert "task-A" in result2["all_tasks"]
+            assert "task-B" in result2["all_tasks"]
+
+        finally:
+            server.stop()
+            server_thread.join(timeout=2.0)
+            if socket_path.exists():
+                socket_path.unlink()
+
+    def test_sync_session_replaces_existing_state(self) -> None:
+        """SYNC_SESSION for same task_id replaces previous state."""
+        import threading
+        from pathlib import Path
+
+        from effect_broker.executor_subprocess import ExecutorServer
+
+        socket_path = Path("/tmp/test-sync-replace.sock")
+        if socket_path.exists():
+            socket_path.unlink()
+
+        ready = threading.Event()
+        server = ExecutorServer(socket_path, ready_event=ready)
+        server_thread = threading.Thread(target=server.run, daemon=True)
+        server_thread.start()
+        ready.wait(timeout=5.0)
+
+        try:
+            from effect_broker.executor_ipc import ProcessExecutorClient, session_state_to_dict
+            from effect_broker.model import Session
+
+            client = ProcessExecutorClient(socket_path)
+
+            session1 = Session(session_id="task-X")
+            session1.logical_time = 1.0
+            session1.used = frozenset({"nonce-A"})
+
+            session2 = Session(session_id="task-X")
+            session2.logical_time = 99.0
+            session2.used = frozenset({"nonce-A", "nonce-B", "nonce-C"})
+
+            client.sync_session("task-X", session_state_to_dict(session1))
+            result = client.sync_session("task-X", session_state_to_dict(session2))
+
+            # Latest snapshot should reflect session2's state
+            assert result["session_snapshot"]["logical_time"] == 99.0
+            assert set(result["session_snapshot"]["used"]) == {"nonce-A", "nonce-B", "nonce-C"}
+
+        finally:
+            server.stop()
+            server_thread.join(timeout=2.0)
+            if socket_path.exists():
+                socket_path.unlink()

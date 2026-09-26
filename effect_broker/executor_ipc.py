@@ -39,7 +39,13 @@ from typing import Any, cast
 class ExecutorRequest(Enum):
     """Wire format: broker → executor subprocess."""
 
-    EXECUTE = auto()  # Apply an effect, return observed_targets
+    EXECUTE = auto()  # Apply an simulated effect (internal store only)
+    APPLY_EFFECT = auto()  # Apply an effect with REAL OS/SMTP operations (moved from broker)
+    APPLY_COMMIT = auto()  # Atomic commit: Fresh check + nonce reserve + apply in subprocess
+    SYNC_SESSION = (
+        auto()
+    )  # Sync session state from broker to subprocess (used, revoked, taint, clock)
+    GET_SESSION = auto()  # Get session state from subprocess to broker (B→A, no overwrite)
     READ_STORE = auto()  # Observer reads actual store state for verification
     READ_EMAILS = auto()  # Observer reads emails for duplicate accounting
     READ_FILES = auto()  # Observer reads files
@@ -219,6 +225,35 @@ def send_and_receive(
     return parse_response(raw)
 
 
+def session_state_to_dict(session: Any) -> dict[str, Any]:
+    """Serialize Session to a plain dict for IPC.
+
+    Includes: session_id, logical_time, used, revoked, taint, live.
+    """
+    return {
+        "session_id": session.session_id,
+        "logical_time": session.logical_time,
+        "used": list(session.used),
+        "revoked": list(session.revoked),
+        "tainted": session.tainted,
+        "live": session.live,
+    }
+
+
+def dict_to_session(d: dict[str, Any]) -> Any:
+    """Deserialize a dict back to a Session."""
+    from .model import Session
+
+    # Session requires session_id as the first argument
+    session = Session(session_id=d.get("session_id", "unknown"))
+    session.logical_time = d.get("logical_time", 0.0)
+    session.used = set(d.get("used", []))
+    session.revoked = set(d.get("revoked", []))
+    session._tainted = d.get("tainted", False)
+    session.live = d.get("live", True)
+    return session
+
+
 class ProcessExecutorClient:
     """IPC client: broker talks to executor subprocess over Unix socket.
 
@@ -251,7 +286,51 @@ class ProcessExecutorClient:
             resp = send_and_receive(self._path, ExecutorRequest.EXECUTE, {"effect": effect_dict})
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
-        return cast(dict[str, Any], resp["result"])
+        # Flat response: direct fields
+        resp.pop("ok", None)
+        return resp
+
+    def apply_commit(
+        self,
+        effect_dict: dict[str, Any],
+        task_id: str,
+        session_snapshot: dict[str, Any],
+        reserve_nonce: bool = True,
+    ) -> dict[str, Any]:
+        """Atomic commit: Fresh check + nonce reserve + apply in subprocess.
+
+        This implements the atomic commit protocol from the session sync fix:
+        1. Subprocess receives A's session snapshot
+        2. Fresh check (replay + revoked) in subprocess using A's snapshot
+        3. If Fresh: nonce reserved, effect applied, taint tracked
+        4. Returns session_update with updated state
+
+        Args:
+            effect_dict: Serialized effect to apply
+            task_id: Task ID for session tracking
+            session_snapshot: A's session state at gate time
+            reserve_nonce: Whether to reserve the nonce in the subprocess
+
+        Returns:
+            Success: {"status": "ok", "observed_targets": [...], "session_update": {...}}
+            Blocked: {"status": "blocked", "blocker": "Fresh", "reason": "replay|revoked|expired"}
+            Error: {"status": "error", "reason": str}
+        """
+        with self._lock:
+            resp = send_and_receive(
+                self._path,
+                ExecutorRequest.APPLY_COMMIT,
+                {
+                    "effect": effect_dict,
+                    "task_id": task_id,
+                    "session_snapshot": session_snapshot,
+                    "reserve_nonce": reserve_nonce,
+                },
+            )
+        if not resp.get("ok"):
+            raise RuntimeError(f"Apply commit error: {resp.get('error')}")
+        resp.pop("ok", None)
+        return resp
 
     def read_store(self) -> dict[str, Any]:
         """Read the complete executor store state (for independent observer)."""
@@ -259,7 +338,8 @@ class ProcessExecutorClient:
             resp = send_and_receive(self._path, ExecutorRequest.READ_STORE, {})
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
-        return cast(dict[str, Any], resp["result"])
+        resp.pop("ok", None)
+        return resp
 
     def read_files(self) -> dict[str, Any]:
         """Read just the files state."""
@@ -267,7 +347,8 @@ class ProcessExecutorClient:
             resp = send_and_receive(self._path, ExecutorRequest.READ_FILES, {})
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
-        return cast(dict[str, Any], resp["result"])
+        resp.pop("ok", None)
+        return resp
 
     def read_emails(self) -> dict[str, Any]:
         """Read just the emails state."""
@@ -275,7 +356,8 @@ class ProcessExecutorClient:
             resp = send_and_receive(self._path, ExecutorRequest.READ_EMAILS, {})
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
-        return cast(dict[str, Any], resp["result"])
+        resp.pop("ok", None)
+        return resp
 
     def read_mailboxes(self) -> dict[str, Any]:
         """Read just the mailboxes state."""
@@ -283,7 +365,8 @@ class ProcessExecutorClient:
             resp = send_and_receive(self._path, ExecutorRequest.READ_MAILBOXES, {})
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
-        return cast(dict[str, Any], resp["result"])
+        resp.pop("ok", None)
+        return resp
 
     def bootstrap(
         self,
@@ -314,14 +397,226 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Executor bootstrap error: {resp.get('error')}")
 
-    def shutdown(self) -> None:
-        """Send SHUTDOWN to the executor subprocess for clean termination.
+    # ---- Real OS/SMTP operations (executed in subprocess) ----
+    # These methods send REAL file/SMTP operations to the subprocess,
+    # ensuring actual I/O happens in the isolated process, not in broker.
 
-        The subprocess will exit its run loop and close its socket.
-        The process handle will then terminate/kill the process.
+    def real_file_read(self, path: str, task_id: str = "default") -> dict[str, Any]:
+        """Read a real file in the executor subprocess.
+
+        Returns: {"ok": bool, "content": bytes | None, "confidentiality": str,
+                  "session_update": dict, "error": str | None}
         """
         with self._lock:
+            resp = send_and_receive(
+                self._path,
+                ExecutorRequest.APPLY_EFFECT,
+                {"op": "real_read", "path": path, "task_id": task_id},
+            )
+        if not resp.get("ok"):
+            raise RuntimeError(f"Real file read error: {resp.get('error')}")
+        resp.pop("ok", None)
+        return resp
+
+    def real_file_write(
+        self, path: str, content: bytes, task_id: str = "default"
+    ) -> dict[str, Any]:
+        """Write content to a real file in the executor subprocess.
+
+        Returns: {"ok": bool, "path": str, "confidentiality": str,
+                  "session_update": dict, "error": str | None}
+        """
+        import base64
+
+        with self._lock:
+            resp = send_and_receive(
+                self._path,
+                ExecutorRequest.APPLY_EFFECT,
+                {
+                    "op": "real_write",
+                    "path": path,
+                    "content": base64.b64encode(content).decode(),
+                    "task_id": task_id,
+                },
+            )
+        if not resp.get("ok"):
+            raise RuntimeError(f"Real file write error: {resp.get('error')}")
+        resp.pop("ok", None)
+        return resp
+
+    def real_file_delete(self, path: str, task_id: str = "default") -> dict[str, Any]:
+        """Delete a real file in the executor subprocess.
+
+        Returns: {"ok": bool, "error": str | None}
+        """
+        with self._lock:
+            resp = send_and_receive(
+                self._path,
+                ExecutorRequest.APPLY_EFFECT,
+                {"op": "real_delete", "path": path, "task_id": task_id},
+            )
+        if not resp.get("ok"):
+            raise RuntimeError(f"Real file delete error: {resp.get('error')}")
+        resp.pop("ok", None)
+        return resp
+
+    def real_file_stat(self, path: str, task_id: str = "default") -> dict[str, Any]:
+        """Stat a real file in the executor subprocess.
+
+        Returns: {"ok": bool, "stat": dict | None, "confidentiality": str,
+                  "session_update": dict, "error": str | None}
+        """
+        with self._lock:
+            resp = send_and_receive(
+                self._path,
+                ExecutorRequest.APPLY_EFFECT,
+                {"op": "real_stat", "path": path, "task_id": task_id},
+            )
+        if not resp.get("ok"):
+            raise RuntimeError(f"Real file stat error: {resp.get('error')}")
+        resp.pop("ok", None)
+        return resp
+
+    def real_file_listdir(self, path: str, task_id: str = "default") -> dict[str, Any]:
+        """List a real directory in the executor subprocess.
+
+        Returns: {"ok": bool, "entries": list[str] | None, "error": str | None}
+        """
+        with self._lock:
+            resp = send_and_receive(
+                self._path,
+                ExecutorRequest.APPLY_EFFECT,
+                {"op": "real_listdir", "path": path, "task_id": task_id},
+            )
+        if not resp.get("ok"):
+            raise RuntimeError(f"Real file listdir error: {resp.get('error')}")
+        resp.pop("ok", None)
+        return resp
+
+    def real_smtp_send(
+        self,
+        sender: str,
+        recipients: list[str],
+        body: str,
+    ) -> dict[str, Any]:
+        """Send a real email via SMTP in the executor subprocess.
+
+        Returns: {"ok": bool, "delivered": list[str], "error": str | None}
+        """
+        with self._lock:
+            resp = send_and_receive(
+                self._path,
+                ExecutorRequest.APPLY_EFFECT,
+                {"op": "real_smtp_send", "sender": sender, "recipients": recipients, "body": body},
+            )
+        if not resp.get("ok"):
+            raise RuntimeError(f"Real SMTP send error: {resp.get('error')}")
+        resp.pop("ok", None)
+        return resp
+
+    def real_smtp_probe(self, sender: str, recipients: list[str]) -> dict[str, Any]:
+        """Probe SMTP server for BCC detection in executor subprocess.
+
+        Sends RSET-only probe (RCPT TO for each recipient), returns the set
+        of actually-accepted recipients. The transaction is aborted (RSET)
+        so no message is queued.
+
+        Returns: {
+            "ok": bool,
+            "declared": list[str],
+            "actual_accepted": list[str],
+            "bcc_detected": list[str],
+            "error": str | None
+        }
+        """
+        with self._lock:
+            resp = send_and_receive(
+                self._path,
+                ExecutorRequest.APPLY_EFFECT,
+                {"op": "real_smtp_probe", "sender": sender, "recipients": recipients},
+            )
+        if not resp.get("ok"):
+            raise RuntimeError(f"Real SMTP probe error: {resp.get('error')}")
+        resp.pop("ok", None)
+        return resp
+
+    def real_imap_read_inbox(
+        self,
+        user: str,
+        imap_host: str,
+        imap_port: int,
+        imap_user: str | None = None,
+        imap_password: str | None = None,
+        imap_use_tls: bool = True,
+    ) -> dict[str, Any]:
+        """Read inbox for a user via real IMAP in the executor subprocess.
+
+        Connects to IMAP server (TLS-wrapped), selects INBOX, searches all
+        messages, and fetches RFC822 body for content analysis. All IMAP
+        operations happen in the isolated subprocess, not in the broker.
+
+        Returns: {
+            "ok": bool,
+            "message_ids": list[str],
+            "total_size": int,
+            "error": str | None
+        }
+        """
+        with self._lock:
+            resp = send_and_receive(
+                self._path,
+                ExecutorRequest.APPLY_EFFECT,
+                {
+                    "op": "real_imap_read_inbox",
+                    "user": user,
+                    "imap_host": imap_host,
+                    "imap_port": imap_port,
+                    "imap_user": imap_user,
+                    "imap_password": imap_password,
+                    "imap_use_tls": imap_use_tls,
+                },
+            )
+        if not resp.get("ok"):
+            raise RuntimeError(f"Real IMAP read_inbox error: {resp.get('error')}")
+        resp.pop("ok", None)
+        return resp
+
+    def shutdown(self) -> None:
+        """Send SHUTDOWN to the executor subprocess for clean termination."""
+        with self._lock:
             send_and_receive(self._path, ExecutorRequest.SHUTDOWN, {})
-        # Ignore response errors — we just want to trigger shutdown.
-        # The process handle will ensure cleanup regardless.
-        return
+
+    def sync_session(
+        self,
+        task_id: str,
+        session_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Sync session state from broker to subprocess.
+
+        Sends the broker's session state (used nonces, revoked, taint, logical_time)
+        to the subprocess. The subprocess can then perform local Fresh checks
+        and maintain an independent audit trail of session state.
+
+        This ensures the subprocess has a consistent view of session state
+        for:
+        1. Independent Fresh checking (replay prevention)
+        2. Audit trail of session state at each execution
+        3. Independent verification for ledger
+
+        Args:
+            task_id: The task ID this session belongs to
+            session_state: Serialized session state from broker
+
+        Returns:
+            {"ok": bool, "session_snapshot": dict} — subprocess's current view
+        """
+        with self._lock:
+            resp = send_and_receive(
+                self._path,
+                ExecutorRequest.SYNC_SESSION,
+                {"task_id": task_id, "session_state": session_state},
+            )
+        if not resp.get("ok"):
+            raise RuntimeError(f"Session sync error: {resp.get('error')}")
+        resp.pop("ok", None)
+        return resp

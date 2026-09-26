@@ -24,6 +24,9 @@ from pathlib import Path
 
 import pytest
 
+from effect_broker.broker import EffectBroker
+from effect_broker.ledger import IndependentEffectLedger
+
 
 class TestSubprocessExecutorRoundTrip:
     """Full round-trip: broker → subprocess store → ledger verification."""
@@ -31,14 +34,10 @@ class TestSubprocessExecutorRoundTrip:
     @pytest.fixture(autouse=True)
     def setup_multiprocess_broker(self, tmp_path: Path) -> None:
         """Create a multi-process broker for each test."""
-        import signal as _signal
 
         uid = uuid.uuid4().hex[:8]
         exec_sock = Path(f"/tmp/ecac-mp-exec-{uid}.sock")
         store_sock = Path(f"/tmp/ecac-mp-store-{uid}.sock")
-
-        from effect_broker.broker import EffectBroker
-        from effect_broker.ledger import IndependentEffectLedger
 
         ledger = IndependentEffectLedger()
         broker = EffectBroker(
@@ -71,8 +70,7 @@ class TestSubprocessExecutorRoundTrip:
 
     def test_commit_routes_through_subprocess_executor(self) -> None:
         """broker.commit() executes through SubprocessExecutor (not IsolatedExecutor)."""
-        from effect_broker.executor import SubprocessExecutor
-        from effect_broker.model import Capability, Commit, Effect, Task, USER, BROKER
+        from effect_broker.model import BROKER, USER, Capability, Commit, Effect, Task
 
         # Root grant
         cap = Capability(
@@ -120,7 +118,7 @@ class TestSubprocessExecutorRoundTrip:
 
     def test_blocked_effect_not_applied_to_subprocess_store(self) -> None:
         """A blocked effect does NOT reach the subprocess store."""
-        from effect_broker.model import Capability, Commit, Effect, Task, USER, BROKER
+        from effect_broker.model import BROKER, USER, Capability, Commit, Effect, Task
 
         # Capability with a different target (will not match the effect's target)
         cap = Capability(
@@ -165,8 +163,8 @@ class TestSubprocessExecutorRoundTrip:
     def test_ledger_records_authorization_and_observation(self) -> None:
         """Ledger records authorization (from gate) and observation (from subprocess)."""
         from effect_broker.executor import SubprocessExecutor
-        from effect_broker.model import Capability, Commit, Effect, Task, USER, BROKER
         from effect_broker.ledger import LedgerVerdict
+        from effect_broker.model import BROKER, USER, Capability, Commit, Effect, Task
 
         # Verify the executor is SubprocessExecutor
         assert isinstance(self._broker.executor, SubprocessExecutor)
@@ -215,7 +213,7 @@ class TestSubprocessExecutorRoundTrip:
 
     def test_verify_complete_mediation_passes_for_valid_effects(self) -> None:
         """broker.verify_complete_mediation() returns no failures for valid effects."""
-        from effect_broker.model import Capability, Commit, Effect, Task, USER, BROKER
+        from effect_broker.model import BROKER, USER, Capability, Commit, Effect, Task
 
         cap = Capability(
             owner=USER,
@@ -309,18 +307,12 @@ class TestSameProcessVsMultiProcessEquivalence:
     """
 
     @pytest.fixture
-    def same_process_broker(self) -> "EffectBroker":
-        from effect_broker.broker import EffectBroker
-        from effect_broker.ledger import IndependentEffectLedger
-
+    def same_process_broker(self) -> EffectBroker:
         broker = EffectBroker(ledger=IndependentEffectLedger(), mode="same-process")
         yield broker
 
     @pytest.fixture
-    def multi_process_broker(self, tmp_path: Path) -> "EffectBroker":
-        from effect_broker.broker import EffectBroker
-        from effect_broker.ledger import IndependentEffectLedger
-
+    def multi_process_broker(self, tmp_path: Path) -> EffectBroker:
         uid = uuid.uuid4().hex[:8]
         exec_sock = Path(f"/tmp/ecac-eq-exec-{uid}.sock")
         store_sock = Path(f"/tmp/ecac-eq-store-{uid}.sock")
@@ -339,8 +331,8 @@ class TestSameProcessVsMultiProcessEquivalence:
 
     def test_write_effect_same_result_both_modes(
         self,
-        same_process_broker: "EffectBroker",
-        multi_process_broker: "EffectBroker",
+        same_process_broker: EffectBroker,
+        multi_process_broker: EffectBroker,
     ) -> None:
         """write effect: allow in same-process and multi-process modes.
 
@@ -354,8 +346,8 @@ class TestSameProcessVsMultiProcessEquivalence:
         Same nonce in SAME logical session → replay detected (correct).
         Same nonce in DIFFERENT logical sessions → both allowed (correct).
         """
-        from effect_broker.model import Capability, Commit, Effect, Task, USER, BROKER
         from effect_broker.lattice import Confidentiality
+        from effect_broker.model import BROKER, USER, Capability, Commit, Effect, Task
 
         # Same capability nonce (same root-granted capability)
         cap = Capability(
@@ -389,12 +381,12 @@ class TestSameProcessVsMultiProcessEquivalence:
             task_id="equiv-task-multi",
             owner=USER,
             ceiling=cap,
-        ) 
+        )
         # Register file in both stores. RestrictedResourceStore requires
         # pre-registration (no auto-create). IsolatedStore auto-creates but
         # registering is fine for consistency.
-        same_process_broker.store._unsafe_bootstrap_file("file:///equiv/test.txt", Confidentiality.PUBLIC)
-        multi_process_broker.store._unsafe_bootstrap_file("file:///equiv/test.txt", Confidentiality.PUBLIC)
+        same_process_broker.store._unsafe_bootstrap_file("file:///equiv/test.txt", Confidentiality.PUBLIC)  # noqa: E501
+        multi_process_broker.store._unsafe_bootstrap_file("file:///equiv/test.txt", Confidentiality.PUBLIC)  # noqa: E501
 
         task_same = Task(
             task_id="equiv-task",
@@ -432,11 +424,11 @@ class TestSameProcessVsMultiProcessEquivalence:
 
     def test_blocked_effect_same_result_both_modes(
         self,
-        same_process_broker: "EffectBroker",
-        multi_process_broker: "EffectBroker",
+        same_process_broker: EffectBroker,
+        multi_process_broker: EffectBroker,
     ) -> None:
         """Blocked effect: deny in same-process and multi-process modes."""
-        from effect_broker.model import Capability, Commit, Effect, Task, USER, BROKER
+        from effect_broker.model import BROKER, USER, Capability, Commit, Effect, Task
 
         cap = Capability(
             owner=USER,
@@ -482,4 +474,181 @@ class TestSameProcessVsMultiProcessEquivalence:
         assert allow_multi is False, f"Should be blocked: {ev_multi}"
         assert ev_same["primary_blocker"] == ev_multi["primary_blocker"], (
             "Both modes should block on the same predicate"
+        )
+
+    def test_t14_hidden_side_effect_blocked_in_multi_process(
+        self,
+        multi_process_broker: EffectBroker,
+    ) -> None:
+        """T14 (hidden side effect) is BLOCKed in multi-process mode.
+
+        This proves that broker.gate() is called in the broker process (Phase 1
+        of the SubprocessExecutor.execute() protocol). The structural enforcement
+        layer (ToolRegistry) runs BEFORE the IPC round-trip to the subprocess.
+
+        If gate() were NOT called in the broker process, the ToolRegistry check
+        would not execute, and T14 would slip through.
+        """
+        from effect_broker.lattice import Confidentiality
+        from effect_broker.model import BROKER, USER, Capability, Commit, Effect, Task
+        from effect_broker.tool_registry import ToolDeclaration
+
+        # Set up ToolRegistry in strict mode on the multi-process broker
+        multi_process_broker.set_tool_registry(strict=True)
+        multi_process_broker.tool_registry.declare(ToolDeclaration(
+            tool_name="file_reader",
+            declared_rights=frozenset({"read"}),  # Only read — NOT write
+            declared_targets=frozenset({"file:///reports"}),
+            description="Read-only file access",
+        ))
+
+        multi_process_broker.store._unsafe_bootstrap_file(
+            "file:///reports", Confidentiality.INTERNAL
+        )
+
+        cap = Capability(
+            owner=USER,
+            holder=BROKER,
+            right="read",  # Capability grants READ only
+            target="file:///reports",
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce="cap-read-reports",
+            derives_from=None,
+        )
+        multi_process_broker.grant_root(cap)
+
+        task = Task(
+            task_id="t14-multi-test",
+            owner=USER,
+            ceiling=cap,
+        )
+        multi_process_broker.tasks["t14-multi-test"] = task
+
+        # T14: tool declared 'read' but attempts 'write' (hidden side effect)
+        attack_effect = Effect(
+            "write",  # etype - UNDECLARED by tool!
+            "file:///reports",
+            {},
+            (),
+            "cap-read-reports",
+            (),
+        )
+        commit = Commit(attack_effect, task, tool_name="file_reader")
+
+        # gate() is called in broker process (before IPC).
+        # Structural check must block T14 BEFORE subprocess is involved.
+        result = multi_process_broker.gate(commit, reserve_nonce=False)
+
+        assert result.allow is False, (
+            "T14 should be blocked at gate() in broker process — "
+            "structural enforcement (ToolRegistry) runs before IPC"
+        )
+        assert result.evidence["primary_blocker"] == "Structural", (
+            f"Expected 'Structural', got {result.evidence['primary_blocker']}"
+        )
+
+    def test_session_taint_composition_blocks_in_multi_process(
+        self,
+        multi_process_broker: EffectBroker,
+    ) -> None:
+        """T20 (amplification via composition) is BLOCKed in multi-process mode.
+
+        Step 1: read CONFIDENTIAL file → session.tainted = True (in subprocess)
+        Step 2: send email → FlowOK checks session.tainted → BLOCKed
+
+        Session state is synchronized A→B (at gate time) and B→A (after apply).
+        This test verifies the B→A sync carries taint state correctly.
+        """
+        from effect_broker.lattice import Confidentiality, Integrity
+        from effect_broker.model import BROKER, USER, Capability, Commit, Data, Effect, Task
+
+        # Bootstrap: files and emails in subprocess store via IPC
+        multi_process_broker.bootstrap_subprocess(
+            files=[{"path": "file:///secrets", "sensitivity": "CONFIDENTIAL"}],
+            emails=[
+                {"address": "internal@corp.com", "domain": "INTERNAL"},
+            ],
+        )
+
+        # Capability: read CONFIDENTIAL files
+        cap_read = Capability(
+            owner=USER,
+            holder=BROKER,
+            right="read",
+            target="file:///secrets",
+            scope=frozenset({"file:///secrets"}),
+            expiry=float("inf"),
+            nonce="cap-read-secrets",
+            derives_from=None,
+        )
+        multi_process_broker.grant_root(cap_read)
+
+        # Capability: send to internal
+        cap_send = Capability(
+            owner=USER,
+            holder=BROKER,
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce="cap-send-internal",
+            derives_from=None,
+        )
+        multi_process_broker.grant_root(cap_send)
+
+        task = Task(
+            task_id="composition-test",
+            owner=USER,
+            ceiling=cap_read,
+        )
+        multi_process_broker.tasks["composition-test"] = task
+
+        # Step 1: read CONFIDENTIAL file → session taint
+        read_effect = Effect(
+            etype="read",
+            target="file:///secrets",
+            metadata={},
+            provenance=(
+                Data("content", Confidentiality.CONFIDENTIAL, Integrity.USER),
+            ),
+            capability_nonce="cap-read-secrets",
+            delegation_chain=(),
+            task_id="composition-test",
+        )
+        read_commit = Commit(read_effect, task)
+        allow_read, _ = multi_process_broker.commit(read_commit)
+        assert allow_read is True, "Step 1 (read CONFIDENTIAL) should ALLOW"
+
+        # Verify session is now tainted (via subprocess sync B→A)
+        assert task.session.tainted is True, (
+            "Session should be tainted after CONFIDENTIAL read — "
+            "B→A sync transfers taint state from subprocess"
+        )
+
+        # Step 2: send email → should be BLOCKed by session taint
+        # Need to update task ceiling to allow send
+        task.ceiling = cap_send
+
+        send_effect = Effect(
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
+            provenance=(Data("msg", Confidentiality.INTERNAL, Integrity.USER),),
+            capability_nonce="cap-send-internal",
+            delegation_chain=(),
+            task_id="composition-test",
+        )
+        send_commit = Commit(send_effect, task)
+        allow_send, ev_send = multi_process_broker.commit(send_commit)
+
+        assert allow_send is False, (
+            "Step 2 (send after CONFIDENTIAL read) should be BLOCKed — "
+            "session taint composition guard prevents amplification"
+        )
+        assert ev_send["primary_blocker"] == "FlowOK", (
+            f"Expected FlowOK blocker, got {ev_send['primary_blocker']}"
+        )
+        assert "session-taint" in ev_send["predicates"]["FlowOK"], (
+            f"FlowOK should cite 'session-taint': {ev_send}"
         )

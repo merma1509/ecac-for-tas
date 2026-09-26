@@ -10,11 +10,12 @@ running traces directly (python run_traces.py) in production mode.
 """
 
 from __future__ import annotations
-import pytest
 
-# Suppress BEFORE any test imports — this must be at module level, before
-# pytest loads test modules (which import ResourceStore and trigger the warning).
+import threading
 import warnings
+from typing import Any
+
+import pytest
 
 warnings.filterwarnings(
     "ignore",
@@ -29,13 +30,16 @@ warnings.filterwarnings(
 # aiosmtpd is only needed in test context; guard so the module loads fine
 # even if aiosmtpd isn't installed in non-dev environments.
 try:
-    import asyncio
     from aiosmtpd.controller import Controller
-    from aiosmtpd.smtp import SMTP, AuthResult, Envelope
-    from authn import Authenticator
+
     HAS_AIOSMTPD = True
 except ImportError:
     HAS_AIOSMTPD = False
+else:
+    try:
+        from authn import Authenticator  # noqa: F401
+    except ImportError:
+        pass  # authn not required for SMTP fixture
 
 
 class RecordingSMTPHandler:
@@ -44,6 +48,10 @@ class RecordingSMTPHandler:
     Accepts all recipients (code 250) and records them. This lets tests
     verify that the shim's RSET-only probe correctly discovers recipients
     and that RSET aborts the transaction (no message is stored after RSET).
+
+    Uses async handlers compatible with aiosmtpd 1.4.6:
+    - handle_RCPT: args=(Envelope, address, rcpt_options), Envelope passed by VALUE
+      so we update session.envelope directly for persistence between RCPT and DATA
     """
 
     def __init__(self) -> None:
@@ -51,29 +59,37 @@ class RecordingSMTPHandler:
         self.data_log: list[bytes] = []    # message bodies from DATA commands
         self.message_log: list[tuple[str, list[str]]] = []  # (mail_from, [recipients])
         self._session = None
+        self._lock = threading.Lock()
 
     def reset(self) -> None:
         self.rcpt_to_log.clear()
         self.data_log.clear()
         self.message_log.clear()
 
-    def rcpt_handler(self, rest: str) -> str:
-        """Called on each RCPT TO command. Always accept (250)."""
-        self.rcpt_to_log.append(rest)
+    async def handle_RCPT(self, session: Any, envelope: Any, *args: Any) -> str:
+        """Async handler for aiosmtpd 1.4.6.
+
+        NOTE: aiosmtpd 1.4.6 passes args=(Envelope, address, rcpt_options).
+        The Envelope is passed BY VALUE, so we must update session.envelope
+        directly (not args[0]) for the Envelope to persist between RCPT and DATA.
+        """
+        with self._lock:
+            if len(args) >= 2:
+                self.rcpt_to_log.append(args[1])
+                if hasattr(session, 'envelope'):
+                    session.envelope.rcpt_tos.append(args[1])
         return "250 OK"
 
-    def data_handler(self, args: str) -> str:
-        self.data_log.append(args.encode() if isinstance(args, str) else args)
-        return "250 Message accepted for delivery"
-
-    def handle_MAIL(self, mail: str) -> str:
+    async def handle_DATA(self, session: Any, envelope: Any, *args: Any) -> str:
+        """Async handler for aiosmtpd 1.4.6."""
+        with self._lock:
+            content = (
+                getattr(session.envelope, "content", b"")  # noqa: E501
+                if hasattr(session, "envelope")
+                else b""
+            )
+            self.data_log.append(content)
         return "250 OK"
-
-    def handle_RCPT(self, rest: str) -> str:
-        return self.rcpt_handler(rest)
-
-    def handle_DATA(self, args: str) -> str:
-        return self.data_handler(args)
 
 
 if HAS_AIOSMTPD:
@@ -90,7 +106,6 @@ if HAS_AIOSMTPD:
                 # server is running on localhost:9025
                 ...
         """
-        import threading
         import time
 
         handler = RecordingSMTPHandler()

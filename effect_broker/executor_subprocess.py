@@ -4,7 +4,7 @@ ARCHITECTURE
 ────────────
 This process runs in ISOLATION from the broker. It is the ONLY component
 that can mutate external state (files, emails, mailboxes). All state
-mutation goes through here — no other process can touch the store directly.
+mutation goes through here — no other process can touch the store directly
 
     ┌────────────────┐  execute(Effect)  ┌─────────────────────────┐
     │  broker        │ ─────────────────►│  executor_subprocess    │
@@ -15,12 +15,12 @@ mutation goes through here — no other process can touch the store directly.
     │  - Approval    │ ◄──────────────── │                         │
     └────────────────┘                   └─────────────────────────┘
                                                         │
-                                    read_store() ───────┘
-                                     (for observer)
-                                    ┌────────────────┐
-                                    │  Ledger        │
-                                    │  Process 3     │
-                                    └────────────────┘
+                                        read_store() ───┘
+                                        (for observer)
+                                        ┌────────────────┐
+                                        │  Ledger        │
+                                        │  Process 3     │
+                                        └────────────────┘
 
 ISOLATION GUARANTEES
 ────────────────────
@@ -56,9 +56,24 @@ import threading
 from pathlib import Path
 from typing import Any
 
+
+def _derive_confidentiality_from_mode(mode_int: int) -> str:
+    """Derive confidentiality from Unix permission bits (mirrors shim_real.py).
+
+    Runs in subprocess so taint detection uses real OS state:
+      Owner-only  (mode & 0o007 == 0)   → CONFIDENTIAL
+      Group-readable (mode & 0o070 != 0) → INTERNAL
+      World-readable (mode & 0o004 != 0) → PUBLIC
+      Other                                → PUBLIC
+    """
+    if mode_int & 0o007 == 0:
+        return "CONFIDENTIAL"
+    if mode_int & 0o070 != 0:
+        return "INTERNAL"
+    return "PUBLIC"
+
+
 # ---- Store: only mutable state in THIS process ----
-
-
 class IsolatedStore:
     """The sole mutable store — ONLY lives in this subprocess.
 
@@ -238,6 +253,7 @@ class ExecutorServer:
     ) -> None:
         self._path = Path(socket_path)
         self._store: IsolatedStore | None = None
+        self._session_states: dict[str, dict[str, Any]] = {}  # task_id → session state
         self._ready_event = ready_event
         self._shutdown = threading.Event()
         self._server: socket.socket | None = None
@@ -327,6 +343,353 @@ class ExecutorServer:
         finally:
             conn.close()
 
+    def _handle_apply_commit(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Handle atomic commit: Fresh check + nonce reserve + apply_effect.
+
+        This implements the atomic commit protocol from the session sync fix:
+        1. Load A's session snapshot (used nonces, revoked, logical_time, taint)
+        2. Fresh check in subprocess: replay detection + revoked check
+        3. If Fresh: apply_effect to IsolatedStore, track taint on CONFIDENTIAL read
+        4. Return session_update with updated state (B→A sync)
+
+        Args:
+            payload: {
+                "effect": effect dict,
+                "task_id": str,
+                "session_snapshot": A's session state,
+                "reserve_nonce": bool
+            }
+
+        Returns:
+            {"status": "ok", "observed_targets": [...], "session_update": {...}}
+            or {"status": "blocked", "blocker": "Fresh", "reason": "replay|revoked|expired"}
+        """
+        effect = payload.get("effect", {})
+        task_id = payload.get("task_id", "default")
+        snapshot = payload.get("session_snapshot", {})
+        reserve_nonce = payload.get("reserve_nonce", True)
+
+        # Get or create subprocess session mirror for this task
+        session = self._session_states.get(task_id, {})
+        if not session:
+            session = dict(snapshot)  # Start from A's snapshot
+            self._session_states[task_id] = session
+
+        # CRITICAL: Fresh check in subprocess using A's snapshot
+        nonce = effect.get("capability_nonce")
+
+        if reserve_nonce and nonce:
+            # Check replay (nonce in A's used set)
+            if nonce in session.get("used", []):
+                return {
+                    "ok": True,
+                    "status": "blocked",
+                    "blocker": "Fresh",
+                    "reason": "replay",
+                    "task_id": task_id,
+                }
+
+            # Check global revocation (nonce in A's revoked set)
+            if nonce in session.get("revoked", []):
+                return {
+                    "ok": True,
+                    "status": "blocked",
+                    "blocker": "Fresh",
+                    "reason": "revoked",
+                    "task_id": task_id,
+                }
+
+        # Apply effect to IsolatedStore
+        assert self._store is not None, "store must be initialized"
+        try:
+            obs_targets = self._store.apply_effect(effect)
+
+            # Track taint: if read CONFIDENTIAL file, mark session as tainted
+            if effect.get("etype") == "read":
+                target = effect.get("target", "")
+                # Check if target is marked CONFIDENTIAL in subprocess store
+                file_entry = self._store._files.get(target)
+                if (
+                    file_entry
+                    and file_entry.sensitivity
+                    and hasattr(file_entry.sensitivity, "name")
+                ):
+                    if file_entry.sensitivity.name == "CONFIDENTIAL":
+                        if not session.get("tainted"):
+                            session["tainted"] = True
+                            session["_taint_reason"] = f"read-confidential({target})"
+                            self._session_states[task_id] = session
+
+            # Reserve nonce if requested (B's local reservation)
+            if reserve_nonce and nonce:
+                if "used" not in session:
+                    session["used"] = list(snapshot.get("used", []))
+                session["used"] = list(session.get("used", [])) + [nonce]
+
+            # Build session update for A (B→A sync)
+            session_update_applied = {
+                "used": session.get("used", list(snapshot.get("used", []))),
+                "logical_time": session.get("logical_time", snapshot.get("logical_time", 0.0)),
+                "tainted": session.get("tainted", snapshot.get("tainted", False)),
+                "_taint_reason": session.get("_taint_reason", ""),
+            }
+
+            return {
+                "ok": True,
+                "status": "ok",
+                "observed_targets": list(obs_targets),
+                "session_update": session_update_applied,
+                "task_id": task_id,
+            }
+
+        except Exception as e:
+            # Rollback nonce reservation on failure
+            if reserve_nonce and nonce and nonce in session.get("used", []):
+                session["used"] = [n for n in session["used"] if n != nonce]
+            return {
+                "ok": True,
+                "status": "error",
+                "reason": str(e),
+                "task_id": task_id,
+            }
+
+    def _handle_real_effect(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Handle real OS/SMTP operations in subprocess (APPLY_EFFECT).
+
+        This is where REAL file I/O and SMTP operations happen — in the
+        isolated subprocess, NOT in the broker process.
+        """
+        import base64
+        import smtplib
+
+        op = payload.get("op", "")
+        SMTP_HOST = os.environ.get("ECAC_SMTP_HOST", "localhost")
+        SMTP_PORT = int(os.environ.get("ECAC_SMTP_PORT", "1025"))
+
+        try:
+            if op == "real_read":
+                path = payload["path"]
+                st = os.stat(path)
+                with open(path, "rb") as f:
+                    content = f.read()
+                # Derive confidentiality from REAL OS permission bits (same heuristic
+                # as shim_real.py). If the file is owner-only, it is CONFIDENTIAL —
+                # reading it taints the session (read-secrets → send-block attack).
+                confidentiality = _derive_confidentiality_from_mode(st.st_mode)
+                session_update = {}
+                if confidentiality == "CONFIDENTIAL":
+                    task_id = payload.get("task_id", "default")
+                    session = self._session_states.get(task_id, {})
+                    # Set taint in subprocess mirror (B) so sync_session returns it to A
+                    if not session.get("tainted"):
+                        session = dict(session)  # copy
+                        session["tainted"] = True
+                        session["_taint_reason"] = f"real-read-confidential({path})"
+                        self._session_states[task_id] = session
+                    session_update = session
+                return {
+                    "ok": True,
+                    "content": base64.b64encode(content).decode(),
+                    "path": path,
+                    "confidentiality": confidentiality,
+                    "session_update": session_update,
+                }
+
+            elif op == "real_write":
+                path = payload["path"]
+                content = base64.b64decode(payload["content"])
+                with open(path, "wb") as f:
+                    f.write(content)
+                # Derive confidentiality of the written file from real mode bits.
+                # A newly written file may have umask-applied permissions;
+                # if it is owner-only (0o600), it is CONFIDENTIAL.
+                try:
+                    st = os.stat(path)
+                    confidentiality = _derive_confidentiality_from_mode(st.st_mode)
+                except OSError:
+                    confidentiality = "INTERNAL"
+                session_update = {}
+                if confidentiality == "CONFIDENTIAL":
+                    task_id = payload.get("task_id", "default")
+                    session = self._session_states.get(task_id, {})
+                    if not session.get("tainted"):
+                        session = dict(session)
+                        session["tainted"] = True
+                        session["_taint_reason"] = f"real-write-confidential({path})"
+                        self._session_states[task_id] = session
+                    session_update = session
+                return {
+                    "ok": True,
+                    "path": path,
+                    "confidentiality": confidentiality,
+                    "session_update": session_update,
+                }
+
+            elif op == "real_delete":
+                path = payload["path"]
+                os.remove(path)
+                return {"ok": True, "path": path}
+
+            elif op == "real_stat":
+                path = payload["path"]
+                st = os.stat(path)
+                confidentiality = _derive_confidentiality_from_mode(st.st_mode)
+                session_update = {}
+                if confidentiality == "CONFIDENTIAL":
+                    task_id = payload.get("task_id", "default")
+                    session = self._session_states.get(task_id, {})
+                    if not session.get("tainted"):
+                        session = dict(session)
+                        session["tainted"] = True
+                        session["_taint_reason"] = f"real-stat-confidential({path})"
+                        self._session_states[task_id] = session
+                    session_update = session
+                return {
+                    "ok": True,
+                    "stat": {
+                        "mode": oct(st.st_mode),
+                        "size": st.st_size,
+                        "st_ino": int(st.st_ino),
+                        "st_dev": int(st.st_dev),
+                        "st_uid": int(st.st_uid),
+                        "st_gid": int(st.st_gid),
+                        "st_mode_int": int(st.st_mode),
+                    },
+                    "confidentiality": confidentiality,
+                    "session_update": session_update,
+                }
+
+            elif op == "real_listdir":
+                path = payload["path"]
+                entries = os.listdir(path)
+                return {"ok": True, "entries": entries}
+
+            elif op == "real_smtp_send":
+                sender = payload["sender"]
+                recipients = payload["recipients"]
+                body = payload["body"]
+                # RSET probe: check each recipient first
+                actual_recipients: list[str] = []
+                bcc_detected = []
+                smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
+                try:
+                    smtp.ehlo()
+                    smtp.mail(sender)
+                    for rcpt in recipients:
+                        code, _ = smtp.rcpt(rcpt)
+                        if code == 250:
+                            actual_recipients.append(rcpt)
+                        else:
+                            bcc_detected.append(rcpt)
+                    smtp.rset()
+                finally:
+                    smtp.quit()
+                if bcc_detected:
+                    return {"ok": True, "bcc_detected": bcc_detected}
+                # Real send
+                smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
+                try:
+                    smtp.sendmail(sender, recipients, body)
+                finally:
+                    smtp.quit()
+                return {"ok": True, "delivered": actual_recipients}
+
+            elif op == "real_smtp_probe":
+                # RSET-only probe for BCC detection — happens ENTIRELY in subprocess.
+                # No message is queued; this just discovers actual MTA recipients.
+                sender = payload["sender"]
+                recipients = payload["recipients"]
+                actual_accepted: list[str] = []
+                bcc_detected = []
+                smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
+                try:
+                    smtp.ehlo()
+                    smtp.mail(sender)
+                    for rcpt in recipients:
+                        code, _ = smtp.rcpt(rcpt)
+                        if code == 250:
+                            actual_accepted.append(rcpt)
+                        else:
+                            bcc_detected.append(rcpt)
+                    smtp.rset()  # Abort — no message queued
+                finally:
+                    smtp.quit()
+                return {
+                    "ok": True,
+                    "declared": recipients,
+                    "actual_accepted": actual_accepted,
+                    "bcc_detected": bcc_detected,
+                }
+
+            elif op == "real_imap_read_inbox":
+                # Real IMAP read_inbox — happens ENTIRELY in subprocess.
+                # This ensures IMAP operations (IMAP4_SSL, SELECT, SEARCH, FETCH)
+                # happen in the isolated subprocess, not in the broker process.
+                import imaplib
+
+                payload["user"]
+                imap_host = payload.get("imap_host", "localhost")
+                imap_port = payload.get("imap_port", 993)
+                imap_user = payload.get("imap_user")
+                imap_password = payload.get("imap_password")
+                imap_use_tls = payload.get("imap_use_tls", True)
+
+                messages: list[str] = []
+                total_size = 0
+                try:
+                    mailbox: imaplib.IMAP4
+                    if imap_use_tls:
+                        mailbox = imaplib.IMAP4_SSL(imap_host, imap_port)
+                    else:
+                        mailbox = imaplib.IMAP4(imap_host, imap_port)
+                    try:
+                        if imap_user and imap_password:
+                            mailbox.login(imap_user, imap_password)
+                        status, _ = mailbox.select("INBOX")
+                        if status != "OK":
+                            return {
+                                "ok": True,
+                                "result": {
+                                    "message_ids": [],
+                                    "total_size": 0,
+                                    "error": f"SELECT INBOX failed: {status}",
+                                },
+                            }
+                        _, msg_ids = mailbox.search(None, "ALL")
+                        ids = msg_ids[0].split() if msg_ids[0] else []
+                        for mid in ids:
+                            _, data = mailbox.fetch(mid, "(RFC822)")
+                            if data and data[0]:
+                                raw = data[0][1] if isinstance(data[0], tuple) else data[0]
+                                total_size += len(raw)
+                        messages = [mid.decode() for mid in ids]
+                    finally:
+                        mailbox.logout()
+                except Exception as ex:
+                    return {
+                        "ok": True,
+                        "message_ids": [],
+                        "total_size": 0,
+                        "error": str(ex),
+                    }
+                return {
+                    "ok": True,
+                    "message_ids": messages,
+                    "total_size": total_size,
+                    "error": None,
+                }
+
+            return {"ok": False, "error": f"Unknown op: {op}"}
+
+        except Exception as e:
+            import traceback
+
+            return {
+                "ok": False,
+                "error": str(e) or repr(e) or "unknown",
+                "trace": traceback.format_exc(),
+            }
+
     def _dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
         from effect_broker.executor_ipc import ExecutorRequest
 
@@ -344,32 +707,28 @@ class ExecutorServer:
                 obs_targets = self._store.apply_effect(effect_dict)
                 return {
                     "ok": True,
-                    "result": {
-                        "observed_targets": list(obs_targets),
-                        "effects_log": list(self._store.effects_log),
-                    },
+                    "observed_targets": list(obs_targets),
+                    "effects_log": list(self._store.effects_log),
                 }
 
             case ExecutorRequest.READ_STORE:
                 return {
                     "ok": True,
-                    "result": {
-                        "files": self._store.list_files(),
-                        "emails": self._store.list_emails(),
-                        "mailboxes": self._store.list_mailboxes(),
-                        "effects_log": self._store.read_effects_log(),
-                        "identity_log": self._store.read_identity_log(),
-                    },
+                    "files": self._store.list_files(),
+                    "emails": self._store.list_emails(),
+                    "mailboxes": self._store.list_mailboxes(),
+                    "effects_log": self._store.read_effects_log(),
+                    "identity_log": self._store.read_identity_log(),
                 }
 
             case ExecutorRequest.READ_FILES:
-                return {"ok": True, "result": {"files": self._store.list_files()}}
+                return {"ok": True, "files": self._store.list_files()}
 
             case ExecutorRequest.READ_EMAILS:
-                return {"ok": True, "result": {"emails": self._store.list_emails()}}
+                return {"ok": True, "emails": self._store.list_emails()}
 
             case ExecutorRequest.READ_MAILBOXES:
-                return {"ok": True, "result": {"mailboxes": self._store.list_mailboxes()}}
+                return {"ok": True, "mailboxes": self._store.list_mailboxes()}
 
             case ExecutorRequest.BOOTSTRAP:
                 files = payload.get("files", [])
@@ -381,11 +740,39 @@ class ExecutorServer:
                 mailboxes = payload.get("mailboxes", [])
                 for user in mailboxes:
                     self._store._unsafe_bootstrap_mailbox(user)
-                return {"ok": True, "result": True}
+                return {"ok": True}
+
+            case ExecutorRequest.APPLY_COMMIT:
+                # Atomic commit protocol: Fresh check + nonce reserve + apply_effect
+                # This runs entirely in the subprocess for consistency guarantees.
+                return self._handle_apply_commit(payload)
+
+            case ExecutorRequest.APPLY_EFFECT:
+                return self._handle_real_effect(payload)
+
+            case ExecutorRequest.SYNC_SESSION:
+                # Sync session state from broker to subprocess.
+                # Subprocess maintains its own mirror of session state for:
+                # 1. Independent Fresh checking (replay prevention)
+                # 2. Audit trail of session state at each execution
+                # 3. Independent verification for ledger
+                task_id = payload.get("task_id", "default")
+                session_state = payload.get("session_state", {})
+                self._session_states[task_id] = session_state
+                # Return subprocess's current view of session state
+                return {
+                    "ok": True,
+                    "task_id": task_id,
+                    "session_snapshot": self._session_states.get(task_id, {}),
+                    "all_tasks": list(self._session_states.keys()),
+                }
 
             case ExecutorRequest.SHUTDOWN:
                 self._shutdown_requested = True
-                return {"ok": True, "result": True}
+                return {"ok": True}
+
+            case _:
+                return {"ok": False, "error": f"Unhandled request kind: {kind}"}
 
 
 class ExecutorProcessHandle:

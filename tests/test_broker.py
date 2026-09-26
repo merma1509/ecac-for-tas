@@ -10,6 +10,7 @@ import pytest
 
 from effect_broker.broker import EffectBroker
 from effect_broker.lattice import Confidentiality, Integrity
+from effect_broker.ledger import UnknownLedgerResult
 from effect_broker.mediation import MediationVerdict, Mediator, ToolSpec
 from effect_broker.model import (
     AGENT,
@@ -25,7 +26,6 @@ from effect_broker.model import (
     LabelException,
     Task,
 )
-from effect_broker.ledger import UnknownLedgerResult
 from effect_broker.traces import build
 
 CHAIN = (USER, AGENT, BROKER)
@@ -852,7 +852,7 @@ class TestCrossTaskApprovalUse:
             known_targets=EffectTarget(primary="internal@corp.com"),
         )
         approval_nonce = broker.grant_approval(grant_effect, expiry=100.0, task_id="task-a")
-        stored = broker._approved_requests[approval_nonce]
+        _unused_stored = broker._approved_requests[approval_nonce]
 
         # Commit with task-a: ALLOW
         effect_a = Effect(
@@ -968,7 +968,7 @@ class TestOverObservedIsUnknown:
         the ledger MUST NOT return CONFIRMED_COMMITTED when it cannot verify
         the claim. This tests the boundary case directly.
         """
-        from effect_broker.ledger import LedgerVerdict, UnknownLedgerResult
+        from effect_broker.ledger import UnknownLedgerResult
 
         task_id = "default"
         nonce = "test-nonce"
@@ -989,7 +989,9 @@ class TestOverObservedIsUnknown:
         verdict = broker.ledger.verify(task_id, nonce)
         assert isinstance(verdict, UnknownLedgerResult)
         assert "over-observed" in verdict.reason
-        assert "obs_count=2" in verdict.reason
+        # Now reports committed_count (count of committed obs, not total obs)
+        # because blocked entries don't count toward the limit
+        assert "committed_count=2" in verdict.reason
 
 
 class TestUnknownLedgerResultIsNotSafe:

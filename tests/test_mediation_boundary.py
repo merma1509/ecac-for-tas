@@ -31,7 +31,7 @@ from effect_broker.broker import EffectBroker
 from effect_broker.lattice import Confidentiality, Integrity
 from effect_broker.mediation import Mediator, ToolSpec
 from effect_broker.model import (
-    BROKER,
+    USER,
     Capability,
     Commit,
     Data,
@@ -39,7 +39,6 @@ from effect_broker.model import (
     Effect,
     EffectTarget,
     Task,
-    USER,
 )
 from effect_broker.shim import FileShim
 
@@ -368,9 +367,8 @@ class TestBoundaryMediationViaShim:
         assert broker.store.effects_log == []
 
         # Ledger: CONFIRMED_BLOCKED
-        from effect_broker.ledger import LedgerVerdict
 
-        ledger = broker.ledger
+        _unused_ledger = broker.ledger
         # The shim's _derive_nonce uses tool_name:operation format
         # but the actual nonce is from _find_capability which uses the cap nonce
         failures = broker.verify_complete_mediation()
@@ -425,7 +423,7 @@ class TestMediatorMetadataLimitation:
             capability_nonce="any-cap",
             delegation_chain=(),
         )
-        commit = Commit(effect=effect, task=None, tool_name="undocumented-tool")
+        _unused_commit = Commit(effect=effect, task=None, tool_name="undocumented-tool")
 
         # No mediator -> boundary pass. Capability-level predicates still gate.
         # With UNTRUSTED provenance (INTERNAL, UNTRUSTED), FlowOK would block.

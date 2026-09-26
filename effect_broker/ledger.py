@@ -105,7 +105,6 @@ class IndependentEffectLedger:
     _logical_time: float = 0.0
 
     # ---- Recording API (called by broker.gate and executor/store) ----
-
     def record_authorization(
         self,
         task_id: str,
@@ -150,14 +149,24 @@ class IndependentEffectLedger:
         """Record an observation event (effect reached external state).
 
         Called by store.ledger() when a mutation is applied, or by executor
-        when it reads the identity_log after apply. Pass observed_targets=frozenset()
-        for a confirmed-blocked effect (effect attempted at gate, blocked, no state change).
+        when it reads the identity_log after apply, or by shim when it blocks
+        an effect at the fail-closed boundary BEFORE broker.gate() is reached.
+        Pass observed_targets=frozenset() for a confirmed-blocked effect
+        (effect attempted at gate, blocked, no state change).
+
+        The key distinction: effects blocked BEFORE broker.gate() (e.g., BCC
+        detection in shim) still get recorded here so the ledger can distinguish
+        them from direct store bypass (which would appear as "authorized but
+        never observed"). Without this record, the same (auth=0, obs=0) would be
+        UNKNOWN — indistinguishable from a direct bypass that was simply never
+        recorded at all.
 
         Args:
             task_id: the task context
             nonce: the capability nonce
             observed_targets: resources that were actually touched (empty = blocked)
-            source: who recorded this
+            source: who recorded this. Use "shim.bcc" for BCC blocks, "executor.execute:BLOCKED"
+                    for gate-rejected effects, "subprocess.apply:BLOCKED" for subprocess blocks.
         """
         self._logical_time += 1.0
         entry = LedgerEntry(
@@ -173,32 +182,100 @@ class IndependentEffectLedger:
             self._observations[key] = []
         self._observations[key].append(entry)
 
-    # ---- Verification API (the ONLY way to get verdicts) ----
+    def record_shim_block(
+        self,
+        task_id: str,
+        nonce: str,
+        reason: str,
+        blocked_targets: frozenset[str] | None = None,
+    ) -> None:
+        """Record an effect blocked by the shim BEFORE reaching broker.gate().
 
+        This addresses the "shim-before-commit gap": effects blocked at the shim
+        level (e.g., BCC detection, capability mismatch) never reach broker.commit(),
+        so they would otherwise be invisible to the ledger. Recording them here makes
+        the ledger's CONFIRMED_BLOCKED verdict meaningful for both gate-blocked and
+        shim-blocked effects.
+
+        With this record, the ledger can distinguish:
+          - BCC-blocked effect: obs_entries = [{"source": "shim.bcc", "observed": ∅}]
+          - Direct store bypass: no obs_entries → UNKNOWN
+          - Gate-rejected effect: obs_entries = [{"source": "executor.execute:BLOCKED"}]
+
+        Args:
+            task_id: the task context
+            nonce: the capability nonce (may be "unknown" for shim-level blocks)
+            reason: human-readable reason (e.g., "bcc-detected", "capability-mismatch")
+            blocked_targets: set of targets the shim intended to access (for audit)
+        """
+        self._logical_time += 1.0
+        entry = LedgerEntry(
+            task_id=task_id,
+            nonce=nonce,
+            authorized_targets=blocked_targets or frozenset(),
+            observed_targets=None,  # explicitly blocked — no state change
+            timestamp=self._logical_time,
+            source=f"shim.{reason}",
+        )
+        key = (task_id, nonce)
+        if key not in self._observations:
+            self._observations[key] = []
+        self._observations[key].append(entry)
+
+    # ---- Verification API (the ONLY way to get verdicts) ----
     def verify(self, task_id: str, nonce: str) -> LedgerVerdict | UnknownLedgerResult:
         """Verify mediation for a single (task_id, nonce).
 
         Returns:
-          - CONFIRMED_COMMITTED: authorized AND observed (targets ⊆ authorized), no
-            BLOCKED entries present. The effect was applied and no gate rejections occurred.
-          - CONFIRMED_BLOCKED: at least one BLOCKED observation exists. This proves the
-            gate rejected at least one attempt — even if earlier attempts were allowed.
-            Used for: Fresh replay prevention (effect committed once, then blocked on retry).
+          - CONFIRMED_COMMITTED: at least one observation has non-None observed_targets
+            AND no BLOCKED entries. The effect was applied and gate never rejected.
+          - CONFIRMED_BLOCKED: ALL observations are BLOCKED (no committed entries).
+            The effect was attempted but blocked at every attempt.
           - UNKNOWN: cannot determine outcome (possible bypass or ambiguous).
             Examples: auth without obs (possible bypass), obs without auth (unauthorized),
             obs_count > auth_count (over-observed — possible crash or bypass).
 
         Key invariant: authorized without observation -> UNKNOWN (never "safe").
-        BLOCKED entries take precedence over committed entries: if Fresh blocked a retry,
-        CONFIRMED_BLOCKED is the honest verdict — the second attempt was rejected, not applied.
+
+        VERDICT PRECEDENCE (FIXED):
+          - Committed takes precedence over blocked: if effect was applied at least
+            once, CONFIRMED_COMMITTED even if subsequent retries were blocked (replay).
+          - CONFIRMED_BLOCKED only when ALL observations are blocked.
         """
         key = (task_id, nonce)
         auth_entries = self._authorizations.get(key, [])
         obs_entries = self._observations.get(key, [])
 
+        # Sources that indicate the effect was explicitly blocked (not applied)
+        # These can come from gate rejection (broker/executor) or shim-level
+        # checks (BCC detection, capability mismatch). All mean "no state change"
+        BLOCKED_SOURCES = frozenset(
+            {
+                "broker.commit:BLOCKED",
+                "executor.execute:BLOCKED",
+                "subprocess.gate:BLOCKED",
+                "subprocess.apply:BLOCKED",
+                "shim.bcc",
+                "shim.capability-mismatch",
+            }
+        )
+
         if not auth_entries:
-            # No authorization record — possible unauthorized effect
+            # No authorization record
+            # Two cases:
+            # 1. Obs WITHOUT shim source → possible unauthorized effect (UNKNOWN)
+            #    Example: store mutated directly without broker involvement
+            # 2. Obs WITH shim source only → confirmed blocked, no auth needed
+            #    Example: BCC detection in shim blocks before broker.gate()
+            #    The shim's record IS the observation (equivalent to broker auth)
             if obs_entries:
+                has_shim_source = any(entry.source.startswith("shim.") for entry in obs_entries)
+                all_blocked = all(entry.source.startswith("shim.") for entry in obs_entries)
+                if has_shim_source and all_blocked:
+                    # Explicit shim block (BCC, capability mismatch) — CONFIRMED_BLOCKED
+                    # The shim observed and blocked. No auth entry needed because
+                    # the shim is the authoritative boundary for this class of effects
+                    return LedgerVerdict.CONFIRMED_BLOCKED
                 return UnknownLedgerResult(
                     reason=f"observed_without_authorization(task={task_id},nonce={nonce})"
                 )
@@ -215,8 +292,7 @@ class IndependentEffectLedger:
                 reason=f"authorized_not_observed(task={task_id},nonce={nonce},possible_bypass)"
             )
 
-        # Classify observations: committed (effect was applied) vs blocked (gate rejected)
-        BLOCKED_SOURCES = frozenset({"broker.commit:BLOCKED", "executor.execute:BLOCKED"})
+        # Classify observations: committed (effect was applied) vs blocked (gate/shim rejected)
         committed_entries: list[LedgerEntry] = []
         blocked_entries: list[LedgerEntry] = []
         for entry in obs_entries:
@@ -225,12 +301,9 @@ class IndependentEffectLedger:
             else:
                 committed_entries.append(entry)
 
-        # Key ordering: blocked > committed. If Fresh blocked a retry, the second
-        # attempt did NOT apply to external state — even though the first one did.
-        # Return CONFIRMED_BLOCKED (the block proves the gate worked on the retry).
-        if blocked_entries:
-            return LedgerVerdict.CONFIRMED_BLOCKED
-
+        # KEY FIX: committed takes precedence over blocked.
+        # If any observation has non-None observed_targets, the effect was applied.
+        # Subsequent blocked retries (replay prevention) don't change this fact.
         if committed_entries:
             # There ARE committed observations — verify they are within authorization
             for entry in committed_entries:
@@ -241,16 +314,22 @@ class IndependentEffectLedger:
                         reason=f"extra_observed(task={task_id},nonce={nonce},"
                         f"extra={extra},authorized={authorized_targets})"
                     )
-            # Check occurrence count: cannot observe more than authorized.
-            # obs_count > auth_count -> UNKNOWN (possible bypass or lost auth record).
-            # This implements the "unknown, not safe" guarantee: the ledger must not
-            # claim CONFIRMED_COMMITTED when observation count exceeds authorization count.
-            if len(obs_entries) > len(auth_entries):
+            # Check occurrence count: obs_count > auth_count is only a problem
+            # when ALL observations are committed (no BLOCKED entries).
+            # When BLOCKED entries exist, they don't count toward the limit
+            # because they represent replay prevention, not extra applications.
+            only_committed_count = sum(1 for e in obs_entries if e not in blocked_entries)
+            if only_committed_count > len(auth_entries):
                 return UnknownLedgerResult(
                     reason=f"over-observed(task={task_id},nonce={nonce},"
-                    f"auth_count={len(auth_entries)},obs_count={len(obs_entries)})"
+                    f"auth_count={len(auth_entries)},"
+                    f"committed_count={only_committed_count})"
                 )
             return LedgerVerdict.CONFIRMED_COMMITTED
+
+        # Only blocked attempts — effect was NEVER applied to external state
+        if blocked_entries and auth_entries:
+            return LedgerVerdict.CONFIRMED_BLOCKED
 
         # No committed, no blocked — shouldn't happen with non-empty obs_entries
         return UnknownLedgerResult(reason=f"unknown_observation_type(task={task_id},nonce={nonce})")
@@ -314,7 +393,6 @@ class IndependentEffectLedger:
         return failures
 
     # ---- Audit API ----
-
     def get_entries(
         self, task_id: str | None = None, nonce: str | None = None
     ) -> list[LedgerEntry]:

@@ -14,15 +14,14 @@ with ToolRegistry, T14 is prevented before commit.
 
 from __future__ import annotations
 
-import warnings
 import pytest
 
 from effect_broker.broker import EffectBroker
-from effect_broker.model import Effect, EffectTarget, Data, Capability
-from effect_broker.lattice import Confidentiality, Integrity
+from effect_broker.lattice import Confidentiality
+from effect_broker.model import Capability
 from effect_broker.shim import FileShim, SecurityError
-from effect_broker.traces import build
 from effect_broker.tool_registry import ToolDeclaration, ToolRegistry
+from effect_broker.traces import build
 
 
 def _make_broker_and_shim(
@@ -38,7 +37,6 @@ def _make_broker_and_shim(
     IMPORTANT: _find_capability looks up by (holder, right, target).
     The shim's holder is the tool_name, but broker capabilities use holder="EffectBroker".
     """
-    from effect_broker.model import Capability
 
     broker = build()
     broker.store._unsafe_bootstrap_file("file:///reports", Confidentiality.INTERNAL)
@@ -294,7 +292,7 @@ class TestToolRegistryStructuralEnforcement:
         """ToolRegistry.check_operation_by_name() for pre-Effect validation."""
         registry = ToolRegistry()
         registry.declare(
-            ToolDeclaration("test-tool", declared_rights=frozenset({"read", "send"}), declared_targets=frozenset({"file:///a", "internal@corp.com"}))
+            ToolDeclaration("test-tool", declared_rights=frozenset({"read", "send"}), declared_targets=frozenset({"file:///a", "internal@corp.com"}))  # noqa: E501
         )
 
         ok, reason = registry.check_operation_by_name("test-tool", "read", "file:///a")
@@ -308,7 +306,7 @@ class TestToolRegistryStructuralEnforcement:
         assert not ok
         assert "undeclared-target" in reason
 
-        ok, reason = registry.check_operation_by_name("test-tool", "send", "internal@corp.com", frozenset({"external@evil.com"}))
+        ok, reason = registry.check_operation_by_name("test-tool", "send", "internal@corp.com", frozenset({"external@evil.com"}))  # noqa: E501
         assert not ok
         assert "undeclared-extra-target" in reason
 

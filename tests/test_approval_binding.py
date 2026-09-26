@@ -715,5 +715,5 @@ class TestApprovalGlobalRevocation:
         commit2_task2 = Commit(effect=effect2, task=task2)
         allow2_task2, ev2_task2 = broker.commit(commit2_task2)
         assert allow2_task2 is True, (
-            f"Task2 should ALLOW — different task, revocation in task1 is isolated. Evidence: {ev2_task2}"
+            f"Task2 should ALLOW — different task, revocation in task1 is isolated. Evidence: {ev2_task2}"  # noqa: E501
         )

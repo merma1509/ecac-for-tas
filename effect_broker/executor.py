@@ -38,7 +38,7 @@ ARCHITECTURE (single-path refactor):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .mediation import MediationVerdict
 
@@ -268,10 +268,15 @@ class SubprocessExecutor:
     ) -> tuple[bool, Evidence]:
         """Execute through the multi-process isolation path.
 
-        Three-phase execution:
-          1. gate() in broker process (read-only predicates)
-          2. IPC to subprocess → IsolatedStore.apply_effect()
-          3. Record authorization + observation to the independent ledger
+        Atomic commit protocol (session sync fix):
+          1. gate() in broker process (read-only predicates, atomic Fresh in A)
+          2. APPLY_COMMIT IPC → subprocess: Fresh check + nonce reserve + apply_effect
+          3. Sync session_update (B→A): taint, used nonces, logical_time
+          4. Record authorization + observation to the independent ledger
+
+        The key fix: session state is now synchronized both ways:
+        - A→B: session snapshot at gate time (used, revoked, taint, logical_time)
+        - B→A: session_update after apply (updated used, taint, logical_time)
         """
         self._execution_count += 1
         effect = commit.effect
@@ -279,7 +284,11 @@ class SubprocessExecutor:
         authorized_targets = effect.complete_targets()
 
         # Phase 1: gate evaluation (read-only, in broker process)
-        gate_result = self.broker.gate(commit, mediation=mediation)
+        # CRITICAL: reserve_nonce=False because the subprocess handles
+        # nonce reservation via APPLY_COMMIT protocol. This ensures the
+        # nonce is NOT reserved in A's session before IPC round-trip,
+        # preventing false replay detection in B.
+        gate_result = self.broker.gate(commit, mediation=mediation, reserve_nonce=False)
         allow = gate_result.allow
         evidence = gate_result.evidence
 
@@ -290,21 +299,53 @@ class SubprocessExecutor:
         )
 
         if allow:
-            # Phase 2: apply in subprocess via IPC
+            # Phase 2: Atomic commit in subprocess with session sync
             if self._client is None:
                 raise RuntimeError("SubprocessExecutor: no IPC client available")
 
-            from .executor_ipc import effect_to_dict
+            task = gate_result.task
+            session = task.session
 
+            # Build A's session snapshot at gate time
+            from .executor_ipc import effect_to_dict, session_state_to_dict
+
+            session_snapshot = session_state_to_dict(session) if session else {}
             effect_dict = effect_to_dict(effect)
-            resp = self._client.execute(effect_dict)
 
-            # Phase 3: record observation from subprocess's response
-            obs_targets = frozenset(resp.get("observed_targets", []))
-            identity_entry = resp.get("identity_entry", obs_targets)
-            self.ledger.record_observation(
-                actual_task_id, nonce, identity_entry, source="subprocess.apply"
+            # APPLY_COMMIT: Fresh check + nonce reserve + apply_effect in B
+            # B returns session_update with updated state (taint, used, logical_time)
+            resp = self._client.apply_commit(
+                effect_dict=effect_dict,
+                task_id=task.task_id,
+                session_snapshot=session_snapshot,
+                reserve_nonce=True,
             )
+
+            if resp.get("status") == "ok":
+                # Sync B→A: update A's session with B's changes
+                self._sync_session_from_subprocess(task, resp.get("session_update", {}))
+
+                # Phase 3: record observation from subprocess's response
+                obs_targets = frozenset(resp.get("observed_targets", []))
+                identity_entry = resp.get("identity_entry", obs_targets)
+                self.ledger.record_observation(
+                    actual_task_id, nonce, identity_entry, source="subprocess.apply"
+                )
+            elif resp.get("status") == "blocked":
+                # Fresh check in B detected replay/revoked — block the commit
+                # This should be rare since A already checked Fresh, but provides
+                # defense-in-depth for process isolation scenarios.
+                allow = False
+                evidence = dict(evidence)  # type: ignore[assignment]
+                evidence["allow"] = False
+                evidence["primary_blocker"] = resp.get("blocker", "Fresh")
+                evidence["block_reason"] = resp.get("reason", "unknown")
+                self.ledger.record_observation(
+                    actual_task_id, nonce, None, source="subprocess.apply:BLOCKED"
+                )
+            else:
+                # Error in subprocess — propagate to caller
+                raise RuntimeError(f"Apply commit failed: {resp.get('reason')}")
 
         else:
             # BLOCKED: record explicit blocked observation
@@ -313,6 +354,39 @@ class SubprocessExecutor:
             )
 
         return allow, evidence
+
+    def _sync_session_from_subprocess(
+        self,
+        task: Task,
+        update: dict[str, Any],
+    ) -> None:
+        """Sync session state from subprocess (B) back to broker (A).
+
+        This implements B→A sync for the atomic commit protocol:
+        - used: updated set of reserved nonces
+        - tainted: session taint from reading CONFIDENTIAL data
+        - logical_time: updated logical clock
+
+        Args:
+            task: The task whose session to update
+            update: session_update dict from subprocess response
+        """
+        if task.session is None:
+            return
+
+        # Sync used nonces
+        if "used" in update:
+            task.session.used = set(update["used"])
+
+        # Sync logical time
+        if "logical_time" in update:
+            task.session.logical_time = update["logical_time"]
+
+        # Sync taint state (critical for FlowOK in subsequent commits)
+        if update.get("tainted"):
+            task.session.taint_for_send(update.get("_taint_reason", "read-confidential"))
+            # Note: taint doesn't get cleared — once tainted, always tainted
+            # until broker records explicit declass exception
 
     def apply_effect(self, effect: Effect, task: Task) -> None:
         """NOT USED in multi-process mode.
