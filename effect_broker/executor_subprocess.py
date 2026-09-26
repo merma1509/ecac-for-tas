@@ -568,6 +568,8 @@ class ExecutorServer:
                 bcc_detected: list[str] = []
                 smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
                 try:
+                    smtp.ehlo()
+                    smtp.mail(sender)
                     for rcpt in recipients:
                         code, _ = smtp.rcpt(rcpt)
                         if code == 250:
@@ -596,6 +598,8 @@ class ExecutorServer:
                 bcc_detected: list[str] = []
                 smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
                 try:
+                    smtp.ehlo()
+                    smtp.mail(sender)
                     for rcpt in recipients:
                         code, _ = smtp.rcpt(rcpt)
                         if code == 250:
