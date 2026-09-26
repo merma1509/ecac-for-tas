@@ -204,6 +204,10 @@ class RealFileShim:
         The tool CANNOT set these labels -- the shim derives them from the
         actual file metadata and content. This is kill-criterion #3 resolved:
         FlowOK uses shim-resolved labels, not LLM-claimed labels.
+
+        Priority for EXISTING files being read:
+          1. Permission bits for CONFIDENTIAL signal (owner-only access = OS-enforced)
+          2. Content-based keywords (last resort for non-confidential files)
         """
         # For NEW file writes: derive from path, NOT content
         # Content scanning would cause false CONFIDENTIAL labels for
@@ -212,13 +216,21 @@ class RealFileShim:
         if not pre_exists and op_type == "write":
             conf = self._derive_path_confidentiality(path)
             integ = Integrity.USER
-        # Existing file being read: derive from content
-        elif content is not None and op_type == "read":
-            conf = self._derive_content_confidentiality(content)
-            integ = Integrity.USER
-        # Read-only on existing file
+        # Existing file being read: check permission bits FIRST for CONFIDENTIAL
+        # Permission bits are OS-enforced and cannot be influenced by content.
+        # Owner-only access (0o600) is the definitive CONFIDENTIAL signal.
+        # We don't override with PUBLIC from bits — that's too restrictive;
+        # instead we rely on content keywords for non-confidential files.
         elif pre_exists and op_type in ("read", "stat"):
-            conf = self._derive_path_confidentiality(path)
+            path_conf = self._derive_path_confidentiality(path)
+            if path_conf == Confidentiality.CONFIDENTIAL:
+                # Owner-only access is the definitive CONFIDENTIAL signal
+                conf = Confidentiality.CONFIDENTIAL
+            elif content is not None:
+                # Not definitively restricted — use content as last resort
+                conf = self._derive_content_confidentiality(content)
+            else:
+                conf = Confidentiality.INTERNAL
             integ = Integrity.USER
         # Fallback
         else:
