@@ -105,7 +105,6 @@ class IndependentEffectLedger:
     _logical_time: float = 0.0
 
     # ---- Recording API (called by broker.gate and executor/store) ----
-
     def record_authorization(
         self,
         task_id: str,
@@ -150,14 +149,24 @@ class IndependentEffectLedger:
         """Record an observation event (effect reached external state).
 
         Called by store.ledger() when a mutation is applied, or by executor
-        when it reads the identity_log after apply. Pass observed_targets=frozenset()
-        for a confirmed-blocked effect (effect attempted at gate, blocked, no state change).
+        when it reads the identity_log after apply, or by shim when it blocks
+        an effect at the fail-closed boundary BEFORE broker.gate() is reached.
+        Pass observed_targets=frozenset() for a confirmed-blocked effect
+        (effect attempted at gate, blocked, no state change).
+
+        The key distinction: effects blocked BEFORE broker.gate() (e.g., BCC
+        detection in shim) still get recorded here so the ledger can distinguish
+        them from direct store bypass (which would appear as "authorized but
+        never observed"). Without this record, the same (auth=0, obs=0) would be
+        UNKNOWN — indistinguishable from a direct bypass that was simply never
+        recorded at all.
 
         Args:
             task_id: the task context
             nonce: the capability nonce
             observed_targets: resources that were actually touched (empty = blocked)
-            source: who recorded this
+            source: who recorded this. Use "shim.bcc" for BCC blocks, "executor.execute:BLOCKED"
+                    for gate-rejected effects, "subprocess.apply:BLOCKED" for subprocess blocks.
         """
         self._logical_time += 1.0
         entry = LedgerEntry(
@@ -173,8 +182,47 @@ class IndependentEffectLedger:
             self._observations[key] = []
         self._observations[key].append(entry)
 
-    # ---- Verification API (the ONLY way to get verdicts) ----
+    def record_shim_block(
+        self,
+        task_id: str,
+        nonce: str,
+        reason: str,
+        blocked_targets: frozenset[str] | None = None,
+    ) -> None:
+        """Record an effect blocked by the shim BEFORE reaching broker.gate().
 
+        This addresses the "shim-before-commit gap": effects blocked at the shim
+        level (e.g., BCC detection, capability mismatch) never reach broker.commit(),
+        so they would otherwise be invisible to the ledger. Recording them here makes
+        the ledger's CONFIRMED_BLOCKED verdict meaningful for both gate-blocked and
+        shim-blocked effects.
+
+        With this record, the ledger can distinguish:
+          - BCC-blocked effect: obs_entries = [{"source": "shim.bcc", "observed": ∅}]
+          - Direct store bypass: no obs_entries → UNKNOWN
+          - Gate-rejected effect: obs_entries = [{"source": "executor.execute:BLOCKED"}]
+
+        Args:
+            task_id: the task context
+            nonce: the capability nonce (may be "unknown" for shim-level blocks)
+            reason: human-readable reason (e.g., "bcc-detected", "capability-mismatch")
+            blocked_targets: set of targets the shim intended to access (for audit)
+        """
+        self._logical_time += 1.0
+        entry = LedgerEntry(
+            task_id=task_id,
+            nonce=nonce,
+            authorized_targets=blocked_targets or frozenset(),
+            observed_targets=None,  # explicitly blocked — no state change
+            timestamp=self._logical_time,
+            source=f"shim.{reason}",
+        )
+        key = (task_id, nonce)
+        if key not in self._observations:
+            self._observations[key] = []
+        self._observations[key].append(entry)
+
+    # ---- Verification API (the ONLY way to get verdicts) ----
     def verify(self, task_id: str, nonce: str) -> LedgerVerdict | UnknownLedgerResult:
         """Verify mediation for a single (task_id, nonce).
 
@@ -198,9 +246,38 @@ class IndependentEffectLedger:
         auth_entries = self._authorizations.get(key, [])
         obs_entries = self._observations.get(key, [])
 
+        # Sources that indicate the effect was explicitly blocked (not applied)
+        # These can come from gate rejection (broker/executor) or shim-level
+        # checks (BCC detection, capability mismatch). All mean "no state change"
+        BLOCKED_SOURCES = frozenset({
+            "broker.commit:BLOCKED",
+            "executor.execute:BLOCKED",
+            "subprocess.gate:BLOCKED",
+            "subprocess.apply:BLOCKED",
+            "shim.bcc",
+            "shim.capability-mismatch",
+        })
+
         if not auth_entries:
-            # No authorization record — possible unauthorized effect
+            # No authorization record
+            # Two cases:
+            # 1. Obs WITHOUT shim source → possible unauthorized effect (UNKNOWN)
+            #    Example: store mutated directly without broker involvement
+            # 2. Obs WITH shim source only → confirmed blocked, no auth needed
+            #    Example: BCC detection in shim blocks before broker.gate()
+            #    The shim's record IS the observation (equivalent to broker auth)
             if obs_entries:
+                has_shim_source = any(
+                    entry.source.startswith("shim.") for entry in obs_entries
+                )
+                all_blocked = all(
+                    entry.source.startswith("shim.") for entry in obs_entries
+                )
+                if has_shim_source and all_blocked:
+                    # Explicit shim block (BCC, capability mismatch) — CONFIRMED_BLOCKED
+                    # The shim observed and blocked. No auth entry needed because
+                    # the shim is the authoritative boundary for this class of effects
+                    return LedgerVerdict.CONFIRMED_BLOCKED
                 return UnknownLedgerResult(
                     reason=f"observed_without_authorization(task={task_id},nonce={nonce})"
                 )
@@ -217,8 +294,7 @@ class IndependentEffectLedger:
                 reason=f"authorized_not_observed(task={task_id},nonce={nonce},possible_bypass)"
             )
 
-        # Classify observations: committed (effect was applied) vs blocked (gate rejected)
-        BLOCKED_SOURCES = frozenset({"broker.commit:BLOCKED", "executor.execute:BLOCKED"})
+        # Classify observations: committed (effect was applied) vs blocked (gate/shim rejected)
         committed_entries: list[LedgerEntry] = []
         blocked_entries: list[LedgerEntry] = []
         for entry in obs_entries:
@@ -319,7 +395,6 @@ class IndependentEffectLedger:
         return failures
 
     # ---- Audit API ----
-
     def get_entries(
         self, task_id: str | None = None, nonce: str | None = None
     ) -> list[LedgerEntry]:
