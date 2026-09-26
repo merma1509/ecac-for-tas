@@ -86,8 +86,16 @@ def _grant_for(broker, etype: str, target: str, expiry: float = 100.0,
 class TestFlowDeclassRegression:
     """Declassification requires a broker-recorded LabelException."""
 
-    def test_flow_blocks_conf_leak_without_declass(self) -> None:
-        """Unmitigated conf-leak: FlowOK BLOCKs before anything reaches state."""
+    def test_read_confidential_file_is_allowed(self) -> None:
+        """Read of CONFIDENTIAL file is always ALLOWED — reads are inputs, not outputs.
+
+        Reads pull data INTO the session. Blocking reads of confidential files
+        would make the system unusable. The read→send attack is handled by
+        SESSION TAINT (FlowOK blocks send after CONFIDENTIAL read unless declass).
+
+        This test verifies that check_flow() only applies confidentiality checks
+        to OUTPUT effects (write/send/delete/network), not inputs (read).
+        """
         broker = build()
         nonce, task = _grant_for(broker, "read", "file:///secrets")
 
@@ -99,29 +107,59 @@ class TestFlowDeclassRegression:
         )
         allow, evidence = broker.commit(Commit(high_conf, task))
 
-        assert allow is False
+        # READ is always ALLOWED — reads are inputs, not outputs.
+        # The read→send amplification is handled by session taint.
+        assert allow is True, (
+            f"Reading a CONFIDENTIAL file should ALLOW (read is input). Evidence: {evidence}"
+        )
+
+    def test_write_confidential_content_blocked_without_declass(self) -> None:
+        """Write of CONFIDENTIAL provenance is BLOCKed by FlowOK (output effect).
+
+        This is the REAL confidentiality leak: writing confidential data to
+        an output (file/send) without declass. Reads are inputs (always allowed);
+        writes are outputs (require declass for high-sensitivity data).
+        """
+        broker = build()
+        nonce, task = _grant_for(broker, "write", "file:///output")
+
+        conf_write = _effect(
+            etype="write",
+            target="file:///output",
+            nonce=nonce,
+            provenance=(Data("secret", Confidentiality.CONFIDENTIAL, Integrity.USER),),
+        )
+        allow, evidence = broker.commit(Commit(conf_write, task))
+
+        assert allow is False, (
+            "Write with CONFIDENTIAL provenance should be BLOCKed by FlowOK"
+        )
         assert evidence["primary_blocker"] == "FlowOK"
         assert "conf-leak" in evidence["predicates"]["FlowOK"]
         assert len(broker.store.effects_log) == 0
 
-    def test_flow_allows_conf_leak_with_broker_declass(self) -> None:
-        """Broker-recorded declass: FlowOK ALLOWs exactly once."""
+    def test_declass_allows_write_of_confidential_content(self) -> None:
+        """Broker-recorded declass: FlowOK ALLOWs write with CONFIDENTIAL provenance.
+
+        Note: broker.grant_label_exception() also clears session taint, so the
+        write→send chain is unblocked after declass.
+        """
         broker = build()
-        nonce, task = _grant_for(broker, "read", "file:///secrets")
+        nonce, task = _grant_for(broker, "write", "file:///output")
 
         declass = LabelException(
             kind="declass",
-            match_target="file:///secrets",
+            match_target="file:///output",
             from_label=Confidentiality.CONFIDENTIAL.name,
             to_label=Confidentiality.INTERNAL.name,
             granted_by="User",
-            nonce="declass-secrets",
+            nonce="declass-output",
         )
         broker.grant_label_exception(declass)
 
         effect = _effect(
-            etype="read",
-            target="file:///secrets",
+            etype="write",
+            target="file:///output",
             nonce=nonce,
             provenance=(Data("secret", Confidentiality.CONFIDENTIAL, Integrity.USER),),
             label_exceptions=(declass,),
@@ -133,15 +171,20 @@ class TestFlowDeclassRegression:
         )
         assert len(broker.store.effects_log) == 1
 
-    def test_flow_blocks_if_declass_not_broker_recorded(self) -> None:
-        """LLM-requested declass (not recorded by broker): FlowOK BLOCKs."""
-        broker = build()
-        nonce, task = _grant_for(broker, "read", "file:///secrets")
+    def test_unrecorded_declass_blocked_for_output_effect(self) -> None:
+        """LLM-requested declass (not recorded by broker): FlowOK BLOCKs output effects.
 
-        # LLM builds a request but broker does NOT record it
+        Reads are always allowed (inputs). For output effects (write/send), a
+        declass MUST be broker-recorded. LLM requests alone do not authorize
+        declass — only broker.grant_label_exception() does.
+        """
+        broker = build()
+        nonce, task = _grant_for(broker, "write", "file:///output")
+
+        # LLM builds a declass request but broker does NOT record it
         declass_request = LabelException(
             kind="declass",
-            match_target="file:///secrets",
+            match_target="file:///output",
             nonce="declass-unrecorded",
             from_label=Confidentiality.CONFIDENTIAL.name,
             to_label=Confidentiality.INTERNAL.name,
@@ -149,15 +192,15 @@ class TestFlowDeclassRegression:
         )
 
         effect = _effect(
-            etype="read",
-            target="file:///secrets",
+            etype="write",
+            target="file:///output",
             nonce=nonce,
             provenance=(Data("secret", Confidentiality.CONFIDENTIAL, Integrity.USER),),
-            label_exceptions=(declass_request,),
+            label_exceptions=(declass_request,),  # LLM "requested" this, but broker didn't record
         )
         allow, evidence = broker.commit(Commit(effect, task))
 
-        assert allow is False, "Unrecorded declass should BLOCK"
+        assert allow is False, "Unrecorded declass should BLOCK output effects"
         assert evidence["primary_blocker"] == "FlowOK"
 
     def test_duplicate_declass_grant_raises(self) -> None:
@@ -446,21 +489,30 @@ class TestFlowBoundaryTaskScoped:
     """FlowOK uses the task's flow_boundary, not a global lattice."""
 
     def test_different_tasks_have_different_flow_boundaries(self) -> None:
-        """Task A allows CONFIDENTIAL; Task B blocks it (different boundaries)."""
+        """Task A allows CONFIDENTIAL output; Task B blocks it (different boundaries).
+
+        FlowOK applies to OUTPUT effects. Task A (flow_boundary=CONFIDENTIAL) allows
+        write/send with CONFIDENTIAL provenance. Task B (flow_boundary=INTERNAL)
+        blocks write/send with CONFIDENTIAL provenance (conf-leak).
+
+        Reads are always allowed regardless of flow_boundary — they're inputs,
+        not outputs.
+        """
         from effect_broker.model import Capability, Task
 
         broker = build()
 
-        # Task with wide flow boundary (accepts CONFIDENTIAL data)
+        # Task with wide flow boundary (accepts CONFIDENTIAL data as output)
         wide_ceiling = Capability(
             owner="User",
             holder="EffectBroker",
-            right="read",
+            right="write",
             target="*",
             scope=frozenset({"*"}),
             expiry=float("inf"),
             nonce="wide-ceiling",
         )
+        broker.grant_root(wide_ceiling)  # Register the capability in broker's store
         task_wide = Task(
             task_id="task-wide",
             owner="User",
@@ -469,16 +521,17 @@ class TestFlowBoundaryTaskScoped:
         )
         broker.register_task(task_wide)
 
-        # Task with narrow flow boundary (rejects CONFIDENTIAL data)
+        # Task with narrow flow boundary (rejects CONFIDENTIAL data as output)
         narrow_ceiling = Capability(
             owner="User",
             holder="EffectBroker",
-            right="read",
+            right="write",
             target="*",
             scope=frozenset({"*"}),
             expiry=float("inf"),
             nonce="narrow-ceiling",
         )
+        broker.grant_root(narrow_ceiling)  # Register the capability in broker's store
         task_narrow = Task(
             task_id="task-narrow",
             owner="User",
@@ -487,26 +540,23 @@ class TestFlowBoundaryTaskScoped:
         )
         broker.register_task(task_narrow)
 
-        # Same capability (r-read) works for both tasks' files
+        # Same write effect with CONFIDENTIAL provenance
         conf_effect = _effect(
-            etype="read",
-            target="file:///trusted",
-            nonce="r-read:Agent:EffectBroker",
+            etype="write",
+            target="file:///logs",
+            nonce="narrow-ceiling",  # Use narrow-ceiling nonce
             provenance=(Data("secret", Confidentiality.CONFIDENTIAL, Integrity.USER),),
         )
 
-        # Wide task: ALLOW
+        # Wide task: ALLOW (CONFIDENTIAL within its flow_boundary)
         commit_wide = Commit(conf_effect, task_wide)
         allow_wide, _ = broker.commit(commit_wide)
-        assert allow_wide is True, "Wide-flow task should allow CONFIDENTIAL datum"
+        assert allow_wide is True, "Wide-flow task should allow CONFIDENTIAL output"
 
-        # Narrow task: BLOCK
-        # NOTE: we need a separate capability for the narrow task's files,
-        # or reuse the same one. Since r-read targets file:///trusted and
-        # is in capabilities, it should work for both tasks.
+        # Narrow task: BLOCK (CONFIDENTIAL exceeds its flow_boundary)
         commit_narrow = Commit(conf_effect, task_narrow)
         allow_narrow, ev_narrow = broker.commit(commit_narrow)
         assert allow_narrow is False, (
-            f"Narrow-flow task should block CONFIDENTIAL datum. Evidence: {ev_narrow}"
+            f"Narrow-flow task should block CONFIDENTIAL output. Evidence: {ev_narrow}"
         )
         assert ev_narrow["primary_blocker"] == "FlowOK"

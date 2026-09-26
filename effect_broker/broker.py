@@ -476,6 +476,31 @@ class EffectBroker:
                 executor.shutdown()
             self._mode = "shutdown"  # prevent double-shutdown
 
+    def bootstrap_subprocess(
+        self,
+        files: list[dict[str, str]] | None = None,
+        emails: list[dict[str, str]] | None = None,
+        mailboxes: list[str] | None = None,
+    ) -> None:
+        """Bootstrap the subprocess store with additional resources post-startup.
+
+        Normally, resources in the broker's same-process store are transferred
+        to the subprocess at startup via _bootstrap_executor_store(). This
+        method lets tests add resources to the subprocess store directly via
+        IPC, after the broker and subprocess are already running.
+
+        Args:
+            files: list of {"path": "...", "sensitivity": "CONFIDENTIAL|INTERNAL|PUBLIC"}
+            emails: list of {"address": "...", "domain": "INTERNAL|EXTERNAL"}
+            mailboxes: list of mailbox usernames
+        """
+        if self._mode != "multi-process":
+            raise RuntimeError("bootstrap_subprocess() only works in multi-process mode")
+        executor = self._executor
+        if isinstance(executor, SubprocessExecutor):
+            if hasattr(executor, "_client") and executor._client is not None:
+                executor._client.bootstrap(files=files, emails=emails, mailboxes=mailboxes)
+
     def set_mediator(self, mediator: Mediator) -> None:
         """Attach a Mediator (the enforcement shim) to this broker"""
         self._mediator = mediator
@@ -969,11 +994,19 @@ class EffectBroker:
         rather than hard-coded per-effect-type defaults. This lets
         each task define its own sensitivity floor, making FlowOK task-scoped.
 
+        CONFIDENTIALITY CHECK applies only to OUTPUT effects (write/send/delete/
+        network). Read effects are INPUT operations — they pull data INTO the
+        session, not push it OUT to a sink. Blocking reads of CONFIDENTIAL files
+        would make the system unusable (you can't read any confidential doc).
+        The read→send amplification attack is handled by SESSION TAINT (see below).
+
+        INTEGRITY CHECK applies only to OUTPUT effects as well.
+
         SESSION TAINT (inter-effect composition):
           If the task's session has read CONFIDENTIAL data (session.tainted=True),
           ALL send effects are blocked unless a broker-recorded declass exception
           exists. This prevents the read-secrets→send-exfil attack without requiring
-          taint tracking on data values. The session is tainted when a read effect
+          taint tracking on data VALUES. The session is tainted when a read effect
           reads a CONFIDENTIAL file (see _apply_effect for read handling).
         """
         # ---- Session taint check (inter-effect composition) ----
@@ -994,20 +1027,27 @@ class EffectBroker:
                 )
 
         sink_confidentiality, sink_integrity = task.flow_boundary
-        for datum in effect.provenance:
-            if datum.confidentiality > sink_confidentiality and not self._has_validated_exception(
-                effect, "declass", datum.confidentiality.name
-            ):
-                return False, (
-                    f"conf-leak({datum.name}:"
-                    f"{datum.confidentiality.name}>{sink_confidentiality.name})"
-                )
-            if datum.integrity < sink_integrity and not self._has_validated_exception(
-                effect, "endorse", datum.integrity.name
-            ):
-                return False, (
-                    f"low-integrity({datum.name}:{datum.integrity.name}<{sink_integrity.name})"
-                )
+
+        # Only check output effects. Reads are inputs — they pull data INTO the
+        # session and should not be blocked for reading confidential data.
+        # The read→send attack is handled by session taint above.
+        is_output_effect = effect.etype in ("write", "send", "delete", "network")
+
+        if is_output_effect:
+            for datum in effect.provenance:
+                sens = datum.confidentiality > sink_confidentiality
+                decl = self._has_validated_exception(effect, "declass", datum.confidentiality.name)
+                if sens and not decl:
+                    return False, (
+                        f"conf-leak({datum.name}:"
+                        f"{datum.confidentiality.name}>{sink_confidentiality.name})"
+                    )
+                low = datum.integrity < sink_integrity
+                endo = self._has_validated_exception(effect, "endorse", datum.integrity.name)
+                if low and not endo:
+                    return False, (
+                        f"low-integrity({datum.name}:{datum.integrity.name}<{sink_integrity.name})"
+                    )
         return True, "flow-ok"
 
     def check_noamp(self, effect: Effect, task: Task) -> PredicateResult:
