@@ -182,6 +182,12 @@ class RealEmailShim:
             try:
                 # Establish the mail transaction (RSET to reset any prior state)
                 server.rset()
+                # RSET clears the session state, need to re-EHLO
+                try:
+                    server.ehlo()
+                except smtplib.SMTPServerDisconnected:
+                    server.connect(self.smtp_host, self.smtp_port)
+                    server.ehlo()
                 server.mail(sender)
                 # RCPT TO for each — this is where BCC detection happens
                 rcpt_results = self._smtp_rcpt_to(server, recipients)
@@ -256,11 +262,12 @@ class RealEmailShim:
 
     def _open_smtp(self) -> smtplib.SMTP:
         """Open an SMTP connection to the configured MTA. Returns connected socket."""
+        timeout = 5.0  # 5 second timeout for connection
         if self.use_tls:
             # SMTP_SSL is a subclass of SMTP; cast to satisfy return type annotation
-            server: smtplib.SMTP = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port)
+            server: smtplib.SMTP = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=timeout)
         else:
-            server = smtplib.SMTP(self.smtp_host, self.smtp_port)
+            server = smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=timeout)
         if self.smtp_user and self.smtp_password:
             server.login(self.smtp_user, self.smtp_password)
         return server
@@ -312,6 +319,13 @@ class RealEmailShim:
             server = self._open_smtp()
             try:
                 server.rset()
+                # RSET clears the SMTP session state, so we need to EHLO again
+                try:
+                    server.ehlo()
+                except smtplib.SMTPServerDisconnected:
+                    # Some servers disconnect after RSET — reconnect and EHLO
+                    server.connect(self.smtp_host, self.smtp_port)
+                    server.ehlo()
                 server.mail(sender)
                 rcpt_results = self._smtp_rcpt_to(server, declared_set)
                 actual_accepted: frozenset[str] = frozenset(
@@ -367,6 +381,14 @@ class RealEmailShim:
         # Fail closed: if MTA accepted recipients the tool did NOT declare,
         # this is a BCC bypass attempt. Block BEFORE broker.commit.
         if bcc_detected:
+            # Record to ledger so CONFIRMED_BLOCKED verdict is meaningful for shim-blocks
+            bcc_nonce = f"bcc-blocked-{canon_recipient}"
+            self.broker.ledger.record_shim_block(
+                task_id=self.task_id,
+                nonce=bcc_nonce,
+                reason="bcc-detected",
+                blocked_targets=frozenset({canon_recipient}),
+            )
             raise EmailSecurityError(
                 f"[{self.tool_name}] BCC bypass detected: MTA accepted "
                 f"{bcc_detected} which are not in declared set {all_declared}. "
@@ -392,9 +414,10 @@ class RealEmailShim:
             },
             provenance=(
                 Data("shim-send", conf, integ),
-                Data(f"sender={sender}", Confidentiality.CONFIDENTIAL, Integrity.HIGH),
+                # Sender confidentiality based on domain (corp.com → INTERNAL)
+                Data(f"sender={sender}", conf, Integrity.HIGH),
                 Data(
-                    f"mta-accepted={actual_accepted}", Confidentiality.CONFIDENTIAL, Integrity.HIGH
+                    f"mta-accepted={actual_accepted}", conf, Integrity.HIGH
                 ),
             ),
             capability_nonce=nonce,
@@ -532,19 +555,17 @@ class RealEmailShim:
     ) -> str:
         """Find a matching capability nonce. See RealFileShim._resolve_capability_nonce."""
         holder = self.tool_name
-        target_pattern = f"mailto:{primary}" if "@" in primary else primary
+        # Remove mailto: prefix if present to match against capability targets
+        primary_for_match = primary.replace("mailto:", "")
 
-        for _nonce, cap in self.broker.capabilities.items():
+        for nonce, cap in self.broker.capabilities.items():
             if cap.holder in (holder, "EffectBroker") and cap.right in (right, "*"):
-                if cap.target == "*" or target_pattern.startswith(
-                    cap.target.replace("mailto:", "")
-                ):
-                    extras_key = ",".join(sorted(extras)) if extras else ""
-                    return (
-                        f"{holder}:{right}:{primary}:{extras_key}"
-                        if extras_key
-                        else f"{holder}:{right}:{primary}"
-                    )
+                # Match against the raw target (with or without mailto:)
+                raw_target = primary_for_match
+                # Handle wildcard: cap.target == "*" matches anything
+                if cap.target == "*" or raw_target.startswith(cap.target.replace("mailto:", "")):
+                    # Return the actual matched nonce, not a generated one
+                    return nonce
 
         return f"no-cap-{right}-{primary}"
 
