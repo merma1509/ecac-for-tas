@@ -38,7 +38,7 @@ ARCHITECTURE (single-path refactor):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .mediation import MediationVerdict
 
@@ -308,6 +308,7 @@ class SubprocessExecutor:
 
             # Build A's session snapshot at gate time
             from .executor_ipc import effect_to_dict, session_state_to_dict
+
             session_snapshot = session_state_to_dict(session) if session else {}
             effect_dict = effect_to_dict(effect)
 
@@ -335,7 +336,7 @@ class SubprocessExecutor:
                 # This should be rare since A already checked Fresh, but provides
                 # defense-in-depth for process isolation scenarios.
                 allow = False
-                evidence = dict(evidence)
+                evidence = dict(evidence)  # type: ignore[assignment]
                 evidence["allow"] = False
                 evidence["primary_blocker"] = resp.get("blocker", "Fresh")
                 evidence["block_reason"] = resp.get("reason", "unknown")
@@ -375,7 +376,7 @@ class SubprocessExecutor:
 
         # Sync used nonces
         if "used" in update:
-            task.session.used = frozenset(update["used"])
+            task.session.used = set(update["used"])
 
         # Sync logical time
         if "logical_time" in update:

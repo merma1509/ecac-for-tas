@@ -84,7 +84,7 @@ class RealEmailShim:
 
     # IPC client for multi-process mode (set by broker)
     # When set, real SMTP/IMAP goes through subprocess, not direct calls
-    ipc_client: "ProcessExecutorClient | None" = None
+    ipc_client: ProcessExecutorClient | None = None
 
     def __init__(
         self,
@@ -171,7 +171,7 @@ class RealEmailShim:
                     list(recipients),
                     raw_message.decode("utf-8", errors="replace"),
                 )
-                delivered = result.get("delivered", [])
+                delivered: list[str] = result.get("delivered", [])
                 return delivered
             except RuntimeError as ex:
                 raise SMTPError(f"SMTP IPC error: {ex}") from ex
@@ -290,7 +290,9 @@ class RealEmailShim:
             results[rcpt] = (code, msg)
         return results
 
-    def _smtp_probe(self, sender: str, recipients: frozenset[str]) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    def _smtp_probe(
+        self, sender: str, recipients: frozenset[str]
+    ) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
         """Probe MTA to discover actual recipients via SMTP RCPT TO.
 
         Returns (declared_recipients, actual_accepted, bcc_detected).
@@ -416,9 +418,7 @@ class RealEmailShim:
                 Data("shim-send", conf, integ),
                 # Sender confidentiality based on domain (corp.com → INTERNAL)
                 Data(f"sender={sender}", conf, Integrity.HIGH),
-                Data(
-                    f"mta-accepted={actual_accepted}", conf, Integrity.HIGH
-                ),
+                Data(f"mta-accepted={actual_accepted}", conf, Integrity.HIGH),
             ),
             capability_nonce=nonce,
             delegation_chain=(self.tool_name, "RealEmailShim"),

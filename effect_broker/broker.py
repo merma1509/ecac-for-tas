@@ -46,7 +46,7 @@ from __future__ import annotations
 import os
 import threading
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from .executor import IsolatedExecutor, SubprocessExecutor
 from .executor_ipc import ProcessExecutorClient
@@ -70,6 +70,12 @@ from .model import (
     TaskId,
 )
 from .restricted_store import RestrictedResourceStore as ResourceStore
+from .tool_registry import ToolDeclaration, ToolRegistry
+
+if TYPE_CHECKING:
+    from .shim_email import RealEmailShim
+    from .shim_real import RealFileShim
+
 
 # Union of types that can be passed as the `ledger` argument.
 # Local: IndependentEffectLedger (wrapped in LocalLedgerBackend internally).
@@ -329,6 +335,13 @@ class EffectBroker:
         self._task_locks: dict[TaskId, threading.Lock] = {}
         # Provenance derivation from real resource metadata (not hand-assigned)
         self._provenance_resolver = _ProvenanceResolver(self)
+        # ToolRegistry: structural enforcement layer (T14 hidden side effects, T13)
+        # In strict mode, tools must be pre-registered with declared rights/targets.
+        # In permissive mode (default), unknown tools are allowed (limitation).
+        self.tool_registry: "ToolRegistry | None" = None  # noqa: UP037, F821
+        self._registry_strict: bool = False
+        # L4: Send rate limiting per session (0 = unlimited)
+        self._max_sends_per_session: int = 0
         # Execution mode
         self._mode = mode
         self._executor_socket = Path(executor_socket)
@@ -360,6 +373,74 @@ class EffectBroker:
 
         # Bootstrap the subprocess store with the broker's existing resources
         self._bootstrap_executor_store(client)
+
+    def set_tool_registry(self, strict: bool = False) -> "ToolRegistry":  # noqa: UP037, F821
+        """Enable structural enforcement via ToolRegistry.
+
+        This is the L3 fix for T14 (hidden side effects). When enabled,
+        gate() checks that tool operations are within declared capabilities
+        BEFORE evaluating the four-predicate gate.
+
+        Args:
+            strict: If True, unknown tools are BLOCKed. If False, allowed
+                   (documented limitation — see Honest Limitation L3).
+
+        Returns:
+            The created ToolRegistry for declarative setup.
+
+        Example:
+            broker.set_tool_registry(strict=True)
+            broker.tool_registry.declare(ToolDeclaration(...))
+        """
+
+        self.tool_registry = ToolRegistry(strict=strict)
+        self._registry_strict = strict
+        return self.tool_registry
+
+    def register_tool(self, declaration: ToolDeclaration) -> None:
+        """Register a tool's declared capabilities.
+
+        Must be called AFTER set_tool_registry().
+        Raises RuntimeError if registry is not enabled.
+        """
+        if self.tool_registry is None:
+            raise RuntimeError(
+                "Cannot register tool: ToolRegistry not enabled. "
+                "Call broker.set_tool_registry() first."
+            )
+        self.tool_registry.declare(declaration)
+
+    def set_send_rate_limit(self, max_sends: int) -> None:
+        """Set the maximum number of sends allowed per session.
+
+        L4 fix: Prevents amplification via composition (many small sends exfiltrate
+        more data than individually authorized). When max_sends is reached,
+        check_noamp() blocks subsequent sends with "send-rate-limit" reason.
+
+        This is a SESSION-SCOPED limit. Each task has its own session, so the
+        limit applies per-task. A task can send up to max_sends emails before
+        being blocked. A new task/session starts fresh (send_count = 0).
+
+        For production, set this based on expected workflow:
+          - max_sends=5: Conservative (prevents bulk exfil)
+          - max_sends=10: Moderate (allows reasonable workflows)
+          - max_sends=0: Unlimited (disable rate limiting — not recommended)
+
+        Example:
+            broker.set_send_rate_limit(max_sends=5)  # Max 5 sends per session
+            broker.grant_root(...)  # Now each session limited to 5 sends
+        """
+        if max_sends < 0:
+            raise ValueError(f"max_sends must be >= 0, got {max_sends}")
+        self._max_sends_per_session = max_sends
+
+    def _apply_send_rate_limit_to_session(self, task: Task) -> None:
+        """Apply the broker's send rate limit to a task's session.
+
+        Called when creating a new session or when a task is registered.
+        """
+        if self._max_sends_per_session > 0 and task.session is not None:
+            task.session.set_max_sends(self._max_sends_per_session)
 
     def _bootstrap_executor_store(self, client: ProcessExecutorClient) -> None:
         """Bootstrap the subprocess store with resources from broker's same-process store.
@@ -493,6 +574,9 @@ class EffectBroker:
                     f"Re-registering a used task would allow replay attacks."
                 )
         self.tasks[task.task_id] = task
+
+        # Apply send rate limit to new sessions
+        self._apply_send_rate_limit_to_session(task)
 
     def get_task(self, task_id: TaskId) -> Task | None:
         """Look up a registered task."""
@@ -1058,6 +1142,14 @@ class EffectBroker:
                             f"not in cap-scope={capability.scope}"
                         )
 
+        # L4 FIX: Send rate limiting for inter-effect amplification prevention.
+        # Blocks when session exceeds max_sends_per_session. This prevents the
+        # "many small sends exfiltrate data" attack pattern.
+        if effect.etype == "send" and task.session is not None:
+            allowed, reason = task.session.increment_send_count()
+            if not allowed:
+                return False, reason
+
         return True, f"composition-ok(ceiling-scope={task.ceiling.scope})"
 
     def _scope_label_for_target(self, target: str) -> str:
@@ -1359,6 +1451,7 @@ class EffectBroker:
                 )
                 task = Task(task_id="default", owner=USER, ceiling=default_ceiling)
                 self.tasks[task.task_id] = task
+                self._apply_send_rate_limit_to_session(task)
 
         assert task.session is not None, "Task must have a session (set by __post_init__)"
 
@@ -1407,10 +1500,39 @@ class EffectBroker:
         # This prevents double-commit with the same nonce under concurrency.
         # nonce_reserved = True means Fresh passed AND the nonce is now in used.
         # If we fail the gate AFTER reserving, we MUST release (see rollback below).
-        
+
         # For multi-process mode (SubprocessExecutor), reserve_nonce=False because
         # the subprocess handles nonce reservation via APPLY_COMMIT protocol.
         fresh_result, nonce_reserved = self._atomic_fresh_check(effect, task, reserve_nonce)
+
+        # L3 FIX: Structural enforcement (T14 hidden side effects, T13 false description)
+        # This is Layer 2 above the four-predicate gate (Layer 1).
+        # ToolRegistry must be enabled via set_tool_registry() and tools pre-registered.
+        if self.tool_registry is not None and commit.tool_name is not None:
+            structural_ok, structural_reason = self.tool_registry.check_operation(
+                commit.tool_name, effect
+            )
+            if not structural_ok:
+                # Structural failures are terminal — don't run four-predicate gate
+                return CommitGateResult(
+                    allow=False,
+                    evidence={
+                        "allow": False,
+                        "primary_blocker": "Structural",
+                        "predicates": {
+                            "Structural": structural_reason,
+                            "Auth": "skipped",
+                            "FlowOK": "skipped",
+                            "NoAmp": "skipped",
+                            "Fresh": "skipped",
+                        },
+                        "boundary_stop": None,
+                        "approval_binding": None,
+                    },
+                    effect=effect,
+                    task=task,
+                    can_apply=False,
+                )
 
         predicate_results: dict[str, PredicateResult] = {
             "Auth": self.check_auth(effect, task),
@@ -1624,7 +1746,7 @@ class EffectBroker:
         self,
         task_id: str = "default",
         tool_name: str = "untrusted-tool",
-    ) -> "RealFileShim":
+    ) -> RealFileShim:
         """Create a RealFileShim with IPC routing in multi-process mode.
 
         In multi-process mode, real file I/O happens in the executor subprocess
@@ -1655,7 +1777,7 @@ class EffectBroker:
         smtp_port: int = 25,
         imap_host: str = "localhost",
         imap_port: int = 993,
-    ) -> "RealEmailShim":
+    ) -> RealEmailShim:
         """Create a RealEmailShim with IPC routing in multi-process mode.
 
         In multi-process mode, real SMTP/IMAP happens in the executor subprocess

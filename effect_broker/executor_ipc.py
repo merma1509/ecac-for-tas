@@ -41,8 +41,10 @@ class ExecutorRequest(Enum):
 
     EXECUTE = auto()  # Apply an simulated effect (internal store only)
     APPLY_EFFECT = auto()  # Apply an effect with REAL OS/SMTP operations (moved from broker)
-    APPLY_COMMIT = auto()  # Atomic commit: Fresh check + nonce reserve + apply_effect in subprocess, returns session_update
-    SYNC_SESSION = auto()  # Sync session state from broker to subprocess (used, revoked, taint, clock)
+    APPLY_COMMIT = auto()  # Atomic commit: Fresh check + nonce reserve + apply in subprocess
+    SYNC_SESSION = (
+        auto()
+    )  # Sync session state from broker to subprocess (used, revoked, taint, clock)
     GET_SESSION = auto()  # Get session state from subprocess to broker (B→A, no overwrite)
     READ_STORE = auto()  # Observer reads actual store state for verification
     READ_EMAILS = auto()  # Observer reads emails for duplicate accounting
@@ -245,9 +247,9 @@ def dict_to_session(d: dict[str, Any]) -> Any:
     # Session requires session_id as the first argument
     session = Session(session_id=d.get("session_id", "unknown"))
     session.logical_time = d.get("logical_time", 0.0)
-    session.used = frozenset(d.get("used", []))
-    session.revoked = frozenset(d.get("revoked", []))
-    session.tainted = d.get("tainted", False)
+    session.used = set(d.get("used", []))
+    session.revoked = set(d.get("revoked", []))
+    session._tainted = d.get("tainted", False)
     session.live = d.get("live", True)
     return session
 
@@ -286,7 +288,7 @@ class ProcessExecutorClient:
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
         # Flat response: direct fields
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
     def apply_commit(
         self,
@@ -328,7 +330,7 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Apply commit error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
     def read_store(self) -> dict[str, Any]:
         """Read the complete executor store state (for independent observer)."""
@@ -337,7 +339,7 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
     def read_files(self) -> dict[str, Any]:
         """Read just the files state."""
@@ -346,7 +348,7 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
     def read_emails(self) -> dict[str, Any]:
         """Read just the emails state."""
@@ -355,7 +357,7 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
     def read_mailboxes(self) -> dict[str, Any]:
         """Read just the mailboxes state."""
@@ -364,7 +366,7 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Executor IPC error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
     def bootstrap(
         self,
@@ -414,9 +416,11 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Real file read error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
-    def real_file_write(self, path: str, content: bytes, task_id: str = "default") -> dict[str, Any]:
+    def real_file_write(
+        self, path: str, content: bytes, task_id: str = "default"
+    ) -> dict[str, Any]:
         """Write content to a real file in the executor subprocess.
 
         Returns: {"ok": bool, "path": str, "confidentiality": str,
@@ -428,12 +432,17 @@ class ProcessExecutorClient:
             resp = send_and_receive(
                 self._path,
                 ExecutorRequest.APPLY_EFFECT,
-                {"op": "real_write", "path": path, "content": base64.b64encode(content).decode(), "task_id": task_id},
+                {
+                    "op": "real_write",
+                    "path": path,
+                    "content": base64.b64encode(content).decode(),
+                    "task_id": task_id,
+                },
             )
         if not resp.get("ok"):
             raise RuntimeError(f"Real file write error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
     def real_file_delete(self, path: str, task_id: str = "default") -> dict[str, Any]:
         """Delete a real file in the executor subprocess.
@@ -449,7 +458,7 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Real file delete error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
     def real_file_stat(self, path: str, task_id: str = "default") -> dict[str, Any]:
         """Stat a real file in the executor subprocess.
@@ -466,7 +475,7 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Real file stat error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
     def real_file_listdir(self, path: str, task_id: str = "default") -> dict[str, Any]:
         """List a real directory in the executor subprocess.
@@ -482,7 +491,7 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Real file listdir error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
     def real_smtp_send(
         self,
@@ -503,7 +512,7 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Real SMTP send error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
     def real_smtp_probe(self, sender: str, recipients: list[str]) -> dict[str, Any]:
         """Probe SMTP server for BCC detection in executor subprocess.
@@ -529,7 +538,7 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Real SMTP probe error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
     def real_imap_read_inbox(
         self,
@@ -570,7 +579,7 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Real IMAP read_inbox error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
+        return resp
 
     def shutdown(self) -> None:
         """Send SHUTDOWN to the executor subprocess for clean termination."""
@@ -610,5 +619,4 @@ class ProcessExecutorClient:
         if not resp.get("ok"):
             raise RuntimeError(f"Session sync error: {resp.get('error')}")
         resp.pop("ok", None)
-        return cast(dict[str, Any], resp)
-
+        return resp

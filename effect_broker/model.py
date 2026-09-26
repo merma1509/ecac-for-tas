@@ -9,7 +9,7 @@ from typing import TypedDict
 from .lattice import Confidentiality, Integrity
 
 
-class Evidence(TypedDict):
+class Evidence(TypedDict, total=False):
     """Machine-checkable record emitted for every commit decision."""
 
     allow: bool
@@ -17,6 +17,7 @@ class Evidence(TypedDict):
     predicates: dict[str, str]
     boundary_stop: str | None
     approval_binding: str | None
+    block_reason: str | None
 
 
 # Principals
@@ -46,8 +47,6 @@ class Domain(Enum):
 # ---- Task / Session types ----
 # Task authority ceiling: every effect's authority must be a subset of ceiling(t)
 # Session clock: per-task logical time, revocation set, and replay set
-
-
 @dataclass(frozen=True)
 class CommitGateResult:
     """Result of the four-predicate gate evaluation (commit phase 1).
@@ -121,6 +120,13 @@ class Session:
     _tainted: bool = field(default=False, repr=False)
     _taint_reason: str = field(default="", repr=False)  # human-readable reason
 
+    # L4 FIX: Send rate limiting to prevent amplification via composition.
+    # Tracks number of send effects committed in this session. When the
+    # count exceeds max_sends_per_session, subsequent sends are blocked.
+    # This prevents the "many small sends exfiltrate data" attack pattern.
+    _send_count: int = field(default=0, repr=False)
+    _max_sends_per_session: int = field(default=0, repr=False)  # 0 = unlimited
+
     @property
     def live(self) -> bool:
         """Read-only view of the session live state."""
@@ -161,6 +167,33 @@ class Session:
         self._tainted = False
         self._taint_reason = ""
 
+    def set_max_sends(self, max_sends: int) -> None:
+        """Set the maximum number of sends allowed per session.
+
+        L4 fix: Prevents amplification via composition. When max_sends is reached,
+        subsequent sends are blocked by check_noamp().
+        """
+        self._max_sends_per_session = max_sends
+
+    def increment_send_count(self) -> tuple[bool, str]:
+        """Increment send count and check against limit."""
+        if self._max_sends_per_session > 0:
+            if self._send_count >= self._max_sends_per_session:
+                return False, (
+                    f"send-rate-limit(max={self._max_sends_per_session}, "
+                    f"count={self._send_count}): "
+                    f"session exceeded maximum sends per session"
+                )
+        self._send_count += 1
+        return True, ""
+
+    @property
+    def send_count(self) -> int:
+        """Current send count for this session (read-only)."""
+        return self._send_count
+        self._tainted = False
+        self._taint_reason = ""
+
 
 @dataclass(frozen=True)
 class Capability:
@@ -175,7 +208,7 @@ class Capability:
     expiry        : unix/logical time after which the capability is stale
     nonce         : unique identifier (also used for replay detection)
     task_id       : the task this capability is scoped to; None = any task
-    derives_from   : nonce of the parent this was attenuated from, or None if
+    derives_from  : nonce of the parent this was attenuated from, or None if
                     this is a root grant. Used by NoAmp to prove root-anchored, monotonic derivation
     revoked       : True if the capability has been explicitly revoked
     """

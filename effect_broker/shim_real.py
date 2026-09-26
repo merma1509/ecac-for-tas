@@ -30,7 +30,7 @@ import re
 import stat
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from .lattice import Confidentiality, Integrity
 from .model import Commit, Data, Effect, EffectTarget
@@ -90,7 +90,7 @@ class RealFileShim:
 
     # IPC client for multi-process mode (set by broker)
     # When set, real I/O goes through subprocess, not direct OS calls
-    ipc_client: "ProcessExecutorClient | None" = None
+    ipc_client: ProcessExecutorClient | None = None
 
     # Path normalization regex — canonicalizes paths to prevent traversal
     _NORMALIZE_RE = re.compile(r"/+")
@@ -124,9 +124,7 @@ class RealFileShim:
             return
         if session_update.get("tainted"):
             task.session._tainted = True
-            task.session._taint_reason = session_update.get(
-                "_taint_reason", "subprocess-real-io"
-            )
+            task.session._taint_reason = session_update.get("_taint_reason", "subprocess-real-io")
         if session_update.get("logical_time", 0) > task.session.logical_time:
             task.session.logical_time = session_update["logical_time"]
 

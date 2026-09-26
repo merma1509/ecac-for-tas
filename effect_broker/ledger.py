@@ -249,14 +249,16 @@ class IndependentEffectLedger:
         # Sources that indicate the effect was explicitly blocked (not applied)
         # These can come from gate rejection (broker/executor) or shim-level
         # checks (BCC detection, capability mismatch). All mean "no state change"
-        BLOCKED_SOURCES = frozenset({
-            "broker.commit:BLOCKED",
-            "executor.execute:BLOCKED",
-            "subprocess.gate:BLOCKED",
-            "subprocess.apply:BLOCKED",
-            "shim.bcc",
-            "shim.capability-mismatch",
-        })
+        BLOCKED_SOURCES = frozenset(
+            {
+                "broker.commit:BLOCKED",
+                "executor.execute:BLOCKED",
+                "subprocess.gate:BLOCKED",
+                "subprocess.apply:BLOCKED",
+                "shim.bcc",
+                "shim.capability-mismatch",
+            }
+        )
 
         if not auth_entries:
             # No authorization record
@@ -267,12 +269,8 @@ class IndependentEffectLedger:
             #    Example: BCC detection in shim blocks before broker.gate()
             #    The shim's record IS the observation (equivalent to broker auth)
             if obs_entries:
-                has_shim_source = any(
-                    entry.source.startswith("shim.") for entry in obs_entries
-                )
-                all_blocked = all(
-                    entry.source.startswith("shim.") for entry in obs_entries
-                )
+                has_shim_source = any(entry.source.startswith("shim.") for entry in obs_entries)
+                all_blocked = all(entry.source.startswith("shim.") for entry in obs_entries)
                 if has_shim_source and all_blocked:
                     # Explicit shim block (BCC, capability mismatch) — CONFIRMED_BLOCKED
                     # The shim observed and blocked. No auth entry needed because

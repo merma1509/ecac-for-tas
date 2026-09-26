@@ -13,12 +13,8 @@ Usage (multi-process mode):
 from __future__ import annotations
 
 import base64
-import pathlib
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
-
-from .lattice import Confidentiality, Integrity
-from .model import Data, Effect, EffectTarget
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .executor_ipc import ProcessExecutorClient
@@ -30,7 +26,7 @@ class IpcOp:
 
     operation: str  # read | write | delete | send
     path_or_target: str
-    result: dict
+    result: dict[str, Any]
     blocked: bool = False
 
 
@@ -68,19 +64,19 @@ class IpcShim:
         result = self.client.real_file_delete(path)
         self.ops.append(IpcOp("delete", path, result))
 
-    def stat(self, path: str) -> dict:
+    def stat(self, path: str) -> dict[str, Any]:
         """Get file metadata via subprocess IPC."""
         # client.real_file_stat raises RuntimeError on failure
         result = self.client.real_file_stat(path)
         self.ops.append(IpcOp("stat", path, result))
-        return result.get("stat", {})
+        return result.get("stat", {})  # type: ignore[no-any-return]
 
     def listdir(self, path: str) -> list[str]:
         """List directory via subprocess IPC."""
         # client.real_file_listdir raises RuntimeError on failure
         result = self.client.real_file_listdir(path)
         self.ops.append(IpcOp("listdir", path, result))
-        return result.get("entries", [])
+        return result.get("entries", [])  # type: ignore[no-any-return]
 
     def send(self, sender: str, recipients: list[str], body: str) -> list[str]:
         """Send real email via subprocess IPC.
@@ -97,7 +93,7 @@ class IpcShim:
         bcc = result.get("bcc_detected", [])
         if bcc:
             raise SecurityError(f"BCC detected: {bcc}")
-        delivered = result.get("delivered", [])
+        delivered: list[str] = result.get("delivered", [])
         self.ops.append(IpcOp("send", sender, result))
         return delivered
 
@@ -108,4 +104,5 @@ class IpcShim:
 
 class SecurityError(Exception):
     """Raised when operation is blocked (e.g., BCC detected)."""
+
     pass

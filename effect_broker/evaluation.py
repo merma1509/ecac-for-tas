@@ -362,6 +362,7 @@ class HeldOutEvaluation:
             # Now try to send with a declass exception that covers DIFFERENT flow
             # (FlowOK should block: declass is for read, not for send)
             from effect_broker.model import LabelException
+
             invalid_declass = LabelException(
                 kind="declass",
                 match_target="file:///secrets",
@@ -465,7 +466,7 @@ class HeldOutEvaluation:
                 delegation_chain=(),
             )
 
-        # H-L2: integrity-violation - should test FlowOK (UNTRUSTED content with USER integrity requirement)
+        # H-L2: integrity-violation - should test FlowOK (untrusted content, user integrity)
         elif trace.attack_class == "integrity-violation":
             # Register a valid capability
             broker.capabilities["integrity-cap"] = Capability(
@@ -483,7 +484,9 @@ class HeldOutEvaluation:
                 etype="send",
                 target="internal@corp.com",
                 metadata={},
-                provenance=(Data("external-content", Confidentiality.INTERNAL, Integrity.UNTRUSTED),),
+                provenance=(
+                    Data("external-content", Confidentiality.INTERNAL, Integrity.UNTRUSTED),
+                ),
                 capability_nonce="integrity-cap",
                 delegation_chain=(),
             )
@@ -548,14 +551,14 @@ class HeldOutEvaluation:
 
     def report(self) -> EvaluationReport:
         """Generate an evaluation report from held-out results.
-        
+
         Classification of traces:
           - Each trace is an ATTACK designed to be blocked by the corresponding predicate.
           - BLOCK with correct blocker = correct defense (true positive)
           - ALLOW with wrong blocker = attack succeeded (false negative)
           - BLOCK with wrong blocker = wrong predicate used (misclassification)
           - ALLOW for a benign operation = correct pass (true negative)
-        
+
         In this test suite, all traces are attacks. A "passed" trace means
         the attack was blocked by the CORRECT predicate. This is the defense
         rate, not a false-positive rate.
@@ -568,8 +571,11 @@ class HeldOutEvaluation:
         # Attack succeeded (should block, but allowed) = defense failure
         defense_failure = sum(1 for r in self.results if r.allow and not r.passed)
         # Blocked but by wrong predicate = misclassification
-        misclassified = sum(1 for r in self.results 
-                          if not r.allow and not r.passed and r.actual_blocker != r.expected_blocker)
+        misclassified = sum(
+            1
+            for r in self.results
+            if not r.allow and not r.passed and r.actual_blocker != r.expected_blocker
+        )
 
         timings = sorted(self._timing_data)
         n = len(timings)
@@ -593,7 +599,11 @@ class HeldOutEvaluation:
         print("HELD-OUT SEEDED EVALUATION REPORT")
         print("=" * 70)
         print(f"Total traces:      {report.total_traces} (all attacks — each targets a predicate)")
-        print(f"Defense success:  {report.correct_blocker}/{report.total_traces} (blocked by correct predicate)")
+        print(
+            f"Defense success:  "
+            f"{report.correct_blocker}/{report.total_traces} "
+            "(blocked by correct predicate)"
+        )
         print(f"Defense failure:   {report.false_negatives} (attack ALLOWED — missed attack)")
         print(f"Misclassified:    {report.false_positives} (blocked, but by wrong predicate)")
         print(f"Avg latency:       {report.avg_latency_ms:.2f}ms")
@@ -615,7 +625,9 @@ class HeldOutEvaluation:
         print(f"Defense rate: {defense_rate:.1f}% (correct predicate blocks / total traces)")
         print()
         print("NOTE: All traces are attacks designed to be blocked by their expected predicate.")
-        print("The metric is DEFENSE SUCCESS (blocked by correct predicate), not false-positive rate.")
+        print(
+            "The metric is DEFENSE SUCCESS (blocked by correct predicate), not false-positive rate."
+        )
 
 
 if __name__ == "__main__":

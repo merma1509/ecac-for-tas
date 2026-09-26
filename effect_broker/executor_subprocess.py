@@ -50,7 +50,6 @@ import json
 import os
 import signal
 import socket
-import stat
 import subprocess
 import sys
 import threading
@@ -72,6 +71,7 @@ def _derive_confidentiality_from_mode(mode_int: int) -> str:
     if mode_int & 0o070 != 0:
         return "INTERNAL"
     return "PUBLIC"
+
 
 # ---- Store: only mutable state in THIS process ----
 class IsolatedStore:
@@ -400,6 +400,7 @@ class ExecutorServer:
                 }
 
         # Apply effect to IsolatedStore
+        assert self._store is not None, "store must be initialized"
         try:
             obs_targets = self._store.apply_effect(effect)
 
@@ -408,7 +409,11 @@ class ExecutorServer:
                 target = effect.get("target", "")
                 # Check if target is marked CONFIDENTIAL in subprocess store
                 file_entry = self._store._files.get(target)
-                if file_entry and file_entry.sensitivity and hasattr(file_entry.sensitivity, 'name'):
+                if (
+                    file_entry
+                    and file_entry.sensitivity
+                    and hasattr(file_entry.sensitivity, "name")
+                ):
                     if file_entry.sensitivity.name == "CONFIDENTIAL":
                         if not session.get("tainted"):
                             session["tainted"] = True
@@ -422,7 +427,7 @@ class ExecutorServer:
                 session["used"] = list(session.get("used", [])) + [nonce]
 
             # Build session update for A (B→A sync)
-            session_update = {
+            session_update_applied = {
                 "used": session.get("used", list(snapshot.get("used", []))),
                 "logical_time": session.get("logical_time", snapshot.get("logical_time", 0.0)),
                 "tainted": session.get("tainted", snapshot.get("tainted", False)),
@@ -433,7 +438,7 @@ class ExecutorServer:
                 "ok": True,
                 "status": "ok",
                 "observed_targets": list(obs_targets),
-                "session_update": session_update,
+                "session_update": session_update_applied,
                 "task_id": task_id,
             }
 
@@ -471,7 +476,7 @@ class ExecutorServer:
                 # as shim_real.py). If the file is owner-only, it is CONFIDENTIAL —
                 # reading it taints the session (read-secrets → send-block attack).
                 confidentiality = _derive_confidentiality_from_mode(st.st_mode)
-                session_update: dict[str, Any] = {}
+                session_update = {}
                 if confidentiality == "CONFIDENTIAL":
                     task_id = payload.get("task_id", "default")
                     session = self._session_states.get(task_id, {})
@@ -503,7 +508,7 @@ class ExecutorServer:
                     confidentiality = _derive_confidentiality_from_mode(st.st_mode)
                 except OSError:
                     confidentiality = "INTERNAL"
-                session_update: dict[str, Any] = {}
+                session_update = {}
                 if confidentiality == "CONFIDENTIAL":
                     task_id = payload.get("task_id", "default")
                     session = self._session_states.get(task_id, {})
@@ -529,7 +534,7 @@ class ExecutorServer:
                 path = payload["path"]
                 st = os.stat(path)
                 confidentiality = _derive_confidentiality_from_mode(st.st_mode)
-                session_update: dict[str, Any] = {}
+                session_update = {}
                 if confidentiality == "CONFIDENTIAL":
                     task_id = payload.get("task_id", "default")
                     session = self._session_states.get(task_id, {})
@@ -565,7 +570,7 @@ class ExecutorServer:
                 body = payload["body"]
                 # RSET probe: check each recipient first
                 actual_recipients: list[str] = []
-                bcc_detected: list[str] = []
+                bcc_detected = []
                 smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
                 try:
                     smtp.ehlo()
@@ -595,7 +600,7 @@ class ExecutorServer:
                 sender = payload["sender"]
                 recipients = payload["recipients"]
                 actual_accepted: list[str] = []
-                bcc_detected: list[str] = []
+                bcc_detected = []
                 smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
                 try:
                     smtp.ehlo()
@@ -622,7 +627,7 @@ class ExecutorServer:
                 # happen in the isolated subprocess, not in the broker process.
                 import imaplib
 
-                user = payload["user"]
+                payload["user"]
                 imap_host = payload.get("imap_host", "localhost")
                 imap_port = payload.get("imap_port", 993)
                 imap_user = payload.get("imap_user")
@@ -632,10 +637,11 @@ class ExecutorServer:
                 messages: list[str] = []
                 total_size = 0
                 try:
+                    mailbox: imaplib.IMAP4
                     if imap_use_tls:
-                        mailbox: imaplib.IMAP4_SSL = imaplib.IMAP4_SSL(imap_host, imap_port)  # type: ignore[assignment]
+                        mailbox = imaplib.IMAP4_SSL(imap_host, imap_port)
                     else:
-                        mailbox = imaplib.IMAP4(imap_host, imap_port)  # type: ignore[assignment]
+                        mailbox = imaplib.IMAP4(imap_host, imap_port)
                     try:
                         if imap_user and imap_password:
                             mailbox.login(imap_user, imap_password)
@@ -677,7 +683,12 @@ class ExecutorServer:
 
         except Exception as e:
             import traceback
-            return {"ok": False, "error": str(e) or repr(e) or "unknown", "trace": traceback.format_exc()}
+
+            return {
+                "ok": False,
+                "error": str(e) or repr(e) or "unknown",
+                "trace": traceback.format_exc(),
+            }
 
     def _dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
         from effect_broker.executor_ipc import ExecutorRequest
@@ -759,6 +770,9 @@ class ExecutorServer:
             case ExecutorRequest.SHUTDOWN:
                 self._shutdown_requested = True
                 return {"ok": True}
+
+            case _:
+                return {"ok": False, "error": f"Unhandled request kind: {kind}"}
 
 
 class ExecutorProcessHandle:
