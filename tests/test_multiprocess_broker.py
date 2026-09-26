@@ -24,6 +24,9 @@ from pathlib import Path
 
 import pytest
 
+from effect_broker.broker import EffectBroker
+from effect_broker.ledger import IndependentEffectLedger
+
 
 class TestSubprocessExecutorRoundTrip:
     """Full round-trip: broker → subprocess store → ledger verification."""
@@ -31,14 +34,10 @@ class TestSubprocessExecutorRoundTrip:
     @pytest.fixture(autouse=True)
     def setup_multiprocess_broker(self, tmp_path: Path) -> None:
         """Create a multi-process broker for each test."""
-        import signal as _signal
 
         uid = uuid.uuid4().hex[:8]
         exec_sock = Path(f"/tmp/ecac-mp-exec-{uid}.sock")
         store_sock = Path(f"/tmp/ecac-mp-store-{uid}.sock")
-
-        from effect_broker.broker import EffectBroker
-        from effect_broker.ledger import IndependentEffectLedger
 
         ledger = IndependentEffectLedger()
         broker = EffectBroker(
@@ -71,8 +70,7 @@ class TestSubprocessExecutorRoundTrip:
 
     def test_commit_routes_through_subprocess_executor(self) -> None:
         """broker.commit() executes through SubprocessExecutor (not IsolatedExecutor)."""
-        from effect_broker.executor import SubprocessExecutor
-        from effect_broker.model import Capability, Commit, Effect, Task, USER, BROKER
+        from effect_broker.model import BROKER, USER, Capability, Commit, Effect, Task
 
         # Root grant
         cap = Capability(
@@ -120,7 +118,7 @@ class TestSubprocessExecutorRoundTrip:
 
     def test_blocked_effect_not_applied_to_subprocess_store(self) -> None:
         """A blocked effect does NOT reach the subprocess store."""
-        from effect_broker.model import Capability, Commit, Effect, Task, USER, BROKER
+        from effect_broker.model import BROKER, USER, Capability, Commit, Effect, Task
 
         # Capability with a different target (will not match the effect's target)
         cap = Capability(
@@ -165,8 +163,8 @@ class TestSubprocessExecutorRoundTrip:
     def test_ledger_records_authorization_and_observation(self) -> None:
         """Ledger records authorization (from gate) and observation (from subprocess)."""
         from effect_broker.executor import SubprocessExecutor
-        from effect_broker.model import Capability, Commit, Effect, Task, USER, BROKER
         from effect_broker.ledger import LedgerVerdict
+        from effect_broker.model import BROKER, USER, Capability, Commit, Effect, Task
 
         # Verify the executor is SubprocessExecutor
         assert isinstance(self._broker.executor, SubprocessExecutor)
@@ -215,7 +213,7 @@ class TestSubprocessExecutorRoundTrip:
 
     def test_verify_complete_mediation_passes_for_valid_effects(self) -> None:
         """broker.verify_complete_mediation() returns no failures for valid effects."""
-        from effect_broker.model import Capability, Commit, Effect, Task, USER, BROKER
+        from effect_broker.model import BROKER, USER, Capability, Commit, Effect, Task
 
         cap = Capability(
             owner=USER,
@@ -309,18 +307,12 @@ class TestSameProcessVsMultiProcessEquivalence:
     """
 
     @pytest.fixture
-    def same_process_broker(self) -> "EffectBroker":
-        from effect_broker.broker import EffectBroker
-        from effect_broker.ledger import IndependentEffectLedger
-
+    def same_process_broker(self) -> EffectBroker:
         broker = EffectBroker(ledger=IndependentEffectLedger(), mode="same-process")
         yield broker
 
     @pytest.fixture
-    def multi_process_broker(self, tmp_path: Path) -> "EffectBroker":
-        from effect_broker.broker import EffectBroker
-        from effect_broker.ledger import IndependentEffectLedger
-
+    def multi_process_broker(self, tmp_path: Path) -> EffectBroker:
         uid = uuid.uuid4().hex[:8]
         exec_sock = Path(f"/tmp/ecac-eq-exec-{uid}.sock")
         store_sock = Path(f"/tmp/ecac-eq-store-{uid}.sock")
@@ -339,8 +331,8 @@ class TestSameProcessVsMultiProcessEquivalence:
 
     def test_write_effect_same_result_both_modes(
         self,
-        same_process_broker: "EffectBroker",
-        multi_process_broker: "EffectBroker",
+        same_process_broker: EffectBroker,
+        multi_process_broker: EffectBroker,
     ) -> None:
         """write effect: allow in same-process and multi-process modes.
 
@@ -354,8 +346,8 @@ class TestSameProcessVsMultiProcessEquivalence:
         Same nonce in SAME logical session → replay detected (correct).
         Same nonce in DIFFERENT logical sessions → both allowed (correct).
         """
-        from effect_broker.model import Capability, Commit, Effect, Task, USER, BROKER
         from effect_broker.lattice import Confidentiality
+        from effect_broker.model import BROKER, USER, Capability, Commit, Effect, Task
 
         # Same capability nonce (same root-granted capability)
         cap = Capability(
@@ -389,12 +381,12 @@ class TestSameProcessVsMultiProcessEquivalence:
             task_id="equiv-task-multi",
             owner=USER,
             ceiling=cap,
-        ) 
+        )
         # Register file in both stores. RestrictedResourceStore requires
         # pre-registration (no auto-create). IsolatedStore auto-creates but
         # registering is fine for consistency.
-        same_process_broker.store._unsafe_bootstrap_file("file:///equiv/test.txt", Confidentiality.PUBLIC)
-        multi_process_broker.store._unsafe_bootstrap_file("file:///equiv/test.txt", Confidentiality.PUBLIC)
+        same_process_broker.store._unsafe_bootstrap_file("file:///equiv/test.txt", Confidentiality.PUBLIC)  # noqa: E501
+        multi_process_broker.store._unsafe_bootstrap_file("file:///equiv/test.txt", Confidentiality.PUBLIC)  # noqa: E501
 
         task_same = Task(
             task_id="equiv-task",
@@ -432,11 +424,11 @@ class TestSameProcessVsMultiProcessEquivalence:
 
     def test_blocked_effect_same_result_both_modes(
         self,
-        same_process_broker: "EffectBroker",
-        multi_process_broker: "EffectBroker",
+        same_process_broker: EffectBroker,
+        multi_process_broker: EffectBroker,
     ) -> None:
         """Blocked effect: deny in same-process and multi-process modes."""
-        from effect_broker.model import Capability, Commit, Effect, Task, USER, BROKER
+        from effect_broker.model import BROKER, USER, Capability, Commit, Effect, Task
 
         cap = Capability(
             owner=USER,

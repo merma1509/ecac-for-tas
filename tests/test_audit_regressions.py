@@ -17,8 +17,8 @@ class TestAuditAUDIT1SameProcessGap:
     """
 
     def test_direct_store_mutation_produces_ledger_unknown(self) -> None:
-        from effect_broker.model import File
         from effect_broker.ledger import UnknownLedgerResult
+        from effect_broker.model import File
         from effect_broker.traces import build
 
         broker = build()
@@ -46,6 +46,7 @@ class TestAuditAUDIT1SameProcessGap:
         """
         import uuid
         from pathlib import Path
+
         from effect_broker.broker import EffectBroker
         from effect_broker.ledger import IndependentEffectLedger
 
@@ -78,8 +79,8 @@ class TestAuditAUDIT2ApprovalBinding:
     """
 
     def test_approval_for_send_blocks_write(self) -> None:
-        from effect_broker.model import Capability, Data, Effect, Task, Commit
         from effect_broker.lattice import Confidentiality, Integrity
+        from effect_broker.model import Capability, Commit, Data, Effect, Task
         from effect_broker.traces import build
 
         broker = build()
@@ -107,7 +108,7 @@ class TestAuditAUDIT2ApprovalBinding:
         allow, ev = broker.commit(Commit(write_effect, task))
         assert not allow, "send approval must NOT authorize write"
         assert ev["primary_blocker"] in ("Auth", "ApprovalBinding")
-        assert "right-mismatch" in ev["predicates"]["Auth"] or ev["primary_blocker"] == "ApprovalBinding"
+        assert "right-mismatch" in ev["predicates"]["Auth"] or ev["primary_blocker"] == "ApprovalBinding"  # noqa: E501
 
 
 class TestAuditAUDIT3RightSubstitution:
@@ -118,8 +119,8 @@ class TestAuditAUDIT3RightSubstitution:
     """
 
     def test_read_cap_blocks_write(self) -> None:
-        from effect_broker.model import Capability, Data, Effect, Task, Commit
         from effect_broker.lattice import Confidentiality, Integrity
+        from effect_broker.model import Capability, Commit, Data, Effect, Task
         from effect_broker.traces import build
 
         broker = build()
@@ -148,8 +149,8 @@ class TestAuditAUDIT3RightSubstitution:
 
     def test_right_wildcard_allows_any_type(self) -> None:
         """right='*' explicitly allows any etype — this is intentional, not a bypass."""
-        from effect_broker.model import Capability, Data, Effect, Task, Commit
         from effect_broker.lattice import Confidentiality, Integrity
+        from effect_broker.model import Capability, Commit, Data, Effect, Task
         from effect_broker.traces import build
 
         broker = build()
@@ -184,8 +185,8 @@ class TestAuditAUDIT4SessionClosure:
     """
 
     def test_task_cannot_reregister_after_use(self) -> None:
-        from effect_broker.model import Capability, Data, Effect, Task, Commit
         from effect_broker.lattice import Confidentiality, Integrity
+        from effect_broker.model import Capability, Commit, Data, Effect, Task
         from effect_broker.traces import build
 
         broker = build()
@@ -212,7 +213,7 @@ class TestAuditAUDIT4SessionClosure:
         broker.commit(Commit(effect, task))  # First use — nonce consumed
 
         fresh_task = Task(task_id="audit-4", owner="User", ceiling=task.ceiling)
-        with pytest.raises((AssertionError, ValueError), match="already been used|already registered"):
+        with pytest.raises((AssertionError, ValueError), match="already been used|already registered"):  # noqa: E501
             broker.register_task(fresh_task)
 
 
@@ -224,10 +225,10 @@ class TestAuditAUDIT5Provenance:
     """
 
     def test_shim_provenance_internal_not_llm_controlled(self) -> None:
-        from effect_broker.model import Capability, Task
-        from effect_broker.traces import build
-        from effect_broker.shim import FileShim
         from effect_broker.lattice import Confidentiality
+        from effect_broker.model import Capability, Task
+        from effect_broker.shim import FileShim
+        from effect_broker.traces import build
 
         broker = build()
         broker.store._unsafe_bootstrap_file("file:///audit-5", Confidentiality.INTERNAL)
@@ -271,8 +272,8 @@ class TestAuditAUDIT6PathNormalization:
     """
 
     def test_aliased_path_blocked_by_auth(self) -> None:
-        from effect_broker.model import Capability, Data, Effect, Task, Commit
         from effect_broker.lattice import Confidentiality, Integrity
+        from effect_broker.model import Capability, Commit, Data, Effect, Task
         from effect_broker.traces import build
 
         broker = build()

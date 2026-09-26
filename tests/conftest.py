@@ -10,13 +10,12 @@ running traces directly (python run_traces.py) in production mode.
 """
 
 from __future__ import annotations
+
 import threading
+import warnings
+from typing import Any
 
 import pytest
-
-# Suppress BEFORE any test imports — this must be at module level, before
-# pytest loads test modules (which import ResourceStore and trigger the warning).
-import warnings
 
 warnings.filterwarnings(
     "ignore",
@@ -31,9 +30,8 @@ warnings.filterwarnings(
 # aiosmtpd is only needed in test context; guard so the module loads fine
 # even if aiosmtpd isn't installed in non-dev environments.
 try:
-    import asyncio
     from aiosmtpd.controller import Controller
-    from aiosmtpd.smtp import SMTP, AuthResult, Envelope
+
     HAS_AIOSMTPD = True
 except ImportError:
     HAS_AIOSMTPD = False
@@ -85,7 +83,11 @@ class RecordingSMTPHandler:
     async def handle_DATA(self, session: Any, envelope: Any, *args: Any) -> str:
         """Async handler for aiosmtpd 1.4.6."""
         with self._lock:
-            content = getattr(session.envelope, 'content', b'') if hasattr(session, 'envelope') else b''
+            content = (
+                getattr(session.envelope, "content", b"")  # noqa: E501
+                if hasattr(session, "envelope")
+                else b""
+            )
             self.data_log.append(content)
         return "250 OK"
 
@@ -104,7 +106,6 @@ if HAS_AIOSMTPD:
                 # server is running on localhost:9025
                 ...
         """
-        import threading
         import time
 
         handler = RecordingSMTPHandler()

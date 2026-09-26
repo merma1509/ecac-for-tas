@@ -8,9 +8,9 @@ Run: uv run pytest tests/test_observer_integration.py -v
 from __future__ import annotations
 
 from effect_broker.lattice import Confidentiality, Integrity
-from effect_broker.model import Capability, Data, Effect, Task, Commit, EffectTarget
-from effect_broker.observer import IndependentObserver, ObserverVerdict, CompleteMediationResult
-from effect_broker.ledger import LedgerVerdict, UnknownLedgerResult
+from effect_broker.ledger import UnknownLedgerResult
+from effect_broker.model import Capability, Commit, Data, Effect, EffectTarget, Task
+from effect_broker.observer import IndependentObserver
 from effect_broker.traces import build
 
 
@@ -184,7 +184,7 @@ class TestObserverEmailSend:
         observer = IndependentObserver(broker=broker)
 
         # Primary + BCC: observer should see both in recipient inboxes
-        verdict = observer.observe_effect(effect)
+        _unused_verdict = observer.observe_effect(effect)
         # Depends on whether the broker's store shows messages in inboxes
         # After a commit, the store.deliver should show messages.
         # This is a logic test that the observer checks complete_targets(), not just target.
@@ -224,6 +224,6 @@ class TestObserverBypassDetection:
         )
 
         ledger_verdict = broker.ledger.verify(task.task_id, nonce)
-        assert isinstance(ledger_verdict, UnknownLedgerResult) and "over-observed" in ledger_verdict.reason, (
-            f"Over-observed (auth=1, obs=2) must produce UNKNOWN(over-observed), got {ledger_verdict}"
+        assert isinstance(ledger_verdict, UnknownLedgerResult) and "over-observed" in ledger_verdict.reason, (  # noqa: E501
+            f"Over-observed (auth=1, obs=2) must produce UNKNOWN(over-observed), got {ledger_verdict}"  # noqa: E501
         )

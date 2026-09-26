@@ -216,11 +216,11 @@ class TestConcurrentReplayPrevention:
         Provenance/integrity is validated by FlowOK at commit time, not by binding.
         Content_hash was removed from ApprovalRequest — binding covers structure only."""
         from dataclasses import fields
+
         from effect_broker.lattice import Confidentiality, Integrity
-        from effect_broker.model import Data
 
         # Verify content_hash is NOT in ApprovedRequest
-        from effect_broker.model import ApprovedRequest
+        from effect_broker.model import ApprovedRequest, Data
         field_names = {f.name for f in fields(ApprovedRequest)}
         assert "content_hash" not in field_names, (
             "content_hash must not be in ApprovedRequest binding"
@@ -258,7 +258,7 @@ class TestConcurrentReplayPrevention:
         allow2, ev2 = broker.commit(commit2)
         assert allow2 is False
         assert ev2["primary_blocker"] == "FlowOK", (
-            f"CONFIDENTIAL→INTERNAL without declass should be blocked by FlowOK, not ApprovalBinding. Evidence: {ev2}"
+            f"CONFIDENTIAL→INTERNAL without declass should be blocked by FlowOK, not ApprovalBinding. Evidence: {ev2}"  # noqa: E501
         )
 
     def test_wildcard_right_bypasses_auth_etype_mismatch(self) -> None:
@@ -346,8 +346,8 @@ class TestConcurrentCrossTask:
         broker.register_task(t2)
 
         # Same nonce in both tasks
-        nonce = f"shared-cap"
-        for task in (t1, t2):
+        nonce = "shared-cap"
+        for _task in (t1, t2):
             cap = Capability(
                 owner="User",
                 holder="EffectBroker",

@@ -10,19 +10,14 @@ The core LedgerBackend interface is tested in-process below.
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
-from unittest.mock import patch
 
 import pytest
 
 from effect_broker.ipc import (
-    LedgerBackend,
     LedgerProcessServer,
     LedgerRequest,
-    LedgerResponse,
     LocalLedgerBackend,
     ProcessLedgerClient,
     _parse_response,
@@ -187,7 +182,7 @@ class TestLedgerProcessServerDispatch:
 
             resp = server._dispatch({
                 "kind": "RECORD_OBSERVATION",
-                "payload": {"task_id": "t", "nonce": "n", "observed_targets": ["a"], "source": "test"},
+                "payload": {"task_id": "t", "nonce": "n", "observed_targets": ["a"], "source": "test"},  # noqa: E501
             })
             assert resp["ok"] is True
             assert server._ledger.observation_count == 1
@@ -704,6 +699,7 @@ class TestSessionSyncIPC:
         """SYNC_SESSION request stores session state in executor's _session_states."""
         import threading
         from pathlib import Path
+
         from effect_broker.executor_subprocess import ExecutorServer
 
         socket_path = Path("/tmp/test-sync-session.sock")
@@ -755,6 +751,7 @@ class TestSessionSyncIPC:
         """SYNC_SESSION stores state per-task_id, multiple tasks coexist."""
         import threading
         from pathlib import Path
+
         from effect_broker.executor_subprocess import ExecutorServer
 
         socket_path = Path("/tmp/test-sync-multi-task.sock")
@@ -783,7 +780,7 @@ class TestSessionSyncIPC:
             session2.used = frozenset({"cap-B", "cap-C"})
             session2.taint_for_send("test reason for task-B")
 
-            result1 = client.sync_session("task-A", session_state_to_dict(session1))
+            _unused_result1 = client.sync_session("task-A", session_state_to_dict(session1))
             result2 = client.sync_session("task-B", session_state_to_dict(session2))
 
             # After both syncs, all_tasks should include both tasks
@@ -805,6 +802,7 @@ class TestSessionSyncIPC:
         """SYNC_SESSION for same task_id replaces previous state."""
         import threading
         from pathlib import Path
+
         from effect_broker.executor_subprocess import ExecutorServer
 
         socket_path = Path("/tmp/test-sync-replace.sock")

@@ -13,17 +13,16 @@ from __future__ import annotations
 
 from effect_broker.broker import EffectBroker
 from effect_broker.lattice import Confidentiality, Integrity
+from effect_broker.ledger import LedgerVerdict, UnknownLedgerResult
 from effect_broker.model import (
     BROKER,
+    USER,
     Capability,
     Commit,
     Data,
     Effect,
-    EffectTarget,
     Task,
-    USER,
 )
-from effect_broker.ledger import LedgerVerdict, UnknownLedgerResult
 
 
 class TestUnknownToolPassesBoundary:

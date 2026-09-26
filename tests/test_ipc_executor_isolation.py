@@ -18,8 +18,6 @@ Key properties verified:
 
 from __future__ import annotations
 
-import tempfile
-import time
 from pathlib import Path
 
 import pytest
@@ -31,10 +29,10 @@ class TestExecutorSubprocessIPC:
     @pytest.fixture(autouse=True)
     def setup_subprocess(self, tmp_path: Path) -> None:
         """Start the executor subprocess for each test."""
-        from effect_broker.executor_subprocess import ExecutorProcessHandle
-
         # macOS limits AF_UNIX paths to ~104 chars; use short paths in /tmp.
         import uuid
+
+        from effect_broker.executor_subprocess import ExecutorProcessHandle
         uid = uuid.uuid4().hex[:8]
         sock = Path(f"/tmp/ecac-exec-{uid}.sock")
         store_sock = Path(f"/tmp/ecac-store-{uid}.sock")
@@ -69,7 +67,7 @@ class TestExecutorSubprocessIPC:
 
         result = client.execute(effect)
         assert result["observed_targets"] == ["file:///reports/summary.txt"]
-        assert ["write", f"file:file:///reports/summary.txt"] in result["effects_log"]
+        assert ["write", "file:file:///reports/summary.txt"] in result["effects_log"]
 
     def test_execute_send_effect_with_bcc(self, tmp_path: Path) -> None:
         """send with BCC: executor delivers to ALL targets, returns complete set."""
@@ -189,11 +187,11 @@ class TestLedgerReadsExecutorStore:
     @pytest.fixture(autouse=True)
     def setup_executor_and_ledger(self, tmp_path: Path) -> None:
         """Start executor and ledger subprocesses."""
-        from effect_broker.executor_subprocess import ExecutorProcessHandle
-        from effect_broker.ipc import LedgerProcessHandle
-
         # macOS limits AF_UNIX paths to ~104 chars; use short paths in /tmp.
         import uuid
+
+        from effect_broker.executor_subprocess import ExecutorProcessHandle
+        from effect_broker.ipc import LedgerProcessHandle
         uid = uuid.uuid4().hex[:8]
         exec_sock = Path(f"/tmp/ecac-exec-{uid}.sock")
         store_sock = Path(f"/tmp/ecac-store-{uid}.sock")

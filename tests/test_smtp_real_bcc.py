@@ -17,15 +17,13 @@ Requires: aiosmtpd (pip install aiosmtpd), pytest-asyncio
 
 from __future__ import annotations
 
-import asyncio
 import threading
 import time
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import pytest
-import pytest_asyncio
+
 
 # ---- SMTP server fixture ----
 @pytest.fixture(scope="module")
@@ -67,7 +65,7 @@ def smtp_server(request: Any) -> Any:
             """Called after DATA body. Records message content."""
             with self._lock:
                 # Get content from session.envelope (has the actual state)
-                content = getattr(session.envelope, 'content', b'') if hasattr(session, 'envelope') else b''
+                content = getattr(session.envelope, 'content', b'') if hasattr(session, 'envelope') else b''  # noqa: E501
                 self.data_log.append(content)
             return "250 OK"
 
@@ -117,21 +115,20 @@ def smtp_server(request: Any) -> Any:
 # ---- Test helpers ----
 def _make_broker(allow_all: bool = True) -> Any:
     """Create broker for SMTP tests.
-    
+
     Args:
         allow_all: If True, creates a broker that allows all emails (wildcard scope).
                    If False, creates a restrictive broker that blocks external sends.
     """
     from effect_broker.broker import EffectBroker
-    from effect_broker.lattice import Integrity
-    from effect_broker.model import Capability, Task, Domain
+    from effect_broker.model import Capability, Domain, Task
 
     broker = EffectBroker(mode="same-process")
-    
+
     # Bootstrap email resources for the test
     broker.store._unsafe_bootstrap_email("internal@corp.com", Domain.INTERNAL)
     broker.store._unsafe_bootstrap_email("team@corp.com", Domain.INTERNAL)
-    
+
     if allow_all:
         # Allow all emails - used for tests that verify BCC detection works
         broker.tasks["default"] = Task(
@@ -180,7 +177,7 @@ def _make_broker(allow_all: bool = True) -> Any:
             expiry=float("inf"),
             nonce="cap-send-internal",
         )
-    
+
     return broker
 
 
@@ -233,8 +230,8 @@ class TestBCCSameProcess:
         EmailSecurityError before broker.commit is called. The ledger records
         the BCC block as CONFIRMED_BLOCKED (shim-level block, no auth entry needed).
         """
-        from effect_broker.shim_email import EmailSecurityError, RealEmailShim
         from effect_broker.ledger import LedgerVerdict
+        from effect_broker.shim_email import EmailSecurityError, RealEmailShim
 
         broker = _make_broker()
         shim = RealEmailShim(
@@ -246,7 +243,7 @@ class TestBCCSameProcess:
         )
 
         # Simulate: tool declared 2 recipients but MTA accepts 3.
-        original_probe = shim._smtp_probe
+        _unused_original_probe = shim._smtp_probe
 
         def bcc_probe(sender: str, recipients: frozenset) -> tuple:  # type: ignore[type]
             decl = frozenset({"internal@corp.com", "team@corp.com"})
@@ -277,19 +274,18 @@ class TestBCCSameProcess:
         Verifies the full path: RSET probe → authorization → commit → delivery
         Ledger should report CONFIRMED_COMMITTED for the delivered effect
         """
-        from effect_broker.shim_email import EmailSecurityError, RealEmailShim
-        from effect_broker.lattice import Confidentiality, Integrity
-        from effect_broker.model import Capability, Task, Domain
-        from effect_broker.ledger import LedgerVerdict
-
         # Create broker with task that allows CONFIDENTIAL send operations
         from effect_broker.broker import EffectBroker
+        from effect_broker.lattice import Confidentiality, Integrity
+        from effect_broker.ledger import LedgerVerdict
+        from effect_broker.model import Capability, Domain, Task
+        from effect_broker.shim_email import RealEmailShim
         broker = EffectBroker(mode="same-process")
-        
+
         # Bootstrap email resources (use mailto: prefix for store lookup)
         broker.store._unsafe_bootstrap_email("mailto:internal@corp.com", Domain.INTERNAL)
         broker.store._unsafe_bootstrap_email("mailto:team@corp.com", Domain.INTERNAL)
-        
+
         # Task with flow_boundary that allows USER integrity (normal for emails)
         # Note: flow_boundary=(CONFIDENTIAL, USER) allows:
         #   - CONFIDENTIAL or lower confidentiality (INTERNAL, PUBLIC)
@@ -328,7 +324,7 @@ class TestBCCSameProcess:
         )
 
         # Patch to guarantee no BCC (MTA accepts exactly what we declare)
-        def clean_probe(sender: str, recipients: frozenset) -> tuple: 
+        def clean_probe(sender: str, recipients: frozenset) -> tuple:
             return recipients, recipients, frozenset()
 
         shim._smtp_probe = clean_probe  # type: ignore[method-assign]
@@ -355,7 +351,7 @@ class TestBCCSameProcess:
         # Clear any leftover data from previous tests (module-scoped fixture)
         smtp_server.data_log.clear()
         smtp_server.rcpt_log.clear()
-        
+
         from effect_broker.shim_email import RealEmailShim
 
         broker = _make_broker()
@@ -387,6 +383,7 @@ class TestBCCMultiProcess:
         subprocess RSET probe → returns actual accepted recipients.
         """
         import threading
+
         from effect_broker.executor_ipc import ProcessExecutorClient
         from effect_broker.executor_subprocess import ExecutorServer
 
@@ -431,6 +428,7 @@ class TestBCCMultiProcess:
         BCC check → DATA delivery (or block on BCC).
         """
         import threading
+
         from effect_broker.executor_ipc import ProcessExecutorClient
         from effect_broker.executor_subprocess import ExecutorServer
 
@@ -475,8 +473,8 @@ class TestBCCMultiProcess:
         The key security property: no message is queued before BCC check.
         The ledger records the BCC block as CONFIRMED_BLOCKED
         """
-        from effect_broker.shim_email import EmailSecurityError, RealEmailShim
         from effect_broker.ledger import LedgerVerdict
+        from effect_broker.shim_email import EmailSecurityError, RealEmailShim
 
         broker = _make_broker()
         shim = RealEmailShim(
@@ -512,6 +510,7 @@ class TestBCCMultiProcess:
     def test_zero_rcpt_returns_empty_accepted(self) -> None:
         """RSET probe with zero recipients returns empty accepted/bcc sets."""
         import threading
+
         from effect_broker.executor_ipc import ProcessExecutorClient
         from effect_broker.executor_subprocess import ExecutorServer
 
@@ -554,6 +553,7 @@ class TestBCCIntegration:
     def test_subprocess_smtp_probe_with_real_server(self, smtp_server: Any) -> None:
         """Subprocess RSET probe against real aiosmtpd server on port 9025."""
         import threading
+
         from effect_broker.executor_ipc import ProcessExecutorClient
         from effect_broker.executor_subprocess import ExecutorServer
 

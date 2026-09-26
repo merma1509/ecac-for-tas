@@ -15,11 +15,10 @@ import pytest
 
 from effect_broker.broker import EffectBroker
 from effect_broker.lattice import Confidentiality, Integrity
-from effect_broker.model import Capability, Commit, Data, Effect, Task
+from effect_broker.model import Capability, Task
 from effect_broker.shim_email import (
     EmailSecurityError,
     RealEmailShim,
-    SMTPError,
 )
 
 
@@ -27,14 +26,14 @@ from effect_broker.shim_email import (
 def _make_broker() -> EffectBroker:
     """Build a broker with a domain-scoped send capability and high flow boundary."""
     from effect_broker.model import Domain
-    
+
     broker = EffectBroker(mode="same-process")
     # Bootstrap email resources (use mailto: prefix for store lookup)
     # Domain.INTERNAL matches _derive_email_confidentiality for corp.com emails
     broker.store._unsafe_bootstrap_email("mailto:internal@corp.com", Domain.INTERNAL)
     broker.store._unsafe_bootstrap_email("mailto:team@corp.com", Domain.INTERNAL)
     broker.store._unsafe_bootstrap_email("mailto:attacker@evil.com", Domain.EXTERNAL)
-    
+
     task = Task(
         task_id="email-test",
         owner="User",
@@ -122,7 +121,7 @@ class TestShimEmailSMTPSend:
 
         # Simulate: tool declared 2 recipients but MTA accepts 3.
         # We patch _smtp_probe to simulate MTA accepting an extra.
-        declared = frozenset({"internal@corp.com", "team@corp.com"})
+        _unused_declared = frozenset({"internal@corp.com", "team@corp.com"})
 
         def patched_probe(sender: str, decl: frozenset[str]):
             # MTA secretly accepts attacker@evil.com too

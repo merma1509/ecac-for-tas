@@ -15,12 +15,9 @@ Run with: pytest tests/test_real_provenance.py -v
 
 from __future__ import annotations
 
-import json
-import os
 import threading
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 
@@ -163,15 +160,14 @@ class TestRealProvenanceSubprocess:
 
         File permissions control confidentiality. The shim reads real stat
         and derives labels, not accepting LLM claims.
-        
+
         Note: Uses same-process mode (same as subprocess path) since RealFileShim
         delegates to subprocess for real stat() calls.
         """
-        from effect_broker.lattice import Confidentiality, Integrity
-        from effect_broker.shim_real import RealFileShim
-
         from effect_broker.broker import EffectBroker
+        from effect_broker.lattice import Confidentiality, Integrity
         from effect_broker.model import Capability, Task
+        from effect_broker.shim_real import RealFileShim
 
         broker = EffectBroker(mode="same-process")
         # Use .resolve() so canonical path matches what shim._canonical_path produces.
@@ -216,7 +212,7 @@ class TestRealProvenanceSubprocess:
         shim = RealFileShim(broker, task_id="mode-test", tool_name="mode-tool")
 
         # Read the file — shim should derive labels from real mode bits
-        content = shim.read(str(test_file))
+        _unused_content = shim.read(str(test_file))
         ops = shim.get_ops()
         assert len(ops) == 1
         op = ops[0]
@@ -249,7 +245,7 @@ class TestContentProvenance:
         shim = RealFileShim(broker, task_id="provenance-test", tool_name="provenance-tool")
 
         path = str(tmpdir / "confidential.txt")
-        content = shim.read(path)
+        _unused_content = shim.read(path)
         ops = shim.get_ops()
         assert len(ops) == 1
         op = ops[0]
@@ -318,7 +314,6 @@ class TestProvenanceMultiProcess:
         """
         from effect_broker.broker import EffectBroker
         from effect_broker.model import Capability, Task
-        from effect_broker.shim_real import RealFileShim
 
         broker = EffectBroker(mode="multi-process")
         task = Task(
@@ -362,7 +357,6 @@ class TestProvenanceMultiProcess:
         """
         from effect_broker.broker import EffectBroker
         from effect_broker.model import Capability, Task
-        from effect_broker.shim_email import RealEmailShim
 
         broker = EffectBroker(mode="multi-process")
         task = Task(
@@ -405,7 +399,6 @@ class TestProvenanceMultiProcess:
         """
         from effect_broker.broker import EffectBroker
         from effect_broker.model import Capability, Task
-        from effect_broker.shim_real import RealFileShim
 
         broker = EffectBroker(mode="same-process")
         task = Task(
