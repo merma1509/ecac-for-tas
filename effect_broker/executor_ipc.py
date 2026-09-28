@@ -29,8 +29,13 @@ The executor process deserializes, applies, returns observed_targets as a frozen
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
+import secrets
 import threading
+import time
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, cast
@@ -236,12 +241,6 @@ def send_and_receive(
 # ---- Executor IPC Payload Integrity (HMAC-SHA256 signing) ----
 # Shared secret key for HMAC signing. Both broker and subprocess must use
 # the same key. Key is stored in a file with restricted permissions.
-import hashlib
-import hmac
-import os
-import secrets
-
-
 def _get_ipc_secret_key() -> bytes:
     """Get or create the IPC signing key.
 
@@ -276,8 +275,9 @@ def _sign_payload(payload: dict[str, Any], kind: ExecutorRequest) -> dict[str, A
 
     # Include request kind in signature for replay prevention
     # IMPORTANT: Sign the payload WITHOUT _ecac_signature and _ecac_signed_at
-    payload_for_signing = {k: v for k, v in payload.items()
-                           if k not in ("_ecac_signature", "_ecac_signed_at")}
+    payload_for_signing = {
+        k: v for k, v in payload.items() if k not in ("_ecac_signature", "_ecac_signed_at")
+    }
     content = json.dumps({"kind": kind.name, "payload": payload_for_signing}, sort_keys=True)
     content_bytes = content.encode("utf-8")
 
@@ -302,8 +302,9 @@ def _verify_payload(payload: dict[str, Any], kind: ExecutorRequest) -> bool:
 
     # Recompute expected signature using payload WITHOUT signature fields
     key = _get_ipc_secret_key()
-    payload_for_verify = {k: v for k, v in payload.items()
-                          if k not in ("_ecac_signature", "_ecac_signed_at")}
+    payload_for_verify = {
+        k: v for k, v in payload.items() if k not in ("_ecac_signature", "_ecac_signed_at")
+    }
     content = json.dumps({"kind": kind.name, "payload": payload_for_verify}, sort_keys=True)
     content_bytes = content.encode("utf-8")
 
@@ -311,10 +312,6 @@ def _verify_payload(payload: dict[str, Any], kind: ExecutorRequest) -> bool:
 
     # Use constant-time comparison to prevent timing attacks
     return hmac.compare_digest(signature, expected)
-
-
-# Import time for signed_at timestamp
-import time
 
 
 def session_state_to_dict(session: Any) -> dict[str, Any]:

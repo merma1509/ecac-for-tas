@@ -12,7 +12,7 @@ mutation goes through here — no other process can touch the store directly
     │  - Auth/FlowOK │  (allow,          │  - RestrictedStore      │
     │  - Fresh check │   obs_targets,    │  - _apply_effect()      │
     │  - NoAmp       │   evidence)       │  - identity_log         │
-    │  - Approval    │ ◄──────────────── │                         │
+    │  - Approval    │ ◄──────────────── │  - audit_log            │
     └────────────────┘                   └─────────────────────────┘
                                                         │
                                         read_store() ───┘
@@ -28,6 +28,8 @@ ISOLATION GUARANTEES
 2. Every effect reaches state through executor_subprocess._apply_effect().
 3. Direct store mutation (broker.store._files._data=...) is IMPOSSIBLE —
    the broker doesn't have a reference to this store.
+4. All mutations are logged to audit_log with timestamp + effect details.
+5. Process ID is logged for audit trail traceability.
 4. The ledger's obs_targets come from THIS process, not from the broker.
 5. An external observer can read_store() to independently verify state.
 
@@ -83,6 +85,9 @@ class IsolatedStore:
     """
 
     def __init__(self) -> None:
+        import os
+        import time
+
         from effect_broker.model import Email, File, Mailbox
 
         self._files: dict[str, File] = {}
@@ -90,6 +95,28 @@ class IsolatedStore:
         self._mailboxes: dict[str, Mailbox] = {}
         self.effects_log: list[tuple[str, str]] = []
         self.identity_log: list[frozenset[str]] = []
+        # Audit log: every mutation with timestamp + pid for traceability
+        self.audit_log: list[dict[str, object]] = []
+        self._pid = os.getpid()
+        self._start_time = time.time()
+
+    def _audit(
+        self, action: str, effect: dict[str, object], extra: dict[str, object] | None = None
+    ) -> None:
+        """Record mutation to audit log with process context."""
+        import time
+
+        self.audit_log.append(
+            {
+                "ts": time.time() - self._start_time,
+                "pid": self._pid,
+                "action": action,
+                "etype": effect.get("etype"),
+                "target": effect.get("target"),
+                "nonce": effect.get("capability_nonce"),
+                "extra": extra or {},
+            }
+        )
 
     # ---- Bootstrap (setup only, before broker starts) ----
     def _unsafe_bootstrap_file(self, path: str, sensitivity: str) -> None:
@@ -137,6 +164,10 @@ class IsolatedStore:
     def read_identity_log(self) -> list[list[str]]:
         return [list(x) for x in self.identity_log]
 
+    def read_audit_log(self) -> list[dict[str, object]]:
+        """Read the audit log for observer verification."""
+        return list(self.audit_log)
+
     # ---- Sole mutation point ----
     def apply_effect(self, effect: dict[str, Any]) -> frozenset[str]:
         """Apply an effect to this store. Returns the complete set of observed targets.
@@ -167,6 +198,7 @@ class IsolatedStore:
             del self._files[target]
             self.effects_log.append(("delete", f"file:{target}"))
             self.identity_log.append(all_targets_frozen)
+            self._audit("delete_file", effect, {"path": target})
 
         elif etype == "write":
             # Auto-create the file if it doesn't exist
@@ -177,6 +209,11 @@ class IsolatedStore:
                 self._files[target] = File(target, Confidentiality.PUBLIC)
             self.effects_log.append(("write", f"file:{target}"))
             self.identity_log.append(all_targets_frozen)
+            self._audit(
+                "write_file",
+                effect,
+                {"path": target, "size": len(effect.get("metadata", {}).get("content", ""))},
+            )
 
         elif etype == "read":
             # Auto-create the file if it doesn't exist
@@ -187,6 +224,7 @@ class IsolatedStore:
                 self._files[target] = File(target, Confidentiality.PUBLIC)
             self.effects_log.append(("read", f"file:{target}"))
             self.identity_log.append(all_targets_frozen)
+            self._audit("read_file", effect, {"path": target})
 
         elif etype == "send":
             # Deliver to ALL targets (primary + BCC), append to each recipient's outbox.
@@ -214,12 +252,14 @@ class IsolatedStore:
 
             self.effects_log.append(("send", f"email:{target}"))
             self.identity_log.append(all_targets_frozen)
+            self._audit("send_email", effect, {"recipients": list(all_targets)})
 
         elif etype == "network":
             # Extract domain for scope tracking (same as RestrictedStore._url_for)
             domain = target.split("://", 1)[1].split("/")[0] if "://" in target else target
             self.effects_log.append(("network", f"url:{target}"))
             self.identity_log.append(all_targets_frozen)
+            self._audit("network_access", effect, {"domain": domain})
 
         elif etype == "read" and "@" in target and target in self._emails:
             # read on email → log which mailbox inbox is accessed
@@ -227,11 +267,13 @@ class IsolatedStore:
             mb = self._mailboxes.setdefault(local, _make_mailbox(local))
             self.effects_log.append(("read", f"inbox:{local}"))
             self.identity_log.append(all_targets_frozen)
+            self._audit("read_inbox", effect, {"mailbox": local})
 
         else:
             # Log for audit (unknown/not applicable)
             self.effects_log.append((etype, target))
             self.identity_log.append(all_targets_frozen)
+            self._audit("unknown_effect", effect, {})
 
         return all_targets_frozen
 

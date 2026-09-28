@@ -40,7 +40,7 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .model import Effect  # noqa: F401
+    pass
 
 
 class LedgerVerdict(Enum):
