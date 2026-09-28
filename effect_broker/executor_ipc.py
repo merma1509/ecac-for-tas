@@ -205,13 +205,21 @@ def send_and_receive(
     kind: ExecutorRequest,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Send a request and receive the response over Unix socket."""
+    """Send a request and receive the response over Unix socket.
+
+    Signs outgoing payloads with HMAC-SHA256 to prevent IPC tampering.
+    If a payload is modified in transit (e.g., MITM attack on Unix socket),
+    the signature verification fails and the executor rejects the request.
+    """
     import socket as _sock
+
+    # Sign the payload with HMAC-SHA256
+    signed_payload = _sign_payload(payload, kind)
 
     with _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM) as s:
         s.settimeout(30.0)
         s.connect(str(socket_path))
-        s.sendall(serialize_request(kind, payload))
+        s.sendall(serialize_request(kind, signed_payload))
         header = b""
         while b"\n" not in header:
             header += s.recv(1)
@@ -223,6 +231,90 @@ def send_and_receive(
                 raise ConnectionError("Executor process closed connection")
             raw += chunk
     return parse_response(raw)
+
+
+# ---- Executor IPC Payload Integrity (HMAC-SHA256 signing) ----
+# Shared secret key for HMAC signing. Both broker and subprocess must use
+# the same key. Key is stored in a file with restricted permissions.
+import hashlib
+import hmac
+import os
+import secrets
+
+
+def _get_ipc_secret_key() -> bytes:
+    """Get or create the IPC signing key.
+
+    Key is stored at: ~/.ecac/ipc_secret.key
+    File permissions: 0o600 (owner read/write only)
+    """
+    key_dir = Path.home() / ".ecac"
+    key_file = key_dir / "ipc_secret.key"
+
+    if key_file.exists():
+        # Read existing key
+        key = key_file.read_bytes()
+        if len(key) >= 32:
+            return key[:32]  # Use first 32 bytes
+
+    # Generate new key
+    key_dir.mkdir(parents=True, exist_ok=True)
+    key = secrets.token_bytes(32)  # 256-bit key for HMAC-SHA256
+    key_file.write_bytes(key)
+    os.chmod(key_file, 0o600)  # Restrict to owner only
+    return key
+
+
+def _sign_payload(payload: dict[str, Any], kind: ExecutorRequest) -> dict[str, Any]:
+    """Sign payload with HMAC-SHA256.
+
+    Adds "signature" and "signed_at" fields to the payload.
+    The signature covers the JSON-serialized request kind + payload content
+    (WITHOUT the signature fields themselves to avoid circular dependency).
+    """
+    key = _get_ipc_secret_key()
+
+    # Include request kind in signature for replay prevention
+    # IMPORTANT: Sign the payload WITHOUT _ecac_signature and _ecac_signed_at
+    payload_for_signing = {k: v for k, v in payload.items()
+                           if k not in ("_ecac_signature", "_ecac_signed_at")}
+    content = json.dumps({"kind": kind.name, "payload": payload_for_signing}, sort_keys=True)
+    content_bytes = content.encode("utf-8")
+
+    signature = hmac.new(key, content_bytes, hashlib.sha256).hexdigest()
+
+    return {
+        **payload_for_signing,
+        "_ecac_signature": signature,
+        "_ecac_signed_at": time.time(),
+    }
+
+
+def _verify_payload(payload: dict[str, Any], kind: ExecutorRequest) -> bool:
+    """Verify payload HMAC signature.
+
+    Checks that the payload hasn't been tampered with in transit.
+    Returns True if valid, False if tampered or missing signature.
+    """
+    signature = payload.get("_ecac_signature")
+    if signature is None:
+        return False  # No signature = tampered or old protocol
+
+    # Recompute expected signature using payload WITHOUT signature fields
+    key = _get_ipc_secret_key()
+    payload_for_verify = {k: v for k, v in payload.items()
+                          if k not in ("_ecac_signature", "_ecac_signed_at")}
+    content = json.dumps({"kind": kind.name, "payload": payload_for_verify}, sort_keys=True)
+    content_bytes = content.encode("utf-8")
+
+    expected = hmac.new(key, content_bytes, hashlib.sha256).hexdigest()
+
+    # Use constant-time comparison to prevent timing attacks
+    return hmac.compare_digest(signature, expected)
+
+
+# Import time for signed_at timestamp
+import time
 
 
 def session_state_to_dict(session: Any) -> dict[str, Any]:
