@@ -546,11 +546,18 @@ class Effect:
 
         # For write effects, hash the content being written
         if self.etype == "write":
-            content = self.metadata.get("content", "")
-            if isinstance(content, bytes):
-                content = content.decode("utf-8", errors="replace")
-            if isinstance(content, str) and content:
-                return compute_content_hash(content)
+            # Handle both direct content (bytes/str) and base64-encoded content
+            import base64
+            content_raw = self.metadata.get("content", "")
+            if content_raw is None or content_raw == "":
+                # Also check for base64 encoded content (from IPC-safe shim)
+                content_b64 = self.metadata.get("content_b64", "")
+                if isinstance(content_b64, str) and content_b64:
+                    content_raw = base64.b64decode(content_b64)
+            if isinstance(content_raw, bytes):
+                content_raw = content_raw.decode("utf-8", errors="replace")
+            if isinstance(content_raw, str) and content_raw:
+                return compute_content_hash(content_raw)
 
         # For read/delete effects, there's no mutable content to bind
         return None
