@@ -219,11 +219,11 @@ class TestConcurrentReplayPrevention:
 
         from effect_broker.lattice import Confidentiality, Integrity
 
-        # Verify content_hash is NOT in ApprovedRequest
+        # Verify content_hash IS in ApprovedRequest
         from effect_broker.model import ApprovedRequest, Data
         field_names = {f.name for f in fields(ApprovedRequest)}
-        assert "content_hash" not in field_names, (
-            "content_hash must not be in ApprovedRequest binding"
+        assert "content_hash" in field_names, (
+            "content_hash must be in ApprovedRequest binding"
         )
 
         broker = build()
