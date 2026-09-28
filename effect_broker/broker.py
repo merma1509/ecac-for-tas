@@ -292,6 +292,7 @@ class EffectBroker:
         ledger: LedgerSource = None,
         *,
         mode: str = "same-process",
+        production_safe: bool = False,
         executor_socket: str | Path = "/tmp/ecac-executor.sock",
         store_socket: str | Path = "/tmp/ecac-executor-store.sock",
     ) -> None:
@@ -303,11 +304,19 @@ class EffectBroker:
                   In multi-process mode, the broker runs in a separate process
                   from the executor's mutable store. State mutation happens in
                   the subprocess; the broker communicates via IPC only.
+            production_safe: if True, reject same-process mode and force multi-process.
+                            Use this for production deployments requiring isolation.
             executor_socket: Unix socket path for broker → executor IPC
                              (only used in multi-process mode)
             store_socket: Unix socket path for observer → executor store reads
                          (only used in multi-process mode)
         """
+        # Production safety check: refuse same-process mode if isolation required
+        if production_safe and mode == "same-process":
+            raise ValueError(
+                "SECURITY: EffectBroker(production_safe=True) cannot use same-process mode. "
+                "Direct store mutation bypasses authorization. Use mode='multi-process'."
+            )
         # Ledger backend (local or remote IPC). The ledger is the single
         # source of truth for mediation verdicts. Neither broker nor
         # executor can modify ledger entries after recording.
@@ -1479,9 +1488,9 @@ class EffectBroker:
             task = self.tasks.get("default")
             if task is None:
                 raise ValueError(
-                    f"task=None requires a registered task. "
-                    f"No default task exists. Register task first with "
-                    f"broker.register_task() or ensure Commit.task is set."
+                    "task=None requires a registered task. "
+                    "No default task exists. Register task first with "
+                    "broker.register_task() or ensure Commit.task is set."
                 )
 
         assert task.session is not None, "Task must have a session (set by __post_init__)"
