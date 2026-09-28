@@ -397,10 +397,23 @@ class TestMediatorMetadataLimitation:
         tools must register with the mediator for boundary enforcement.
         The capability-level predicates (Auth/FlowOK/NoAmp/Fresh) still gate.
         """
+        from effect_broker.model import Task
         broker = EffectBroker()
 
         # Bootstrap the resource so apply_effect() doesn't KeyError
         broker.store._unsafe_bootstrap_file("file:///secrets", Confidentiality.CONFIDENTIAL)
+
+        # Register default task for backward compatibility
+        default_task = Task(
+            task_id="default",
+            owner=USER,
+            ceiling=Capability(
+                owner=USER, holder="EffectBroker", right="*",
+                target="*", scope=frozenset({"*"}),
+                expiry=float("inf"), nonce="default-ceiling",
+            ),
+        )
+        broker.tasks["default"] = default_task
 
         # No mediator registered
         assert broker._mediator is None
