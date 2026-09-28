@@ -47,6 +47,24 @@ def _capability(
 @pytest.fixture
 def broker() -> Iterator[EffectBroker]:
     broker_instance = EffectBroker()
+    
+    # Register default task for backward compatibility with existing tests
+    # This allows Commit(effect) without explicit task to work with a registered task.
+    default_task = Task(
+        task_id="default",
+        owner=USER,
+        ceiling=Capability(
+            owner=USER,
+            holder=BROKER,
+            right="*",
+            target="*",
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce="default-task-ceiling",
+        ),
+    )
+    broker_instance.tasks["default"] = default_task
+    
     # external resources: R = F ∪ E ∪ M — bootstrap via restricted store API
     broker_instance.store._unsafe_bootstrap_file(
         "file:///reports", Confidentiality.INTERNAL
