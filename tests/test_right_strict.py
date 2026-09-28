@@ -71,9 +71,7 @@ class TestStrictRightMatching:
         commit = broker._make_commit(write_effect, task_id="default")
         allow, evidence = broker.commit(commit)
 
-        assert allow is False, (
-            "read approval should NOT authorize write. Evidence: {evidence}"
-        )
+        assert allow is False, "read approval should NOT authorize write. Evidence: {evidence}"
         assert evidence["primary_blocker"] == "Auth"
         assert "right-mismatch" in evidence["predicates"]["Auth"]
         # The capability's right="read" vs effect's etype="write"
@@ -140,9 +138,7 @@ class TestStrictRightMatching:
         commit = broker._make_commit(write_effect, task_id="default")
         allow, evidence = broker.commit(commit)
 
-        assert allow is True, (
-            f"Exact right match should ALLOW. Evidence: {evidence}"
-        )
+        assert allow is True, f"Exact right match should ALLOW. Evidence: {evidence}"
         assert evidence["primary_blocker"] is None
 
     def test_capability_right_mismatch_also_blocks(self) -> None:

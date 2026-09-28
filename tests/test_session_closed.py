@@ -263,8 +263,7 @@ class TestSessionLiveFalseBlocks:
             )
             allow, ev = broker.commit(broker._make_commit(effect, task_id=task_id))
             assert allow is expected, (
-                f"Task {task_id}: expected allow={expected}, got allow={allow}. "
-                f"Evidence: {ev}"
+                f"Task {task_id}: expected allow={expected}, got allow={allow}. Evidence: {ev}"
             )
 
     def test_cannot_reopen_a_closed_session(self) -> None:

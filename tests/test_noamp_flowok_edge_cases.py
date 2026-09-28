@@ -449,6 +449,7 @@ class TestFlowOKEndorseEdgeCases:
         # FlowOK allows: UNTRUSTED→USER exception applies
         assert allow is True
 
+
 # =============================================================================
 # Session Taint (inter-effect composition)
 # =============================================================================
@@ -485,23 +486,29 @@ class TestSessionTaintInterEffectComposition:
             task_id="taint-test",
             owner=USER,
             ceiling=Capability(
-                owner=USER, holder=BROKER, right="read",
-                target="file:///secrets", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce="cap",
+                owner=USER,
+                holder=BROKER,
+                right="read",
+                target="file:///secrets",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="cap",
             ),
             flow_boundary=(Confidentiality.CONFIDENTIAL, Integrity.USER),
         )
         broker.tasks["taint-test"] = task
         broker.capabilities["cap"] = Capability(
-            owner=USER, holder=BROKER, right="read",
-            target="file:///secrets", scope=frozenset({"*"}),
-            expiry=float("inf"), nonce="cap",
+            owner=USER,
+            holder=BROKER,
+            right="read",
+            target="file:///secrets",
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce="cap",
         )
 
         # Bootstrap the file with CONFIDENTIAL sensitivity
-        broker.store._unsafe_bootstrap_file(
-            "file:///secrets", Confidentiality.CONFIDENTIAL
-        )
+        broker.store._unsafe_bootstrap_file("file:///secrets", Confidentiality.CONFIDENTIAL)
 
         effect = Effect(
             etype="read",
@@ -536,17 +543,25 @@ class TestSessionTaintInterEffectComposition:
             task_id="taint-test",
             owner=USER,
             ceiling=Capability(
-                owner=USER, holder=BROKER, right="send",
-                target="internal@corp.com", scope=frozenset({"internal"}),
-                expiry=float("inf"), nonce="send-cap",
+                owner=USER,
+                holder=BROKER,
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"internal"}),
+                expiry=float("inf"),
+                nonce="send-cap",
             ),
             flow_boundary=(Confidentiality.INTERNAL, Integrity.USER),
         )
         broker.tasks["taint-test"] = task
         broker.capabilities["send-cap"] = Capability(
-            owner=USER, holder=BROKER, right="send",
-            target="internal@corp.com", scope=frozenset({"internal"}),
-            expiry=float("inf"), nonce="send-cap",
+            owner=USER,
+            holder=BROKER,
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="send-cap",
         )
 
         # Bootstrap the file and mark session as taint-forced
@@ -585,17 +600,25 @@ class TestSessionTaintInterEffectComposition:
             task_id="declass-test",
             owner=USER,
             ceiling=Capability(
-                owner=USER, holder=BROKER, right="send",
-                target="internal@corp.com", scope=frozenset({"internal"}),
-                expiry=float("inf"), nonce="send-cap",
+                owner=USER,
+                holder=BROKER,
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"internal"}),
+                expiry=float("inf"),
+                nonce="send-cap",
             ),
             flow_boundary=(Confidentiality.INTERNAL, Integrity.USER),
         )
         broker.tasks["declass-test"] = task
         broker.capabilities["send-cap"] = Capability(
-            owner=USER, holder=BROKER, right="send",
-            target="internal@corp.com", scope=frozenset({"internal"}),
-            expiry=float("inf"), nonce="send-cap",
+            owner=USER,
+            holder=BROKER,
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="send-cap",
         )
 
         # Session is taint-forced (read-secrets happened)
@@ -615,6 +638,7 @@ class TestSessionTaintInterEffectComposition:
 
         # NOTE: nonce must be unique for grant_label_exception
         from effect_broker.model import LabelException
+
         grant = LabelException(
             kind="declass",
             match_target="internal@corp.com",
@@ -629,6 +653,7 @@ class TestSessionTaintInterEffectComposition:
 
         # Bootstrap the email (required for send effect to be valid)
         from effect_broker.model import Domain
+
         broker.store._unsafe_bootstrap_email("internal@corp.com", Domain.INTERNAL)
 
         # Broker grants: this should clear the session taint
@@ -667,17 +692,25 @@ class TestSessionTaintInterEffectComposition:
             task_id="clean-task",
             owner=USER,
             ceiling=Capability(
-                owner=USER, holder=BROKER, right="send",
-                target="internal@corp.com", scope=frozenset({"internal"}),
-                expiry=float("inf"), nonce="send-cap",
+                owner=USER,
+                holder=BROKER,
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"internal"}),
+                expiry=float("inf"),
+                nonce="send-cap",
             ),
             flow_boundary=(Confidentiality.INTERNAL, Integrity.USER),
         )
         broker.tasks["clean-task"] = task
         broker.capabilities["send-cap"] = Capability(
-            owner=USER, holder=BROKER, right="send",
-            target="internal@corp.com", scope=frozenset({"internal"}),
-            expiry=float("inf"), nonce="send-cap",
+            owner=USER,
+            holder=BROKER,
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="send-cap",
         )
 
         # Session is NOT tainted (no CONFIDENTIAL read happened)
@@ -685,6 +718,7 @@ class TestSessionTaintInterEffectComposition:
 
         # Bootstrap the email (required for send effect to be valid)
         from effect_broker.model import Domain
+
         broker.store._unsafe_bootstrap_email("internal@corp.com", Domain.INTERNAL)
 
         # Send should ALLOW
@@ -718,17 +752,25 @@ class TestSessionTaintInterEffectComposition:
             task_id="internal-read",
             owner=USER,
             ceiling=Capability(
-                owner=USER, holder=BROKER, right="read",
-                target="file:///reports", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce="read-cap",
+                owner=USER,
+                holder=BROKER,
+                right="read",
+                target="file:///reports",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="read-cap",
             ),
             flow_boundary=(Confidentiality.INTERNAL, Integrity.USER),
         )
         broker.tasks["internal-read"] = task
         broker.capabilities["read-cap"] = Capability(
-            owner=USER, holder=BROKER, right="read",
-            target="file:///reports", scope=frozenset({"*"}),
-            expiry=float("inf"), nonce="read-cap",
+            owner=USER,
+            holder=BROKER,
+            right="read",
+            target="file:///reports",
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce="read-cap",
         )
 
         # Bootstrap with INTERNAL sensitivity
@@ -762,23 +804,32 @@ class TestSessionTaintInterEffectComposition:
             task_id="task-A",
             owner=USER,
             ceiling=Capability(
-                owner=USER, holder=BROKER, right="send",
-                target="internal@corp.com", scope=frozenset({"internal"}),
-                expiry=float("inf"), nonce="send-cap",
+                owner=USER,
+                holder=BROKER,
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"internal"}),
+                expiry=float("inf"),
+                nonce="send-cap",
             ),
             flow_boundary=(Confidentiality.INTERNAL, Integrity.USER),
         )
         broker.tasks["task-A"] = task_a
         broker.capabilities["send-cap"] = Capability(
-            owner=USER, holder=BROKER, right="send",
-            target="internal@corp.com", scope=frozenset({"internal"}),
-            expiry=float("inf"), nonce="send-cap",
+            owner=USER,
+            holder=BROKER,
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="send-cap",
         )
 
         # Session A is tainted
         task_a.session.taint_for_send("read-confidential in task-A")
 
         from effect_broker.model import LabelException
+
         # Declass is granted for task-B (different task)
         grant = LabelException(
             kind="declass",
@@ -876,7 +927,9 @@ class TestProvenanceDerivation:
         resolver = broker._provenance_resolver
         conf, integ = resolver.resolve("alice@corp.com")
         # corp.com is in TRUSTED_DOMAINS → internal domain → INTERNAL
-        assert conf == Confidentiality.INTERNAL, f"Expected INTERNAL for corp.com domain, got {conf}"  # noqa: E501
+        assert conf == Confidentiality.INTERNAL, (
+            f"Expected INTERNAL for corp.com domain, got {conf}"
+        )  # noqa: E501
         assert integ == Integrity.USER
 
     def test_email_external_domain_is_public(self) -> None:

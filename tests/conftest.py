@@ -55,8 +55,8 @@ class RecordingSMTPHandler:
     """
 
     def __init__(self) -> None:
-        self.rcpt_to_log: list[str] = []   # recipients from RCPT TO commands
-        self.data_log: list[bytes] = []    # message bodies from DATA commands
+        self.rcpt_to_log: list[str] = []  # recipients from RCPT TO commands
+        self.data_log: list[bytes] = []  # message bodies from DATA commands
         self.message_log: list[tuple[str, list[str]]] = []  # (mail_from, [recipients])
         self._session = None
         self._lock = threading.Lock()
@@ -76,7 +76,7 @@ class RecordingSMTPHandler:
         with self._lock:
             if len(args) >= 2:
                 self.rcpt_to_log.append(args[1])
-                if hasattr(session, 'envelope'):
+                if hasattr(session, "envelope"):
                     session.envelope.rcpt_tos.append(args[1])
         return "250 OK"
 
@@ -93,6 +93,7 @@ class RecordingSMTPHandler:
 
 
 if HAS_AIOSMTPD:
+
     @pytest.fixture
     def smtp_server():
         """Start an aiosmtpd server on port 9025 for email shim tests.
@@ -127,8 +128,7 @@ if HAS_AIOSMTPD:
 
         controller.stop()
 else:
+
     @pytest.fixture  # type: ignore[misc]
     def smtp_server():
         pytest.skip("aiosmtpd not installed — install with: pip install aiosmtpd")
-
-

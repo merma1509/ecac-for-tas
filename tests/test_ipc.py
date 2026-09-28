@@ -40,6 +40,7 @@ class TestWireFormat:
         # Length-prefixed format: "<length>\n<json>"
         # Split on first newline to get length and body separately
         import json
+
         newline_idx = raw.index(b"\n")
         length = int(raw[:newline_idx])
         body = raw[newline_idx + 1 :]
@@ -83,9 +84,7 @@ class TestLocalLedgerBackend:
         backend = LocalLedgerBackend(ledger)
         backend.record_authorization("task1", "nonce1", frozenset({"file:///a"}), source="test")
         # Source must match BLOCKED_SOURCES for verify to return CONFIRMED_BLOCKED
-        backend.record_observation(
-            "task1", "nonce1", None, source="broker.commit:BLOCKED"
-        )
+        backend.record_observation("task1", "nonce1", None, source="broker.commit:BLOCKED")
 
         result = backend.verify("task1", "nonce1")
         assert result == LedgerVerdict.CONFIRMED_BLOCKED
@@ -162,15 +161,17 @@ class TestLedgerProcessServerDispatch:
             # Manually set ledger (normally set by run())
             server._ledger = IndependentEffectLedger()
 
-            resp = server._dispatch({
-                "kind": "RECORD_AUTHORIZATION",
-                "payload": {
-                    "task_id": "t1",
-                    "nonce": "n1",
-                    "authorized_targets": ["file:///a"],
-                    "source": "test",
-                },
-            })
+            resp = server._dispatch(
+                {
+                    "kind": "RECORD_AUTHORIZATION",
+                    "payload": {
+                        "task_id": "t1",
+                        "nonce": "n1",
+                        "authorized_targets": ["file:///a"],
+                        "source": "test",
+                    },
+                }
+            )
             assert resp["ok"] is True
             assert server._ledger.authorization_count == 1
 
@@ -180,10 +181,17 @@ class TestLedgerProcessServerDispatch:
             server._ledger = IndependentEffectLedger()
             server._ledger.record_authorization("t", "n", frozenset({"a"}), source="test")
 
-            resp = server._dispatch({
-                "kind": "RECORD_OBSERVATION",
-                "payload": {"task_id": "t", "nonce": "n", "observed_targets": ["a"], "source": "test"},  # noqa: E501
-            })
+            resp = server._dispatch(
+                {
+                    "kind": "RECORD_OBSERVATION",
+                    "payload": {
+                        "task_id": "t",
+                        "nonce": "n",
+                        "observed_targets": ["a"],
+                        "source": "test",
+                    },  # noqa: E501
+                }
+            )
             assert resp["ok"] is True
             assert server._ledger.observation_count == 1
 
@@ -194,10 +202,12 @@ class TestLedgerProcessServerDispatch:
             server._ledger.record_authorization("t", "n", frozenset({"a"}), source="test")
             server._ledger.record_observation("t", "n", frozenset({"a"}), source="test")
 
-            resp = server._dispatch({
-                "kind": "VERIFY",
-                "payload": {"task_id": "t", "nonce": "n"},
-            })
+            resp = server._dispatch(
+                {
+                    "kind": "VERIFY",
+                    "payload": {"task_id": "t", "nonce": "n"},
+                }
+            )
             assert resp["ok"] is True
             assert resp["result"] == "CONFIRMED_COMMITTED"
 
@@ -208,10 +218,12 @@ class TestLedgerProcessServerDispatch:
             server._ledger.record_authorization("t", "n", frozenset({"a"}), source="test")
             # No observation
 
-            resp = server._dispatch({
-                "kind": "VERIFY",
-                "payload": {"task_id": "t", "nonce": "n"},
-            })
+            resp = server._dispatch(
+                {
+                    "kind": "VERIFY",
+                    "payload": {"task_id": "t", "nonce": "n"},
+                }
+            )
             assert resp["ok"] is True
             # ledger returns "authorized_not_observed" reason (not "NO_OBSERVATION")
             assert resp["result"] == {
@@ -227,15 +239,17 @@ class TestLedgerProcessServerDispatch:
             server._ledger.record_authorization("t2", "n2", frozenset({"b"}), source="test")
             server._ledger.record_observation("t1", "n1", frozenset({"a"}), source="test")
 
-            resp = server._dispatch({
-                "kind": "VERIFY_ALL",
-                "payload": {
-                    "records": {
-                        "t1$n1": ["a"],
-                        "t2$n2": ["b"],
-                    }
-                },
-            })
+            resp = server._dispatch(
+                {
+                    "kind": "VERIFY_ALL",
+                    "payload": {
+                        "records": {
+                            "t1$n1": ["a"],
+                            "t2$n2": ["b"],
+                        }
+                    },
+                }
+            )
             assert resp["ok"] is True
             # verify_all returns UNKNOWN(...) strings (not bare nonce)
             assert resp["result"] == [
@@ -248,10 +262,12 @@ class TestLedgerProcessServerDispatch:
             server._ledger = IndependentEffectLedger()
             server._ledger.record_authorization("t", "n", frozenset({"a", "b"}), source="test")
 
-            resp = server._dispatch({
-                "kind": "GET_ENTRIES",
-                "payload": {"task_id": "t", "nonce": "n"},
-            })
+            resp = server._dispatch(
+                {
+                    "kind": "GET_ENTRIES",
+                    "payload": {"task_id": "t", "nonce": "n"},
+                }
+            )
             assert resp["ok"] is True
             entries = resp["result"]
             assert len(entries) == 1
@@ -290,10 +306,12 @@ class TestLedgerProcessServerDispatch:
 
             # KeyError propagates from LedgerRequest[invalid] and is caught
             # by server's _handle -> returns error dict
-            resp = server._dispatch({
-                "kind": "DOES_NOT_EXIST",
-                "payload": {},
-            })
+            resp = server._dispatch(
+                {
+                    "kind": "DOES_NOT_EXIST",
+                    "payload": {},
+                }
+            )
             # The server catches all exceptions and returns error response
             assert resp["ok"] is False
             assert "DOES_NOT_EXIST" in resp["error"]
@@ -394,12 +412,8 @@ class TestProcessLedgerClientIntegration:
             assert client.authorization_count() == 1
             assert client.observation_count() == 1
 
-            client.record_authorization(
-                "task2", "nonce2", frozenset({"file:///b"}), source="test"
-            )
-            client.record_observation(
-                "task2", "nonce2", frozenset({"file:///b"}), source="test"
-            )
+            client.record_authorization("task2", "nonce2", frozenset({"file:///b"}), source="test")
+            client.record_observation("task2", "nonce2", frozenset({"file:///b"}), source="test")
             assert client.authorization_count() == 2
             assert client.observation_count() == 2
             assert client.verify("task2", "nonce2") == LedgerVerdict.CONFIRMED_COMMITTED

@@ -393,18 +393,27 @@ class TestApprovalExactBinding:
         assert evidence["primary_blocker"] == "ApprovalBinding"
         assert "cross-task-use" in evidence["approval_binding"]
 
-    def test_approval_content_hash_removed_binding_is_label_only(self) -> None:
-        """Binding no longer covers content_hash — content changes are NOT a binding
-        issue. Binding covers etype + target + additional + task_id only.
-        Provenance/integrity is enforced by FlowOK at commit time."""
+    def test_approval_content_hash_is_now_part_of_binding(self) -> None:
+        """Binding now covers content_hash — content changes ARE blocked.
+
+        Binding covers: etype + target + additional + task_id + content_hash.
+        This prevents the attack where tool modifies content after approval.
+        """
         from dataclasses import fields
 
         field_names = {f.name for f in fields(ApprovedRequest)}
-        assert (
-            "content_hash" not in field_names
-        ), "content_hash must be removed from ApprovedRequest binding"
-        # Verify the binding fields that DO exist
-        assert field_names >= {"nonce", "etype", "targets", "expiry", "task_id", "granted_by"}
+        # content_hash is now part of the immutable binding
+        assert "content_hash" in field_names, "content_hash must be in ApprovedRequest binding"
+        # Verify all binding fields exist
+        assert field_names >= {
+            "nonce",
+            "etype",
+            "targets",
+            "expiry",
+            "task_id",
+            "granted_by",
+            "content_hash",
+        }
 
     def test_approval_allows_with_exact_binding_match(self) -> None:
         """Exact match: etype + target + task_id → ALLOW."""

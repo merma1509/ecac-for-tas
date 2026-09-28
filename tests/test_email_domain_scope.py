@@ -34,6 +34,7 @@ from effect_broker.traces import build
 
 def _provenance(name: str, content: str = "") -> tuple[Data, ...]:
     from effect_broker.lattice import Confidentiality, Integrity
+
     return (Data(name, Confidentiality.INTERNAL, Integrity.USER, content=content),)
 
 
@@ -158,9 +159,7 @@ class TestEmailDomainScopeFix:
         )
         allow, ev = broker.commit(Commit(effect, task))
 
-        assert allow is True, (
-            f"BCC to same-domain recipient should ALLOW. Evidence: {ev}"
-        )
+        assert allow is True, f"BCC to same-domain recipient should ALLOW. Evidence: {ev}"
         assert ev["primary_blocker"] is None
 
     def test_bcc_different_domain_outside_scope_blocked(self) -> None:
@@ -231,7 +230,9 @@ class TestEmailDomainScopeFix:
 
         # Non-email targets pass through unchanged
         assert broker._scope_label_for_target("file:///reports") == "file:///reports"
-        assert broker._scope_label_for_target("http://internal.corp.com") == "http://internal.corp.com"
+        assert (
+            broker._scope_label_for_target("http://internal.corp.com") == "http://internal.corp.com"
+        )
 
         # Plain target (no @) → pass through
         assert broker._scope_label_for_target("secret-key") == "secret-key"
@@ -280,9 +281,7 @@ class TestEmailDomainScopeFix:
             f"Domain scope fix broke concurrent commits! Results: {results}"
         )
 
-        fresh_blocked = sum(
-            1 for _, allow, blocker in results if not allow and blocker == "Fresh"
-        )
+        fresh_blocked = sum(1 for _, allow, blocker in results if not allow and blocker == "Fresh")
         assert fresh_blocked == 4, f"Expected 4 Fresh blocks, got {fresh_blocked}"
 
     def test_approval_with_email_and_domain_scope(self) -> None:
@@ -311,8 +310,7 @@ class TestEmailDomainScopeFix:
         cap = broker.capabilities.get(nonce)
         assert cap is not None
         assert cap.scope == frozenset({"internal"}), (
-            f"Approval capability scope should be domain-level {{'internal'}}, "
-            f"got {cap.scope}"
+            f"Approval capability scope should be domain-level {{'internal'}}, got {cap.scope}"
         )
 
         # Commit the approved effect

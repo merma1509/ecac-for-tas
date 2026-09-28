@@ -42,9 +42,7 @@ def broker_with_files(tmp_path: Path) -> tuple[Any, Path, Any]:
     (tmp_path / "public.txt").write_text("public content")
     (tmp_path / "confidential.txt").write_text("secret content")
 
-    b.store._unsafe_bootstrap_file(
-        f"file://{tmp_path}/public.txt", Confidentiality.PUBLIC
-    )
+    b.store._unsafe_bootstrap_file(f"file://{tmp_path}/public.txt", Confidentiality.PUBLIC)
     b.store._unsafe_bootstrap_file(
         f"file://{tmp_path}/confidential.txt", Confidentiality.CONFIDENTIAL
     )
@@ -148,6 +146,7 @@ class TestRealProvenanceSubprocess:
 
             # Flat response: content is directly in result
             import base64
+
             assert result.get("content") == base64.b64encode(test_content).decode()
         finally:
             server.stop()
@@ -205,9 +204,7 @@ class TestRealProvenanceSubprocess:
         test_file.chmod(0o600)
         # Use .resolve() for the URI so scope label matches canonical path
         resolved_path = str(test_file.resolve())
-        broker.store._unsafe_bootstrap_file(
-            f"file://{resolved_path}", Confidentiality.CONFIDENTIAL
-        )
+        broker.store._unsafe_bootstrap_file(f"file://{resolved_path}", Confidentiality.CONFIDENTIAL)
 
         shim = RealFileShim(broker, task_id="mode-test", tool_name="mode-tool")
 
@@ -440,9 +437,7 @@ class TestProvenanceMultiProcess:
 class TestProvenanceImmutability:
     """Tests that provenance is set by shim, not tool/LLM."""
 
-    def test_provenance_set_by_shim_not_by_tool_claims(
-        self, broker_with_files
-    ) -> None:  # type: ignore[type]
+    def test_provenance_set_by_shim_not_by_tool_claims(self, broker_with_files) -> None:  # type: ignore[type]
         """Tool-provided metadata is ignored; shim sets provenance from real OS.
 
         The tool cannot forge provenance labels. The shim reads real OS metadata
@@ -468,9 +463,7 @@ class TestProvenanceImmutability:
         assert "provenance-all" in op.nonce
         assert "|read|" in op.nonce
 
-    def test_llm_cannot_override_provenance_confidentiality(
-        self, broker_with_files
-    ) -> None:  # type: ignore[type]
+    def test_llm_cannot_override_provenance_confidentiality(self, broker_with_files) -> None:  # type: ignore[type]
         """LLM cannot claim PUBLIC for a CONFIDENTIAL file.
 
         The shim reads real file metadata and derives labels. LLM has no way

@@ -9,6 +9,8 @@ authors = [{ name = "Niyonshuti Martin" }]
 keywords = ["agent-security", "tool-agents", "authority", "information-flow", "capabilities", "mcp"]
 
 dependencies = [
+    "agentdojo>=0.1.35",
+    "aiosmtpd>=1.4",
     "pytest-asyncio>=1.4.0",
 ]
 
@@ -17,7 +19,6 @@ dev = [
     "pytest>=8.0",
     "mypy>=1.10",
     "ruff>=0.6",
-    "aiosmtpd>=1.4",
 ]
 
 [build-system]
@@ -36,6 +37,7 @@ asyncio_mode = "auto"
 python_version = "3.11"
 strict = true
 packages = ["effect_broker"]
+exclude = ["effect_broker/baselines/"]
 
 [tool.ruff]
 line-length = 100
@@ -48,5 +50,6 @@ select = ["E", "F", "I", "W", "UP", "B", "C4"]
 dev = [
     "aiosmtpd>=1.4.6",
     "mypy>=2.3.1",
+    "pyflakes>=4.0.0",
     "pytest>=9.1.1",
 ]

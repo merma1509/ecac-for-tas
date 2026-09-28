@@ -157,7 +157,11 @@ class TestSubprocessExecutorRoundTrip:
         assert allow is False, "Effect with non-matching target should be blocked"
         assert evidence["allow"] is False
         assert evidence["primary_blocker"] in (
-            "Auth", "NoAmp", "task-bounded-fail", "target-mismatch", "bottom-scoping-violation"
+            "Auth",
+            "NoAmp",
+            "task-bounded-fail",
+            "target-mismatch",
+            "bottom-scoping-violation",
         )
 
     def test_ledger_records_authorization_and_observation(self) -> None:
@@ -260,10 +264,9 @@ class TestSubprocessExecutorRoundTrip:
 
         # Socket should be removed after shutdown
         import time
+
         time.sleep(0.3)
-        assert not exec_sock.exists(), (
-            "Executor socket should be removed after shutdown"
-        )
+        assert not exec_sock.exists(), "Executor socket should be removed after shutdown"
 
     def test_shutdown_is_idempotent(self) -> None:
         """Calling shutdown() multiple times should not raise."""
@@ -385,8 +388,12 @@ class TestSameProcessVsMultiProcessEquivalence:
         # Register file in both stores. RestrictedResourceStore requires
         # pre-registration (no auto-create). IsolatedStore auto-creates but
         # registering is fine for consistency.
-        same_process_broker.store._unsafe_bootstrap_file("file:///equiv/test.txt", Confidentiality.PUBLIC)  # noqa: E501
-        multi_process_broker.store._unsafe_bootstrap_file("file:///equiv/test.txt", Confidentiality.PUBLIC)  # noqa: E501
+        same_process_broker.store._unsafe_bootstrap_file(
+            "file:///equiv/test.txt", Confidentiality.PUBLIC
+        )  # noqa: E501
+        multi_process_broker.store._unsafe_bootstrap_file(
+            "file:///equiv/test.txt", Confidentiality.PUBLIC
+        )  # noqa: E501
 
         task_same = Task(
             task_id="equiv-task",
@@ -495,12 +502,14 @@ class TestSameProcessVsMultiProcessEquivalence:
 
         # Set up ToolRegistry in strict mode on the multi-process broker
         multi_process_broker.set_tool_registry(strict=True)
-        multi_process_broker.tool_registry.declare(ToolDeclaration(
-            tool_name="file_reader",
-            declared_rights=frozenset({"read"}),  # Only read — NOT write
-            declared_targets=frozenset({"file:///reports"}),
-            description="Read-only file access",
-        ))
+        multi_process_broker.tool_registry.declare(
+            ToolDeclaration(
+                tool_name="file_reader",
+                declared_rights=frozenset({"read"}),  # Only read — NOT write
+                declared_targets=frozenset({"file:///reports"}),
+                description="Read-only file access",
+            )
+        )
 
         multi_process_broker.store._unsafe_bootstrap_file(
             "file:///reports", Confidentiality.INTERNAL
@@ -609,9 +618,7 @@ class TestSameProcessVsMultiProcessEquivalence:
             etype="read",
             target="file:///secrets",
             metadata={},
-            provenance=(
-                Data("content", Confidentiality.CONFIDENTIAL, Integrity.USER),
-            ),
+            provenance=(Data("content", Confidentiality.CONFIDENTIAL, Integrity.USER),),
             capability_nonce="cap-read-secrets",
             delegation_chain=(),
             task_id="composition-test",

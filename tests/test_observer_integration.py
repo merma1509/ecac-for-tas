@@ -23,8 +23,13 @@ def _make_broker() -> tuple:
 
 def _make_task(broker, task_id="obs-task") -> Task:
     ceiling = Capability(
-        owner="User", holder="EffectBroker", right="*", target="*",
-        scope=frozenset({"*"}), expiry=float("inf"), nonce=f"ceil-{task_id}",
+        owner="User",
+        holder="EffectBroker",
+        right="*",
+        target="*",
+        scope=frozenset({"*"}),
+        expiry=float("inf"),
+        nonce=f"ceil-{task_id}",
     )
     task = Task(task_id=task_id, owner="User", ceiling=ceiling)
     broker.register_task(task)
@@ -39,13 +44,19 @@ class TestObserverCompleteMediation:
         task = _make_task(broker)
 
         broker.capabilities["obs-write"] = Capability(
-            owner="User", holder="EffectBroker", right="write",
-            target="file:///reports", scope=frozenset({"file:///reports"}),
-            expiry=float("inf"), nonce="obs-write",
+            owner="User",
+            holder="EffectBroker",
+            right="write",
+            target="file:///reports",
+            scope=frozenset({"file:///reports"}),
+            expiry=float("inf"),
+            nonce="obs-write",
         )
 
         effect = Effect(
-            etype="write", target="file:///reports", metadata={},
+            etype="write",
+            target="file:///reports",
+            metadata={},
             provenance=(Data("test", Confidentiality.INTERNAL, Integrity.USER),),
             capability_nonce="obs-write",
             delegation_chain=(),
@@ -73,12 +84,17 @@ class TestObserverCompleteMediation:
 
         # Record only authorization (no actual commit = no executor path)
         broker.ledger.record_authorization(
-            task.task_id, nonce, frozenset({"file:///reports"}), source="broker.gate",
+            task.task_id,
+            nonce,
+            frozenset({"file:///reports"}),
+            source="broker.gate",
         )
         # No observation -> direct bypass simulation
 
         effect = Effect(
-            etype="write", target="file:///reports", metadata={},
+            etype="write",
+            target="file:///reports",
+            metadata={},
             provenance=(Data("test", Confidentiality.INTERNAL, Integrity.USER),),
             capability_nonce="obs-bypass",
             delegation_chain=(),
@@ -103,7 +119,9 @@ class TestObserverCompleteMediation:
         task = _make_task(broker)
 
         effect = Effect(
-            etype="write", target="file:///secrets", metadata={},
+            etype="write",
+            target="file:///secrets",
+            metadata={},
             provenance=(Data("test", Confidentiality.CONFIDENTIAL, Integrity.UNTRUSTED),),
             capability_nonce="obs-no-cap",
             delegation_chain=(),
@@ -131,11 +149,16 @@ class TestObserverUnknownNotSafeInvariant:
 
         # Auth-only record (simulates ledger unknown)
         broker.ledger.record_authorization(
-            task.task_id, nonce, frozenset({"file:///reports"}), source="broker.gate",
+            task.task_id,
+            nonce,
+            frozenset({"file:///reports"}),
+            source="broker.gate",
         )
 
         effect = Effect(
-            etype="write", target="file:///reports", metadata={},
+            etype="write",
+            target="file:///reports",
+            metadata={},
             provenance=(Data("test", Confidentiality.INTERNAL, Integrity.USER),),
             capability_nonce="obs-unknown",
             delegation_chain=(),
@@ -163,15 +186,24 @@ class TestObserverEmailSend:
         broker.store._unsafe_bootstrap_email("attacker@external.com", "EXTERNAL")
 
         task = Task(
-            task_id="bcc-obs", owner="User",
-            ceiling=Capability(owner="User", holder="EffectBroker", right="send",
-                               target="*", scope=frozenset({"corp.com"}),
-                               expiry=float("inf"), nonce="bcc-obs-ceil"),
+            task_id="bcc-obs",
+            owner="User",
+            ceiling=Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="*",
+                scope=frozenset({"corp.com"}),
+                expiry=float("inf"),
+                nonce="bcc-obs-ceil",
+            ),
         )
         broker.register_task(task)
 
         effect = Effect(
-            etype="send", target="alice@corp.com", metadata={},
+            etype="send",
+            target="alice@corp.com",
+            metadata={},
             provenance=(Data("test", Confidentiality.INTERNAL, Integrity.USER),),
             capability_nonce="bcc-obs",
             delegation_chain=(),
@@ -211,19 +243,29 @@ class TestObserverBypassDetection:
 
         # Record auth (1)
         broker.ledger.record_authorization(
-            task.task_id, nonce, frozenset({"file:///reports"}), source="broker.gate",
+            task.task_id,
+            nonce,
+            frozenset({"file:///reports"}),
+            source="broker.gate",
         )
         # Record 2 observations (over-observed) -- committed entries
         broker.ledger.record_observation(
-            task.task_id, nonce, frozenset({"file:///reports"}),
+            task.task_id,
+            nonce,
+            frozenset({"file:///reports"}),
             source="executor.execute",
         )
         broker.ledger.record_observation(
-            task.task_id, nonce, frozenset({"file:///reports"}),
+            task.task_id,
+            nonce,
+            frozenset({"file:///reports"}),
             source="executor.execute",
         )
 
         ledger_verdict = broker.ledger.verify(task.task_id, nonce)
-        assert isinstance(ledger_verdict, UnknownLedgerResult) and "over-observed" in ledger_verdict.reason, (  # noqa: E501
+        assert (
+            isinstance(ledger_verdict, UnknownLedgerResult)
+            and "over-observed" in ledger_verdict.reason
+        ), (  # noqa: E501
             f"Over-observed (auth=1, obs=2) must produce UNKNOWN(over-observed), got {ledger_verdict}"  # noqa: E501
         )

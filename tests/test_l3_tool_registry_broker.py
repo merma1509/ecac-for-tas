@@ -3,6 +3,7 @@
 This test verifies that T14 (hidden side effect) is blocked at the broker level
 via the ToolRegistry structural enforcement layer in gate().
 """
+
 from effect_broker.broker import EffectBroker
 from effect_broker.lattice import Confidentiality, Integrity
 from effect_broker.ledger import IndependentEffectLedger
@@ -30,12 +31,14 @@ class TestL3ToolRegistryBrokerIntegration:
         broker = EffectBroker(ledger=ledger)
         broker.set_tool_registry(strict=True)
 
-        broker.tool_registry.declare(ToolDeclaration(
-            tool_name="file_reader",
-            declared_rights=frozenset({"read"}),
-            declared_targets=frozenset({"file:///reports"}),
-            description="Read-only file access",
-        ))
+        broker.tool_registry.declare(
+            ToolDeclaration(
+                tool_name="file_reader",
+                declared_rights=frozenset({"read"}),
+                declared_targets=frozenset({"file:///reports"}),
+                description="Read-only file access",
+            )
+        )
 
         broker.store._unsafe_bootstrap_file("file:///reports", Confidentiality.INTERNAL)
 
@@ -43,9 +46,13 @@ class TestL3ToolRegistryBrokerIntegration:
             task_id="t14-attack",
             owner="User",
             ceiling=Capability(
-                owner="User", holder="file_reader", right="read",
-                target="file:///reports", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce="cap-read-reports",
+                owner="User",
+                holder="file_reader",
+                right="read",
+                target="file:///reports",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="cap-read-reports",
             ),
         )
         broker.tasks[task.task_id] = task
@@ -75,28 +82,40 @@ class TestL3ToolRegistryBrokerIntegration:
         broker = EffectBroker(ledger=ledger)
         broker.set_tool_registry(strict=True)
 
-        broker.tool_registry.declare(ToolDeclaration(
-            tool_name="file_reader",
-            declared_rights=frozenset({"read"}),
-            declared_targets=frozenset({"file:///reports"}),
-            description="Read-only file access",
-        ))
+        broker.tool_registry.declare(
+            ToolDeclaration(
+                tool_name="file_reader",
+                declared_rights=frozenset({"read"}),
+                declared_targets=frozenset({"file:///reports"}),
+                description="Read-only file access",
+            )
+        )
 
         broker.store._unsafe_bootstrap_file("file:///reports", Confidentiality.INTERNAL)
 
-        broker.grant_root(Capability(
-            owner="User", holder="EffectBroker", right="read",
-            target="file:///reports", scope=frozenset({"*"}),
-            expiry=float("inf"), nonce="cap-read",
-        ))
+        broker.grant_root(
+            Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="read",
+                target="file:///reports",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="cap-read",
+            )
+        )
 
         task = Task(
             task_id="legitimate-read",
             owner="User",
             ceiling=Capability(
-                owner="User", holder="EffectBroker", right="read",
-                target="file:///reports", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce="cap-read",
+                owner="User",
+                holder="EffectBroker",
+                right="read",
+                target="file:///reports",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="cap-read",
             ),
         )
         broker.tasks[task.task_id] = task
@@ -123,19 +142,29 @@ class TestL3ToolRegistryBrokerIntegration:
 
         broker.store._unsafe_bootstrap_file("file:///docs", Confidentiality.INTERNAL)
 
-        broker.grant_root(Capability(
-            owner="User", holder="EffectBroker", right="read",
-            target="file:///docs", scope=frozenset({"*"}),
-            expiry=float("inf"), nonce="cap-read",
-        ))
+        broker.grant_root(
+            Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="read",
+                target="file:///docs",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="cap-read",
+            )
+        )
 
         task = Task(
             task_id="unknown-tool",
             owner="User",
             ceiling=Capability(
-                owner="User", holder="EffectBroker", right="read",
-                target="file:///docs", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce="cap-read",
+                owner="User",
+                holder="EffectBroker",
+                right="read",
+                target="file:///docs",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="cap-read",
             ),
         )
         broker.tasks[task.task_id] = task
@@ -164,19 +193,29 @@ class TestL3ToolRegistryBrokerIntegration:
 
         broker.store._unsafe_bootstrap_file("file:///docs", Confidentiality.INTERNAL)
 
-        broker.grant_root(Capability(
-            owner="User", holder="EffectBroker", right="read",
-            target="file:///docs", scope=frozenset({"*"}),
-            expiry=float("inf"), nonce="cap-read",
-        ))
+        broker.grant_root(
+            Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="read",
+                target="file:///docs",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="cap-read",
+            )
+        )
 
         task = Task(
             task_id="permissive-task",
             owner="User",
             ceiling=Capability(
-                owner="User", holder="EffectBroker", right="read",
-                target="file:///docs", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce="cap-read",
+                owner="User",
+                holder="EffectBroker",
+                right="read",
+                target="file:///docs",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="cap-read",
             ),
         )
         broker.tasks[task.task_id] = task
@@ -201,29 +240,41 @@ class TestL3ToolRegistryBrokerIntegration:
         broker = EffectBroker(ledger=ledger)
         broker.set_tool_registry(strict=True)
 
-        broker.tool_registry.declare(ToolDeclaration(
-            tool_name="safe_sender",
-            declared_rights=frozenset({"send"}),
-            declared_targets=frozenset({"internal@corp.com"}),
-            description="Send to internal recipients only",
-        ))
+        broker.tool_registry.declare(
+            ToolDeclaration(
+                tool_name="safe_sender",
+                declared_rights=frozenset({"send"}),
+                declared_targets=frozenset({"internal@corp.com"}),
+                description="Send to internal recipients only",
+            )
+        )
 
         broker.store._unsafe_bootstrap_email("internal@corp.com", Domain.INTERNAL)
         broker.store._unsafe_bootstrap_email("attacker@evil.com", Domain.EXTERNAL)
 
-        broker.grant_root(Capability(
-            owner="User", holder="EffectBroker", right="send",
-            target="internal@corp.com", scope=frozenset({"*"}),
-            expiry=float("inf"), nonce="cap-send",
-        ))
+        broker.grant_root(
+            Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="cap-send",
+            )
+        )
 
         task = Task(
             task_id="bcc-attack",
             owner="User",
             ceiling=Capability(
-                owner="User", holder="EffectBroker", right="send",
-                target="internal@corp.com", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce="cap-send",
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="cap-send",
             ),
         )
         broker.tasks[task.task_id] = task
@@ -260,19 +311,29 @@ class TestL4SendRateLimiting:
 
         # Grant capabilities for all 3 sends
         for i in range(3):
-            broker.grant_root(Capability(
-                owner="User", holder="EffectBroker", right="send",
-                target="internal@corp.com", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce=f"send-cap-{i}",
-            ))
+            broker.grant_root(
+                Capability(
+                    owner="User",
+                    holder="EffectBroker",
+                    right="send",
+                    target="internal@corp.com",
+                    scope=frozenset({"*"}),
+                    expiry=float("inf"),
+                    nonce=f"send-cap-{i}",
+                )
+            )
 
         task = Task(
             task_id="rate-limit-test",
             owner="User",
             ceiling=Capability(
-                owner="User", holder="EffectBroker", right="send",
-                target="internal@corp.com", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce="send-cap",
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="send-cap",
             ),
         )
         broker.register_task(task)
@@ -281,15 +342,25 @@ class TestL4SendRateLimiting:
         for i in range(3):
             # Grant capability for each send (or use unique nonce)
             cap_nonce = f"send-cap-{i}"
-            broker.grant_root(Capability(
-                owner="User", holder="EffectBroker", right="send",
-                target="internal@corp.com", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce=cap_nonce,
-            ))
+            broker.grant_root(
+                Capability(
+                    owner="User",
+                    holder="EffectBroker",
+                    right="send",
+                    target="internal@corp.com",
+                    scope=frozenset({"*"}),
+                    expiry=float("inf"),
+                    nonce=cap_nonce,
+                )
+            )
             task.ceiling = Capability(
-                owner="User", holder="EffectBroker", right="send",
-                target="internal@corp.com", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce=cap_nonce,
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce=cap_nonce,
             )
             effect = Effect(
                 "send",
@@ -301,7 +372,7 @@ class TestL4SendRateLimiting:
             )
             commit = Commit(effect, task)
             allow, _ = broker.commit(commit)
-            assert allow is True, f"Send {i+1} should ALLOW"
+            assert allow is True, f"Send {i + 1} should ALLOW"
 
     def test_send_exceeding_rate_limit_blocks(self) -> None:
         """Send exceeding max_sends limit should BLOCK."""
@@ -313,19 +384,29 @@ class TestL4SendRateLimiting:
 
         # Grant capabilities for all 3 sends
         for i in range(3):
-            broker.grant_root(Capability(
-                owner="User", holder="EffectBroker", right="send",
-                target="internal@corp.com", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce=f"send-cap-{i}",
-            ))
+            broker.grant_root(
+                Capability(
+                    owner="User",
+                    holder="EffectBroker",
+                    right="send",
+                    target="internal@corp.com",
+                    scope=frozenset({"*"}),
+                    expiry=float("inf"),
+                    nonce=f"send-cap-{i}",
+                )
+            )
 
         task = Task(
             task_id="rate-limit-block",
             owner="User",
             ceiling=Capability(
-                owner="User", holder="EffectBroker", right="send",
-                target="internal@corp.com", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce="send-cap-0",
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="send-cap-0",
             ),
         )
         broker.register_task(task)
@@ -334,9 +415,13 @@ class TestL4SendRateLimiting:
         for i in range(2):
             cap_nonce = f"send-cap-{i}"
             task.ceiling = Capability(
-                owner="User", holder="EffectBroker", right="send",
-                target="internal@corp.com", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce=cap_nonce,
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce=cap_nonce,
             )
             effect = Effect(
                 "send",
@@ -348,14 +433,20 @@ class TestL4SendRateLimiting:
             )
             commit = Commit(effect, task)
             allow, _ = broker.commit(commit)
-            assert allow is True, f"Send {i+1} should ALLOW"
+            assert allow is True, f"Send {i + 1} should ALLOW"
 
         # 3rd send: update ceiling for fresh nonce, use separate nonce for rate limit
-        broker.grant_root(Capability(
-            owner="User", holder="EffectBroker", right="send",
-            target="internal@corp.com", scope=frozenset({"*"}),
-            expiry=float("inf"), nonce="send-cap-limit",
-        ))
+        broker.grant_root(
+            Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="send-cap-limit",
+            )
+        )
 
         # 3rd send should BLOCK by rate limit (capability already granted)
         effect = Effect(
@@ -379,20 +470,30 @@ class TestL4SendRateLimiting:
 
         broker.store._unsafe_bootstrap_email("internal@corp.com", Domain.INTERNAL)
 
-        broker.grant_root(Capability(
-            owner="User", holder="EffectBroker", right="send",
-            target="internal@corp.com", scope=frozenset({"*"}),
-            expiry=float("inf"), nonce="send-cap",
-        ))
+        broker.grant_root(
+            Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="send-cap",
+            )
+        )
 
         # Task 1: max 1 send
         task1 = Task(
             task_id="session-1",
             owner="User",
             ceiling=Capability(
-                owner="User", holder="EffectBroker", right="send",
-                target="internal@corp.com", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce="send-cap",
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="send-cap",
             ),
         )
         broker.register_task(task1)
@@ -402,44 +503,81 @@ class TestL4SendRateLimiting:
             task_id="session-2",
             owner="User",
             ceiling=Capability(
-                owner="User", holder="EffectBroker", right="send",
-                target="internal@corp.com", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce="send-cap",
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="send-cap",
             ),
         )
         broker.register_task(task2)
 
         # Task 1: 1 send OK, 2nd BLOCKed
-        broker.grant_root(Capability(
-            owner="User", holder="EffectBroker", right="send",
-            target="internal@corp.com", scope=frozenset({"*"}),
-            expiry=float("inf"), nonce="task1-send-1",
-        ))
-        broker.grant_root(Capability(
-            owner="User", holder="EffectBroker", right="send",
-            target="internal@corp.com", scope=frozenset({"*"}),
-            expiry=float("inf"), nonce="task1-send-2",
-        ))
-        effect1 = Effect("send", "internal@corp.com", {},
-                       (Data("msg1", Confidentiality.INTERNAL, Integrity.USER),),
-                       "task1-send-1", CHAIN)
-        effect2 = Effect("send", "internal@corp.com", {},
-                       (Data("msg2", Confidentiality.INTERNAL, Integrity.USER),),
-                       "task1-send-2", CHAIN)
+        broker.grant_root(
+            Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="task1-send-1",
+            )
+        )
+        broker.grant_root(
+            Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="task1-send-2",
+            )
+        )
+        effect1 = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("msg1", Confidentiality.INTERNAL, Integrity.USER),),
+            "task1-send-1",
+            CHAIN,
+        )
+        effect2 = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("msg2", Confidentiality.INTERNAL, Integrity.USER),),
+            "task1-send-2",
+            CHAIN,
+        )
         allow1, _ = broker.commit(Commit(effect1, task1))
         allow2, _ = broker.commit(Commit(effect2, task1))
         assert allow1 is True
         assert allow2 is False
 
         # Task 2: fresh session, starts fresh
-        broker.grant_root(Capability(
-            owner="User", holder="EffectBroker", right="send",
-            target="internal@corp.com", scope=frozenset({"*"}),
-            expiry=float("inf"), nonce="task2-send-1",
-        ))
-        effect3 = Effect("send", "internal@corp.com", {},
-                       (Data("msg3", Confidentiality.INTERNAL, Integrity.USER),),
-                       "task2-send-1", CHAIN)
+        broker.grant_root(
+            Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="task2-send-1",
+            )
+        )
+        effect3 = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("msg3", Confidentiality.INTERNAL, Integrity.USER),),
+            "task2-send-1",
+            CHAIN,
+        )
         allow3, _ = broker.commit(Commit(effect3, task2))
         assert allow3 is True, "Task 2 should have fresh send count"
 
@@ -453,19 +591,29 @@ class TestL4SendRateLimiting:
 
         # Grant capabilities for all 3 sends
         for i in range(3):
-            broker.grant_root(Capability(
-                owner="User", holder="EffectBroker", right="send",
-                target="internal@corp.com", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce=f"send-cap-{i}",
-            ))
+            broker.grant_root(
+                Capability(
+                    owner="User",
+                    holder="EffectBroker",
+                    right="send",
+                    target="internal@corp.com",
+                    scope=frozenset({"*"}),
+                    expiry=float("inf"),
+                    nonce=f"send-cap-{i}",
+                )
+            )
 
         task = Task(
             task_id="unlimited-test",
             owner="User",
             ceiling=Capability(
-                owner="User", holder="EffectBroker", right="send",
-                target="internal@corp.com", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce="send-cap",
+                owner="User",
+                holder="EffectBroker",
+                right="send",
+                target="internal@corp.com",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="send-cap",
             ),
         )
         broker.register_task(task)
@@ -473,11 +621,17 @@ class TestL4SendRateLimiting:
         # Many sends should all ALLOW (each needs unique nonce for Fresh)
         for i in range(10):
             cap_nonce = f"send-cap-{i}"
-            broker.grant_root(Capability(
-                owner="User", holder="EffectBroker", right="send",
-                target="internal@corp.com", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce=cap_nonce,
-            ))
+            broker.grant_root(
+                Capability(
+                    owner="User",
+                    holder="EffectBroker",
+                    right="send",
+                    target="internal@corp.com",
+                    scope=frozenset({"*"}),
+                    expiry=float("inf"),
+                    nonce=cap_nonce,
+                )
+            )
             effect = Effect(
                 "send",
                 "internal@corp.com",
@@ -488,4 +642,4 @@ class TestL4SendRateLimiting:
             )
             commit = Commit(effect, task)
             allow, _ = broker.commit(commit)
-            assert allow is True, f"Send {i+1} should ALLOW with unlimited rate"
+            assert allow is True, f"Send {i + 1} should ALLOW with unlimited rate"

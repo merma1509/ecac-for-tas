@@ -292,6 +292,7 @@ class EffectBroker:
         ledger: LedgerSource = None,
         *,
         mode: str = "same-process",
+        production_safe: bool = False,
         executor_socket: str | Path = "/tmp/ecac-executor.sock",
         store_socket: str | Path = "/tmp/ecac-executor-store.sock",
     ) -> None:
@@ -303,11 +304,19 @@ class EffectBroker:
                   In multi-process mode, the broker runs in a separate process
                   from the executor's mutable store. State mutation happens in
                   the subprocess; the broker communicates via IPC only.
+            production_safe: if True, reject same-process mode and force multi-process.
+                            Use this for production deployments requiring isolation.
             executor_socket: Unix socket path for broker → executor IPC
                              (only used in multi-process mode)
             store_socket: Unix socket path for observer → executor store reads
                          (only used in multi-process mode)
         """
+        # Production safety check: refuse same-process mode if isolation required
+        if production_safe and mode == "same-process":
+            raise ValueError(
+                "SECURITY: EffectBroker(production_safe=True) cannot use same-process mode. "
+                "Direct store mutation bypasses authorization. Use mode='multi-process'."
+            )
         # Ledger backend (local or remote IPC). The ledger is the single
         # source of truth for mediation verdicts. Neither broker nor
         # executor can modify ledger entries after recording.
@@ -793,8 +802,7 @@ class EffectBroker:
 
         # Also store the ApprovedRequest for exact immutable request binding
         # (kill-criterion #5: complete identity must match).
-        # The binding covers etype, target set, and task_id.
-        # Provenance/integrity is checked by FlowOK, not the binding.
+        # The binding now covers etype, target set, task_id, AND content_hash.
         authorized_targets = effect.complete_targets()
         all_targets = authorized_targets
 
@@ -805,6 +813,7 @@ class EffectBroker:
             expiry=expiry,
             task_id=task_id,
             granted_by=APPROVER,
+            content_hash=effect.compute_content_hash(),  # A1 FIX: bind content hash
         )
         self._approved_requests: dict[str, ApprovedRequest] = getattr(
             self, "_approved_requests", {}
@@ -1430,26 +1439,23 @@ class EffectBroker:
         return self.commit(Commit(effect, task))
 
     def _make_commit(self, effect: Effect, task_id: TaskId = "default") -> Commit:
-        """Build a Commit from an effect and task_id (used by the shim)."""
+        """Build a Commit from an effect and task_id (used by the shim)
+
+        Fail-closed: task must be registered. No wildcard default task
+        """
         task = self.tasks.get(task_id)
         if task is None:
-            default_ceiling = Capability(
-                owner=USER,
-                holder=BROKER,
-                right="*",
-                target="*",
-                scope=frozenset({"*"}),
-                expiry=float("inf"),
-                nonce="default-ceiling",
+            raise ValueError(
+                f"task_id '{task_id}' is not registered. "
+                f"Register task first with broker.register_task() or use "
+                f"an existing task_id. Direct broker.commit() without a "
+                f"registered task is not allowed."
             )
-            task = Task(task_id=task_id, owner=USER, ceiling=default_ceiling)
-            self.tasks[task_id] = task
         return Commit(effect, task)
 
     # ---- Split commit gate (evaluation) from apply (state mutation) ----
     # This is the key separation for independent observer verification.
     # The executor calls gate() then (on can_apply=True) apply_effect().
-
     def gate(
         self,
         commit: Commit,
@@ -1477,21 +1483,15 @@ class EffectBroker:
         task = commit.task
 
         # Get or create task (same logic as commit())
+        # Fail-closed — task must be registered. No wildcard default task.
         if task is None:
             task = self.tasks.get("default")
             if task is None:
-                default_ceiling = Capability(
-                    owner=USER,
-                    holder=BROKER,
-                    right="*",
-                    target="*",
-                    scope=frozenset({"*"}),
-                    expiry=float("inf"),
-                    nonce="default-ceiling",
+                raise ValueError(
+                    "task=None requires a registered task. "
+                    "No default task exists. Register task first with "
+                    "broker.register_task() or ensure Commit.task is set."
                 )
-                task = Task(task_id="default", owner=USER, ceiling=default_ceiling)
-                self.tasks[task.task_id] = task
-                self._apply_send_rate_limit_to_session(task)
 
         assert task.session is not None, "Task must have a session (set by __post_init__)"
 
@@ -1591,6 +1591,7 @@ class EffectBroker:
         approval_binding_msg = ""
 
         # Approval binding: verify exact immutable request binding
+        # Now includes content_hash verification
         if allow and commit.approved_request is not None:
             stored = self._approved_requests.get(commit.approved_request.nonce)
 
@@ -1599,8 +1600,8 @@ class EffectBroker:
                 approval_binding_msg = f"approval-nonce-unknown({commit.approved_request.nonce})"
             else:
                 # ApprovalBinding checks: etype, target, additional recipients, task_id.
+                # Also checks content_hash for immutable binding.
                 # Provenance/integrity is checked by FlowOK at commit time.
-                # We do NOT bind to content values — that would break dynamic content.
                 # CRITICAL: use canonical complete_targets() — authoritative
                 # source for target set. Must match what grant_approval() stored.
                 current_additional = effect.complete_targets() - {effect.target}
@@ -1623,6 +1624,15 @@ class EffectBroker:
                 elif task.task_id != stored.task_id:
                     approval_binding_ok = False
                     approval_binding_msg = f"cross-task-use({task.task_id}!={stored.task_id})"
+                # Verify content_hash matches (prevents content modification after approval)
+                elif stored.content_hash is not None:
+                    current_hash = effect.compute_content_hash()
+                    if current_hash != stored.content_hash:
+                        approval_binding_ok = False
+                        approval_binding_msg = (
+                            f"content-hash-mismatch(approved={stored.content_hash[:16]}...,"
+                            f"got={current_hash[:16] if current_hash else 'N/A'}...)"
+                        )
 
             if not approval_binding_ok:
                 allow = False

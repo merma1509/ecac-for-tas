@@ -134,6 +134,7 @@ class TestSubprocessIsolation:
                 if os.path.exists(sock):
                     os.unlink(sock)
 
+
 class TestBrokerFactoryMethod:
     """Test broker.create_real_file_shim() and broker.create_real_email_shim()."""
 

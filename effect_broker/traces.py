@@ -25,7 +25,6 @@ from __future__ import annotations
 from collections.abc import Callable  # noqa: UP035  # used in type annotations
 
 from .broker import EffectBroker
-from .ipc import LocalLedgerBackend  # noqa: F401  # used as broker argument
 from .lattice import Confidentiality, Integrity
 from .ledger import IndependentEffectLedger
 from .mediation import Mediator, ToolSpec
@@ -39,6 +38,7 @@ from .model import (
     Domain,
     Effect,
     LabelException,
+    Task,
 )
 
 
@@ -69,6 +69,23 @@ def build() -> EffectBroker:
     # executor.execute() (via-shim) record to this same ledger
     ledger = IndependentEffectLedger()
     broker = EffectBroker(ledger=ledger)
+
+    # Register default task for backward compatibility
+    # This allows Commit(effect) without explicit task to work with a registered task.
+    default_task = Task(
+        task_id="default",
+        owner=USER,
+        ceiling=Capability(
+            owner=USER,
+            holder=BROKER,
+            right="*",
+            target="*",
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce="default-task-ceiling",
+        ),
+    )
+    broker.tasks["default"] = default_task
 
     # ---- external resources: R = F ∪ E ∪ M (files, emails, mailboxes) ----
     broker.store._unsafe_bootstrap_file("file:///reports", Confidentiality.INTERNAL)

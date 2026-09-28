@@ -23,6 +23,7 @@ from effect_broker.traces import build
 
 def _provenance(name: str) -> tuple[Data, ...]:
     from effect_broker.lattice import Confidentiality, Integrity
+
     return (Data(name, Confidentiality.INTERNAL, Integrity.USER),)
 
 
@@ -111,13 +112,9 @@ class TestConcurrentReplayPrevention:
         )
 
         # All others should be blocked by Fresh (replay)
-        fresh_blocked = sum(
-            1 for _, allow, blocker in results
-            if not allow and blocker == "Fresh"
-        )
+        fresh_blocked = sum(1 for _, allow, blocker in results if not allow and blocker == "Fresh")
         assert fresh_blocked == 9, (
-            f"Expected 9 Fresh blocks, got {fresh_blocked}. "
-            f"Results: {results}"
+            f"Expected 9 Fresh blocks, got {fresh_blocked}. Results: {results}"
         )
 
         # The single successful commit's nonce is in the used set
@@ -159,8 +156,7 @@ class TestConcurrentReplayPrevention:
         # All 10 should ALLOW (different nonces, different tasks)
         allow_count = sum(1 for _, allow, _ in results if allow)
         assert allow_count == num_tasks, (
-            f"Expected {num_tasks} ALLOWs, got {allow_count}. "
-            f"Results: {results}"
+            f"Expected {num_tasks} ALLOWs, got {allow_count}. Results: {results}"
         )
 
     def test_failed_gate_after_atomic_reservation_rolls_back(self) -> None:
@@ -209,7 +205,6 @@ class TestConcurrentReplayPrevention:
         assert ev2["primary_blocker"] == "Fresh"
         assert "replay" in ev2["predicates"]["Fresh"]
 
-
     def test_binding_covers_structure_not_content(self) -> None:
         """ApprovalBinding checks etype + targets + task_id only.
 
@@ -219,12 +214,11 @@ class TestConcurrentReplayPrevention:
 
         from effect_broker.lattice import Confidentiality, Integrity
 
-        # Verify content_hash is NOT in ApprovedRequest
+        # Verify content_hash IS in ApprovedRequest
         from effect_broker.model import ApprovedRequest, Data
+
         field_names = {f.name for f in fields(ApprovedRequest)}
-        assert "content_hash" not in field_names, (
-            "content_hash must not be in ApprovedRequest binding"
-        )
+        assert "content_hash" in field_names, "content_hash must be in ApprovedRequest binding"
 
         broker = build()
         # Trigger default task creation if needed

@@ -379,25 +379,9 @@ peer-reviewed security evaluation.
   only for non-existent files. The kernel reads from the OS, not the LLM's declarations.
   Full OS-level label APIs (SELinux getxattr, Windows sensitivity labels) deferred —
   the statx/permission-bit heuristic is traceable and auditable on all Unix systems.
-- **Cross-task composition (PARTIALLY enforced).** Session Taint prevents intra-task
-  read-secrets→send-internal attacks. Cross-task isolation is enforced at the capability
-  level: `check_auth()` sub-check 6 blocks reusable capabilities with `task_id` when used
-  in a different task; `ApprovalBinding` blocks cross-task approval use ("cross-task-use");
-  `LabelException.task_id` prevents cross-task declass from clearing a task's taint.
-  NOT enforced: data-level flow (output of Task A used as input to Task B) — requires
-  language-level taint tracking (PACT/CaMeL). Deferred.
-- **TCB expansion is unquantified.** Effect mediation pulls primitives into the
-  trusted core; the TCB size and correctness are not formally argued.
-- **Exactly-once external semantics not claimed.** The ledger confirms each authorized
-  effect is applied at most once (Fresh + occurrence count). Whether SMTP/filesystem
-  deliver/process exactly-once is outside scope.
+- **Cross-task composition (PARTIALLY enforced).** Session Taint prevents intra-task read-secrets→send-internal attacks. Cross-task isolation is enforced at the capability level: `check_auth()` sub-check 6 blocks reusable capabilities with `task_id` when used in a different task; `ApprovalBinding` blocks cross-task approval use ("cross-task-use"); `LabelException.task_id` prevents cross-task declass from clearing a task's taint. NOT enforced: data-level flow (output of Task A used as input to Task B) — requires language-level taint tracking (PACT/CaMeL). Deferred.
+- **TCB expansion is unquantified.** Effect mediation pulls primitives into the trusted core; the TCB size and correctness are not formally argued.
+- **Exactly-once external semantics not claimed.** The ledger confirms each authorized effect is applied at most once (Fresh + occurrence count). Whether SMTP/filesystem deliver/process exactly-once is outside scope.
 - **No performance or approval-burden metrics.** Experiments measure correctness only.
-- **No external baseline comparison.** ECAC is not yet compared against a genuine
-  baseline under matched assumptions.
-- **Formal proof (structured sketch + TLA+ spec).** The proof sketch in
-  `effect_broker/proof.py` provides a structured argument. A TLA+ spec in `TLA+/ECAC.tla`
-  formalizes the four-predicate gate, commit operation, and safety invariants
-  (`Inv1`–`Inv5`). The spec can be model-checked with Apalache or TLC. Coq/Isabelle
-  formalization (machine-checked proof) is deferred — TLA+ model checking on finite
-  instances provides strong evidence; full proof requires significant effort for
-  marginal additional assurance.
+- **No external baseline comparison.** ECAC is not yet compared against a genuine baseline under matched assumptions.
+- **Formal specification.** The four-predicate gate, commit operation, and safety invariants (`Inv1`–`Inv4`) are documented in `docs/formal_invariant.md`. Python tests in `tests/test_formal_invariants.py` verify the implementation matches the formal specification.

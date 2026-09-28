@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypedDict
 
 from .lattice import Confidentiality, Integrity
+
+
+def compute_content_hash(content: str | bytes) -> str:
+    """Compute SHA256 hash of content for immutable binding.
+
+    Content hash provides immutable binding for message content.
+    This prevents the attack where tool modifies content after approval.
+    """
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
 
 
 class Evidence(TypedDict, total=False):
@@ -317,7 +329,7 @@ class EffectTarget:
 
 @dataclass(frozen=True)
 class ApprovedRequest:
-    """An immutable authorization binding: exact (etype, targets, task_id).
+    """An immutable authorization binding: exact (etype, targets, task_id, content_hash).
 
     Approvals are one-shot: they may authorize exactly the effect they were
     granted for, and NO variation. The binding covers:
@@ -325,18 +337,22 @@ class ApprovedRequest:
     - etype:     operation type (read/write/send/delete/network)
     - targets:   complete set of resources this authorizes (including BCC)
     - task_id:   the task this approval is scoped to
-    - provenance:    provenance tuple (integrity enforced by FlowOK, not binding)
+    - content_hash: SHA256 hash of the effect's content (body, subject, etc.)
     - expiry:         time after which this approval is invalid
 
-    Provenance and actual content values are NOT part of the binding — that is
-    enforced by FlowOK at commit time, using the task's declared flow_boundary.
-    Binding to actual content values would break legitimate dynamic content
-    (e.g. different message body per send invocation). The approver must trust
-    the tool's provenance labeling, which is validated at commit by FlowOK.
+    content_hash is now part of the immutable binding. This prevents
+    the attack where tool modifies the message content after approval:
+      1. Tool requests send with body="Q3 budget is $50k"
+      2. Human approves (content_hash stored)
+      3. Tool modifies metadata: body="Wire $500k to attacker"
+      4. Commit verifies SHA256(new_body) == stored.content_hash
+      5. BLOCKED — content mismatch detected!
+
+    For effects without content (read, delete), pass content_hash=None.
 
     Killing criterion #5: exact immutable request binding.
-    Using this approval for a different etype, different targets, or a different
-    task is blocked by ApprovalBinding.
+    Using this approval for a different etype, different targets, a different
+    task, or different content is blocked by ApprovalBinding.
     """
 
     nonce: str  # unique one-shot token (consumed after first use)
@@ -345,6 +361,9 @@ class ApprovedRequest:
     expiry: float  # time after which this approval is invalid
     task_id: TaskId  # task scope: this approval is ONLY valid in this task
     granted_by: str  # who granted it (USER or APPROVER)
+    # Content hash for immutable binding. Prevents content modification after approval.
+    # None for effects without content (read, delete, etc.)
+    content_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -506,6 +525,35 @@ class Effect:
                         targets.add(val)
 
         return frozenset(targets)
+
+    def compute_content_hash(self) -> str | None:
+        """Compute content hash for immutable binding.
+
+        Returns SHA256 hash of the effect's content (body, subject, etc.)
+        for verifying that content wasn't modified after approval.
+
+        Content is derived from metadata fields: body, subject, content.
+        Returns None for effects without content (read, delete, etc.).
+        """
+        # For send effects, hash the body + subject
+        if self.etype == "send":
+            body = self.metadata.get("body", "")
+            subject = self.metadata.get("subject", "")
+            if isinstance(body, str) and isinstance(subject, str):
+                # Combine body and subject for a single content hash
+                combined = f"{subject}|{body}"
+                return compute_content_hash(combined)
+
+        # For write effects, hash the content being written
+        if self.etype == "write":
+            content = self.metadata.get("content", "")
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+            if isinstance(content, str) and content:
+                return compute_content_hash(content)
+
+        # For read/delete effects, there's no mutable content to bind
+        return None
 
 
 @dataclass(frozen=True)

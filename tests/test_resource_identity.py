@@ -65,12 +65,13 @@ class TestMailboxVsEmailIdentity:
         broker = build()
         task = _make_task("default")
         broker.register_task(task)
+        # Use same metadata as _grant (empty) to match content_hash
         nonce = _grant(broker, task, "send", "internal@corp.com")
 
         effect = Effect(
             etype="send",
             target="internal@corp.com",
-            metadata={"body": "msg"},
+            metadata={},  # Must match what _grant used
             provenance=_provenance("m"),
             capability_nonce=nonce,
             delegation_chain=(),
@@ -94,10 +95,11 @@ class TestMailboxVsEmailIdentity:
         nonce1 = _grant(broker, task, "send", "internal@corp.com", expiry=200.0)
         nonce2 = _grant(broker, task, "send", "internal@corp.com", expiry=200.0)
 
+        # Use empty metadata to match what _grant used
         effect1 = Effect(
             etype="send",
             target="internal@corp.com",
-            metadata={"body": "A"},
+            metadata={},
             provenance=_provenance("a"),
             capability_nonce=nonce1,
             delegation_chain=(),
@@ -105,7 +107,7 @@ class TestMailboxVsEmailIdentity:
         effect2 = Effect(
             etype="send",
             target="internal@corp.com",
-            metadata={"body": "B"},
+            metadata={},  # Same empty metadata to match approval
             provenance=_provenance("b"),
             capability_nonce=nonce2,
             delegation_chain=(),
@@ -169,7 +171,7 @@ class TestMailboxContainerBoundary:
         effect_a = Effect(
             etype="send",
             target="internal@corp.com",
-            metadata={"body": "A"},
+            metadata={},
             provenance=_provenance("a"),
             capability_nonce=nonce1,
             delegation_chain=(),
@@ -177,7 +179,7 @@ class TestMailboxContainerBoundary:
         effect_b = Effect(
             etype="send",
             target="internal@corp.com",
-            metadata={"body": "B"},
+            metadata={},
             provenance=_provenance("b"),
             capability_nonce=nonce2,
             delegation_chain=(),

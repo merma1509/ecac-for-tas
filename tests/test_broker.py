@@ -47,16 +47,28 @@ def _capability(
 @pytest.fixture
 def broker() -> Iterator[EffectBroker]:
     broker_instance = EffectBroker()
+
+    # Register default task for backward compatibility with existing tests
+    # This allows Commit(effect) without explicit task to work with a registered task.
+    default_task = Task(
+        task_id="default",
+        owner=USER,
+        ceiling=Capability(
+            owner=USER,
+            holder=BROKER,
+            right="*",
+            target="*",
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce="default-task-ceiling",
+        ),
+    )
+    broker_instance.tasks["default"] = default_task
+
     # external resources: R = F ∪ E ∪ M — bootstrap via restricted store API
-    broker_instance.store._unsafe_bootstrap_file(
-        "file:///reports", Confidentiality.INTERNAL
-    )
-    broker_instance.store._unsafe_bootstrap_file(
-        "file:///secrets", Confidentiality.CONFIDENTIAL
-    )
-    broker_instance.store._unsafe_bootstrap_email(
-        "internal@corp.com", Domain.INTERNAL
-    )
+    broker_instance.store._unsafe_bootstrap_file("file:///reports", Confidentiality.INTERNAL)
+    broker_instance.store._unsafe_bootstrap_file("file:///secrets", Confidentiality.CONFIDENTIAL)
+    broker_instance.store._unsafe_bootstrap_email("internal@corp.com", Domain.INTERNAL)
     broker_instance.store._unsafe_bootstrap_mailbox("alice")
     broker_instance.grant_root(
         _capability(USER, USER, "send", "internal@corp.com", frozenset({"internal"}), 100, "r-send")
@@ -246,11 +258,19 @@ def test_path_traversal_dotdot_in_target_blocked_auth(broker: EffectBroker) -> N
     """
     # Grant a write capability scoped only to file:///reports
     broker.grant_root(
-        _capability(USER, USER, "write", "file:///reports",
-                    frozenset({"file:///reports"}), 100, "r-write-reports")
+        _capability(
+            USER,
+            USER,
+            "write",
+            "file:///reports",
+            frozenset({"file:///reports"}),
+            100,
+            "r-write-reports",
+        )
     )
-    broker.attenuate("r-write-reports", AGENT, "write", "file:///reports",
-                     frozenset({"file:///reports"}), 100)
+    broker.attenuate(
+        "r-write-reports", AGENT, "write", "file:///reports", frozenset({"file:///reports"}), 100
+    )
 
     effect = Effect(
         "write",
@@ -296,11 +316,13 @@ def test_path_traversal_dotdot_in_known_targets_blocked(broker: EffectBroker) ->
     broker.register_task(restrictive_task)
 
     broker.grant_root(
-        _capability(USER, USER, "write", "file:///reports",
-                    frozenset({"file:///reports"}), 100, "r-write")
+        _capability(
+            USER, USER, "write", "file:///reports", frozenset({"file:///reports"}), 100, "r-write"
+        )
     )
-    broker.attenuate("r-write", AGENT, "write", "file:///reports",
-                     frozenset({"file:///reports"}), 100)
+    broker.attenuate(
+        "r-write", AGENT, "write", "file:///reports", frozenset({"file:///reports"}), 100
+    )
 
     effect = Effect(
         etype="write",
@@ -314,9 +336,7 @@ def test_path_traversal_dotdot_in_known_targets_blocked(broker: EffectBroker) ->
             additional=frozenset({"file:///../../etc/password"}),
         ),
     )
-    allow, evidence = broker.commit(
-        broker._make_commit(effect, task_id="t-restrict")
-    )
+    allow, evidence = broker.commit(broker._make_commit(effect, task_id="t-restrict"))
     assert not allow
     assert evidence["primary_blocker"] in ("Auth", "NoAmp")
 
@@ -324,11 +344,13 @@ def test_path_traversal_dotdot_in_known_targets_blocked(broker: EffectBroker) ->
 def test_normal_path_legitimate_write_allowed(broker: EffectBroker) -> None:
     """Legitimate path (no traversal) within authorized scope is allowed."""
     broker.grant_root(
-        _capability(USER, USER, "write", "file:///reports",
-                    frozenset({"file:///reports"}), 100, "r-write")
+        _capability(
+            USER, USER, "write", "file:///reports", frozenset({"file:///reports"}), 100, "r-write"
+        )
     )
-    broker.attenuate("r-write", AGENT, "write", "file:///reports",
-                     frozenset({"file:///reports"}), 100)
+    broker.attenuate(
+        "r-write", AGENT, "write", "file:///reports", frozenset({"file:///reports"}), 100
+    )
 
     effect = Effect(
         "write",
@@ -542,7 +564,8 @@ def test_conditioned_mediation_prevents_commit() -> None:
     )
     # T13: effect.target NOT in declared_targets → false-description
     mediation = MediationVerdict(
-        False, "false-description(effect.target=file:///secrets not in declared_targets=frozenset({'file:///reports'}))"
+        False,
+        "false-description(effect.target=file:///secrets not in declared_targets=frozenset({'file:///reports'}))",
     )
     allow, evidence = broker.commit(Commit(effect), mediation=mediation)
     assert allow is False
@@ -761,9 +784,12 @@ class TestClosedSessionBlocksCommit:
 
         # Trigger lazy task creation (first commit populates broker.tasks["default"])
         warmup = Effect(
-            "send", "internal@corp.com", {},
+            "send",
+            "internal@corp.com",
+            {},
             (Data("warmup", Confidentiality.INTERNAL, Integrity.USER),),
-            "r-send:Agent:EffectBroker", (USER, AGENT, BROKER),
+            "r-send:Agent:EffectBroker",
+            (USER, AGENT, BROKER),
         )
         broker.commit(Commit(warmup))
 
@@ -795,9 +821,14 @@ class TestClosedSessionBlocksCommit:
 
         broker = build()
         # Trigger lazy task creation
-        warmup = Effect("send", "internal@corp.com", {},
-                        (Data("warmup", Confidentiality.INTERNAL, Integrity.USER),),
-                        "r-send:Agent:EffectBroker", (USER, AGENT, BROKER))
+        warmup = Effect(
+            "send",
+            "internal@corp.com",
+            {},
+            (Data("warmup", Confidentiality.INTERNAL, Integrity.USER),),
+            "r-send:Agent:EffectBroker",
+            (USER, AGENT, BROKER),
+        )
         broker.commit(Commit(warmup))
         task = broker.tasks["default"]
 
@@ -825,16 +856,26 @@ class TestCrossTaskApprovalUse:
             task_id="task-a",
             owner=USER,
             ceiling=Capability(
-                USER, "EffectBroker", "send", "internal@corp.com",
-                frozenset({"internal"}), float("inf"), "ceiling-task-a",
+                USER,
+                "EffectBroker",
+                "send",
+                "internal@corp.com",
+                frozenset({"internal"}),
+                float("inf"),
+                "ceiling-task-a",
             ),
         )
         task_b = Task(
             task_id="task-b",
             owner=USER,
             ceiling=Capability(
-                USER, "EffectBroker", "send", "internal@corp.com",
-                frozenset({"internal"}), float("inf"), "ceiling-task-b",
+                USER,
+                "EffectBroker",
+                "send",
+                "internal@corp.com",
+                frozenset({"internal"}),
+                float("inf"),
+                "ceiling-task-b",
             ),
         )
         broker.register_task(task_a)
@@ -886,7 +927,6 @@ class TestCrossTaskApprovalUse:
         assert "cross-task-use" in evidence_b.get("approval_binding", "")
 
 
-
 class TestCrossTaskCapabilityScope:
     """Gap: reusable capability with task_id must not be used outside that task."""
 
@@ -903,16 +943,26 @@ class TestCrossTaskCapabilityScope:
             task_id="task-a",
             owner=USER,
             ceiling=Capability(
-                USER, "EffectBroker", "send", "internal@corp.com",
-                frozenset({"internal"}), float("inf"), "ceiling-task-a",
+                USER,
+                "EffectBroker",
+                "send",
+                "internal@corp.com",
+                frozenset({"internal"}),
+                float("inf"),
+                "ceiling-task-a",
             ),
         )
         task_b = Task(
             task_id="task-b",
             owner=USER,
             ceiling=Capability(
-                USER, "EffectBroker", "send", "internal@corp.com",
-                frozenset({"internal"}), float("inf"), "ceiling-task-b",
+                USER,
+                "EffectBroker",
+                "send",
+                "internal@corp.com",
+                frozenset({"internal"}),
+                float("inf"),
+                "ceiling-task-b",
             ),
         )
         broker.register_task(task_a)
@@ -920,36 +970,58 @@ class TestCrossTaskCapabilityScope:
 
         # Root-grant gives capability with task_id=None (default = "default")
         # We need a capability scoped to task-a — derive it
-        broker.grant_root(Capability(
-            USER, USER, "send", "internal@corp.com",
-            frozenset({"internal"}), 100, "cap-for-task-a",
-        ))
+        broker.grant_root(
+            Capability(
+                USER,
+                USER,
+                "send",
+                "internal@corp.com",
+                frozenset({"internal"}),
+                100,
+                "cap-for-task-a",
+            )
+        )
         broker.attenuate(
-            "cap-for-task-a", "EffectBroker", "send",
-            "internal@corp.com", frozenset({"internal"}), 100,
+            "cap-for-task-a",
+            "EffectBroker",
+            "send",
+            "internal@corp.com",
+            frozenset({"internal"}),
+            100,
         )
         # The attenuated cap inherits from parent — manually set task_id
         broker.capabilities["cap-task-a-restricted"] = Capability(
-            USER, "EffectBroker", "send", "internal@corp.com",
-            frozenset({"internal"}), 100, "cap-task-a-restricted",
+            USER,
+            "EffectBroker",
+            "send",
+            "internal@corp.com",
+            frozenset({"internal"}),
+            100,
+            "cap-task-a-restricted",
             derives_from="cap-for-task-a:EffectBroker",
             task_id="task-a",
         )
 
         # Use in task-a: ALLOW
         msg_a = Effect(
-            "send", "internal@corp.com", {},
+            "send",
+            "internal@corp.com",
+            {},
             (Data("q", Confidentiality.INTERNAL, Integrity.USER),),
-            "cap-task-a-restricted", CHAIN,
+            "cap-task-a-restricted",
+            CHAIN,
         )
         allow_a, _ = broker.commit(Commit(msg_a, task=task_a))
         assert allow_a is True
 
         # Use in task-b: BLOCK (task-scope-mismatch)
         msg_b = Effect(
-            "send", "internal@corp.com", {},
+            "send",
+            "internal@corp.com",
+            {},
             (Data("q", Confidentiality.INTERNAL, Integrity.USER),),
-            "cap-task-a-restricted", CHAIN,
+            "cap-task-a-restricted",
+            CHAIN,
         )
         allow_b, evidence_b = broker.commit(Commit(msg_b, task=task_b))
         assert allow_b is False
@@ -975,15 +1047,24 @@ class TestOverObservedIsUnknown:
 
         # Record ONE authorization
         broker.ledger.record_authorization(
-            task_id, nonce, frozenset({"file:///reports"}), source="test",
+            task_id,
+            nonce,
+            frozenset({"file:///reports"}),
+            source="test",
         )
 
         # Record TWO observations (over-observed)
         broker.ledger.record_observation(
-            task_id, nonce, frozenset({"file:///reports"}), source="test-obs-1",
+            task_id,
+            nonce,
+            frozenset({"file:///reports"}),
+            source="test-obs-1",
         )
         broker.ledger.record_observation(
-            task_id, nonce, frozenset({"file:///reports"}), source="test-obs-2",
+            task_id,
+            nonce,
+            frozenset({"file:///reports"}),
+            source="test-obs-2",
         )
 
         verdict = broker.ledger.verify(task_id, nonce)
@@ -1010,7 +1091,10 @@ class TestUnknownLedgerResultIsNotSafe:
 
         # Authorization without observation (simulates bypass)
         broker.ledger.record_authorization(
-            task_id, nonce, frozenset({"file:///secrets"}), source="test",
+            task_id,
+            nonce,
+            frozenset({"file:///secrets"}),
+            source="test",
         )
         # No record_observation call
 
@@ -1034,13 +1118,17 @@ class TestUnknownLedgerResultIsNotSafe:
 
         # Record authorization (as if broker allowed it via gate)
         broker.ledger.record_authorization(
-            task_id, nonce, frozenset({"file:///reports"}), source="broker.gate",
+            task_id,
+            nonce,
+            frozenset({"file:///reports"}),
+            source="broker.gate",
         )
 
         # Direct store mutation bypassing executor (simulates same-process bypass)
         # This is NOT observed by the ledger — no record_observation call
         broker.store._files._data["file:///reports"] = File(
-            "file:///reports", Confidentiality.CONFIDENTIAL,
+            "file:///reports",
+            Confidentiality.CONFIDENTIAL,
         )
         # NOTE: NO record_observation call — the executor is bypassed
 
