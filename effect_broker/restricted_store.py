@@ -1,11 +1,14 @@
 """Restricted mutable external state — the single mutation point.
 
-This module replaces the public-dict ResourceStore with a controlled interface:
+SECURITY WARNING
+───────────────────
+This module provides ADVISORY isolation in same-process mode. Python cannot
+truly prevent attribute replacement. For production deployments, use:
 
-  - files, emails, mailboxes: read-only Mapping views
-    (no direct store[key] = value; violators get TypeError)
-  - effects_log, identity_log: append-only lists
-  - apply_effect(): the SOLE path for state mutation
+    broker = EffectBroker(mode="multi-process")
+    # OR
+    broker = EffectBroker(mode="same-process", production_safe=True)
+    # Raises: ValueError("SECURITY: ... cannot use same-process mode")
 
 Design rationale:
   In a same-process model this is advisory (Python cannot truly prevent
