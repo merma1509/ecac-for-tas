@@ -25,7 +25,6 @@ from __future__ import annotations
 from collections.abc import Callable  # noqa: UP035  # used in type annotations
 
 from .broker import EffectBroker
-from .ipc import LocalLedgerBackend  # noqa: F401  # used as broker argument
 from .lattice import Confidentiality, Integrity
 from .ledger import IndependentEffectLedger
 from .mediation import Mediator, ToolSpec
