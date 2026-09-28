@@ -699,6 +699,21 @@ class ExecutorServer:
             return {"ok": False, "error": f"Unknown request kind: {req['kind']}"}
 
         payload = req.get("payload", {})
+
+        # Verify HMAC signature before processing
+        # If signature is missing or invalid, reject the request
+        from effect_broker.executor_ipc import _verify_payload
+
+        if not _verify_payload(payload, kind):
+            return {
+                "ok": False,
+                "error": (
+                    "IPC payload signature verification failed. "
+                    "Payload may have been tampered with in transit. "
+                    "Request rejected for security."
+                ),
+            }
+
         assert self._store is not None
 
         match kind:
