@@ -23,7 +23,6 @@ that has no filesystem access except via a whitelisted wrapper.
 
 from __future__ import annotations
 
-import base64
 import os
 import pathlib
 import re
@@ -528,10 +527,13 @@ class RealFileShim:
 
         known_targets = EffectTarget(primary=uri, additional=extras)
 
-        effect = Effect(
-            etype=op_type,
-            target=uri,
-            metadata={
+        # Include actual content in metadata BEFORE broker.commit
+        # This binds the content to the effect for content_hash verification
+        # For IPC-safe serialization, base64 encode the content
+        import base64
+        if op_type == "write" and content is not None:
+            metadata = {
+                "content_b64": base64.b64encode(content).decode(),  # Base64 for JSON safety
                 "os_statx": statx_meta,
                 "confidentiality_source": "os-statx"
                 if statx_meta.get("stx_unavailable") is None
@@ -539,7 +541,22 @@ class RealFileShim:
                 if conf == Confidentiality.CONFIDENTIAL or conf == Confidentiality.PUBLIC
                 else "path-keyword-fallback",
                 "pre_exists": pre_exists,
-            },
+            }
+        else:
+            metadata = {
+                "os_statx": statx_meta,
+                "confidentiality_source": "os-statx"
+                if statx_meta.get("stx_unavailable") is None
+                else "permission-bits"
+                if conf == Confidentiality.CONFIDENTIAL or conf == Confidentiality.PUBLIC
+                else "path-keyword-fallback",
+                "pre_exists": pre_exists,
+            }
+
+        effect = Effect(
+            etype=op_type,
+            target=uri,
+            metadata=metadata,
             provenance=(
                 Data(f"shim-{op_type}", conf, integ),
                 Data(f"real-path={canon}", conf, Integrity.USER),
