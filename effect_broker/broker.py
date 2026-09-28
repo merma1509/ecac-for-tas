@@ -173,10 +173,10 @@ def derive_file_provenance(target: str) -> tuple[Confidentiality, Integrity]:
                 return conf, Integrity.USER
         return Confidentiality.INTERNAL, Integrity.USER
 
-    # Convert file:// URI to OS path
-    os_path = target[7:]  # strip "file://"
-    if os_path.startswith("/"):
-        os_path = os_path[1:]
+    # Convert file:// URI to OS path (preserves leading slash for absolute paths)
+    os_path = target[7:]  # strip "file://" prefix only
+    # DO NOT strip leading slash - absolute paths like /etc/passwd must remain /etc/passwd
+    # file:///etc/passwd -> /etc/passwd (correct), NOT etc/passwd (wrong)
 
     # Step 1: Try os.statx() (Linux with kernel >= 4.11)
     try:
