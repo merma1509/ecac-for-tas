@@ -427,7 +427,14 @@ class RealEmailShim:
 
         from .model import Commit
 
-        commit = Commit(effect=effect, task=None, tool_name=self.tool_name)
+        # Use registered task from self.task_id
+        task = self.broker.tasks.get(self.task_id)
+        if task is None:
+            raise EmailSecurityError(
+                f"[{self.tool_name}] task_id '{self.task_id}' not registered. "
+                f"Register task first with broker.register_task()."
+            )
+        commit = Commit(effect=effect, task=task, tool_name=self.tool_name)
         allow, evidence = self.broker.executor.execute(commit)
 
         op = EmailOp(
@@ -503,7 +510,14 @@ class RealEmailShim:
 
         from .model import Commit
 
-        commit = Commit(effect=effect, task=None, tool_name=self.tool_name)
+        # A4 FIX: Use registered task from self.task_id
+        task = self.broker.tasks.get(self.task_id)
+        if task is None:
+            raise EmailSecurityError(
+                f"[{self.tool_name}] task_id '{self.task_id}' not registered. "
+                f"Register task first with broker.register_task()."
+            )
+        commit = Commit(effect=effect, task=task, tool_name=self.tool_name)
         allow, evidence = self.broker.executor.execute(commit)
 
         if not allow:
