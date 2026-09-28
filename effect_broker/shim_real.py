@@ -41,6 +41,18 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
+# Explicit statx constants with cross-platform fallback ----
+# Linux kernel constants (from <linux/stat.h>) — used when os.STATX_* not available
+_STATX_ALL: int = 0x00000FFF  # STATX_ALL = all statx fields
+_STATX_ATTR_ENCRYPTED: int = 1 << 0  # File encrypted with fscrypt
+_STATX_ATTR_IMMUTABLE: int = 1 << 1  # File is immutable (chattr +i)
+
+# Use Python's os constants if available (Linux with Python >= 3.8),
+# otherwise fall back to our explicit constants above
+_STATX_FLAGS_TO_USE: int = getattr(os, "STATX_ALL", _STATX_ALL)
+_STATX_ATTR_ENCRYPTED_BIT: int = getattr(os, "STATX_ATTR_ENCRYPTED", _STATX_ATTR_ENCRYPTED)
+_STATX_ATTR_IMMUTABLE_BIT: int = getattr(os, "STATX_ATTR_IMMUTABLE", _STATX_ATTR_IMMUTABLE)
+
 
 @dataclass
 class ShimOp:
@@ -258,7 +270,7 @@ class RealFileShim:
         """
         try:
             canon = self._canonical_path(path)
-            stx = os.statx(canon, flags=os.STATX_ALL)  # type: ignore[attr-defined]
+            stx = os.statx(canon, flags=_STATX_FLAGS_TO_USE)  # type: ignore[attr-defined]
             label = self._try_statx_label(stx, canon)
             if label is not None:
                 return label
@@ -306,12 +318,12 @@ class RealFileShim:
         # CONFIDENTIAL. Set with: chattr +i file  OR  BitLocker/FileVault
         stx_attributes: int = getattr(stx, "stx_attributes", 0)
         stx_mode: int = getattr(stx, "stx_mode", 0)
-        if stx_attributes & (1 << 0):  # STATX_ATTR_ENCRYPTED
+        if stx_attributes & _STATX_ATTR_ENCRYPTED_BIT:  # STATX_ATTR_ENCRYPTED
             return Confidentiality.CONFIDENTIAL
 
         # Check for system immutable attribute (chattr +i / +a)
         # Immutable files are typically high-sensitivity (root-owned config, secrets)
-        if stx_attributes & (1 << 1):  # STATX_ATTR_IMMUTABLE
+        if stx_attributes & _STATX_ATTR_IMMUTABLE_BIT:  # STATX_ATTR_IMMUTABLE
             # Immutable + non-world-readable → likely CONFIDENTIAL
             # flag as CONFIDENTIAL if also owner-only; prevents false
             # CONFIDENTIAL on files like /etc/passwd (world-readable + immutable)
@@ -502,12 +514,12 @@ class RealFileShim:
         # on all platforms — wrap in try/except to keep effect derivation robust.
         statx_meta: dict[str, object] = {}
         try:
-            stx = os.statx(canon, flags=os.STATX_ALL)  # type: ignore[attr-defined]
+            stx = os.statx(canon, flags=_STATX_FLAGS_TO_USE)  # type: ignore[attr-defined]
             statx_meta = {
                 "stx_mode_octal": f"0o{stx.stx_mode & 0o777:03o}",
                 "stx_attributes_hex": f"0x{stx.stx_attributes:x}",
-                "stx_attributes_encrypted": bool(stx.stx_attributes & (1 << 0)),
-                "stx_attributes_immutable": bool(stx.stx_attributes & (1 << 1)),
+                "stx_attributes_encrypted": bool(stx.stx_attributes & _STATX_ATTR_ENCRYPTED_BIT),
+                "stx_attributes_immutable": bool(stx.stx_attributes & _STATX_ATTR_IMMUTABLE_BIT),
                 "stx_uid": stx.stx_uid,
                 "stx_gid": stx.stx_gid,
             }
