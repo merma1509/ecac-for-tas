@@ -87,8 +87,11 @@ class TestShimEmailSMTPSend:
         """
         broker = _make_broker()
         shim = RealEmailShim(
-            broker, task_id="email-test", tool_name="TestTool",
-            smtp_host="127.0.0.1", smtp_port=9025,
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            smtp_host="127.0.0.1",
+            smtp_port=9025,
         )
 
         # First send — RSET-only probe phase
@@ -97,9 +100,12 @@ class TestShimEmailSMTPSend:
         _, actual_accepted, bcc = shim._smtp_probe("user@corp.com", declared)
 
         # aiosmtpd handler recorded both RCPT TO commands
-        assert sorted(smtp_server.rcpt_to_log) == sorted([
-            "internal@corp.com", "team@corp.com",
-        ])
+        assert sorted(smtp_server.rcpt_to_log) == sorted(
+            [
+                "internal@corp.com",
+                "team@corp.com",
+            ]
+        )
         # MTA accepted both
         assert actual_accepted == declared
         # No BCC detected (all accepted were declared)
@@ -115,8 +121,11 @@ class TestShimEmailSMTPSend:
         """
         broker = _make_broker()
         shim = RealEmailShim(
-            broker, task_id="email-test", tool_name="TestTool",
-            smtp_host="127.0.0.1", smtp_port=9025,
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            smtp_host="127.0.0.1",
+            smtp_port=9025,
         )
 
         # Simulate: tool declared 2 recipients but MTA accepts 3.
@@ -147,8 +156,11 @@ class TestShimEmailSMTPSend:
         """
         broker = _make_broker()
         shim = RealEmailShim(
-            broker, task_id="email-test", tool_name="TestTool",
-            smtp_host="127.0.0.1", smtp_port=9025,
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            smtp_host="127.0.0.1",
+            smtp_port=9025,
         )
 
         # Reset handler so we can assert on data_log after real delivery
@@ -157,6 +169,7 @@ class TestShimEmailSMTPSend:
         # Patch probe to avoid SMTP connection issues in test
         def clean_probe(sender: str, decl: frozenset[str]):
             return decl, decl, frozenset()
+
         shim._smtp_probe = clean_probe  # type: ignore
 
         shim.send(
@@ -181,8 +194,11 @@ class TestShimEmailSMTPSend:
         """MTA accepts declared recipients but NoAmp blocks (BCC outside cap scope)."""
         broker = _make_broker()
         shim = RealEmailShim(
-            broker, task_id="email-test", tool_name="TestTool",
-            smtp_host="127.0.0.1", smtp_port=9025,
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            smtp_host="127.0.0.1",
+            smtp_port=9025,
         )
         smtp_server.reset()
 
@@ -209,8 +225,11 @@ class TestShimEmailSMTPSend:
         """RSET-only probe never delivers a message — data_log stays empty."""
         broker = _make_broker()
         shim = RealEmailShim(
-            broker, task_id="email-test", tool_name="TestTool",
-            smtp_host="127.0.0.1", smtp_port=9025,
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            smtp_host="127.0.0.1",
+            smtp_port=9025,
         )
         smtp_server.reset()
 
@@ -226,8 +245,11 @@ class TestShimEmailSMTPSend:
         """SMTP unreachable → SMTPError → EmailSecurityError before broker.commit."""
         broker = _make_broker()
         shim = RealEmailShim(
-            broker, task_id="email-test", tool_name="TestTool",
-            smtp_host="127.0.0.1", smtp_port=59999,  # nothing listening
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            smtp_host="127.0.0.1",
+            smtp_port=59999,  # nothing listening
         )
 
         with pytest.raises(EmailSecurityError) as exc_info:
@@ -247,8 +269,11 @@ class TestShimEmailIMAP:
         del broker.capabilities["read-inbox-cap"]
 
         shim = RealEmailShim(
-            broker, task_id="email-test", tool_name="TestTool",
-            imap_host="imap.example.com", imap_port=993,
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            imap_host="imap.example.com",
+            imap_port=993,
         )
 
         # Should raise before attempting any IMAP connection
@@ -265,8 +290,11 @@ class TestShimEmailIMAP:
         """
         broker = _make_broker()
         shim = RealEmailShim(
-            broker, task_id="email-test", tool_name="TestTool",
-            imap_host="imap.example.invalid", imap_port=993,
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            imap_host="imap.example.invalid",
+            imap_port=993,
         )
 
         # Capability nonce must match target "internal@corp.com" to pass Auth.
@@ -357,8 +385,11 @@ class TestShimEmailBrokerIntegration:
         """Allowed send: effects_log records the send effect."""
         broker = _make_broker()
         shim = RealEmailShim(
-            broker, task_id="email-test", tool_name="TestTool",
-            smtp_host="127.0.0.1", smtp_port=9025,
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            smtp_host="127.0.0.1",
+            smtp_port=9025,
         )
         smtp_server.reset()
 
@@ -378,8 +409,11 @@ class TestShimEmailBrokerIntegration:
         """Blocked send: nothing in effects_log (effect never committed)."""
         broker = _make_broker()
         shim = RealEmailShim(
-            broker, task_id="email-test", tool_name="TestTool",
-            smtp_host="127.0.0.1", smtp_port=9025,
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            smtp_host="127.0.0.1",
+            smtp_port=9025,
         )
 
         # BCC detected → fail closed before broker.commit

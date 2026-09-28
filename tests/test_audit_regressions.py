@@ -26,11 +26,16 @@ class TestAuditAUDIT1SameProcessGap:
         nonce = "audit-1-nonce"
 
         broker.ledger.record_authorization(
-            task_id, nonce, frozenset({"file:///audit-1"}), source="broker.gate",
+            task_id,
+            nonce,
+            frozenset({"file:///audit-1"}),
+            source="broker.gate",
         )
         broker.store._files._data["file:///audit-1"] = File(
             "file:///audit-1",
-            broker.store._files._data.get("file:///audit-1", broker.store._files._data.get("file:///audit-1")),
+            broker.store._files._data.get(
+                "file:///audit-1", broker.store._files._data.get("file:///audit-1")
+            ),
         )
 
         verdict = broker.ledger.verify(task_id, nonce)
@@ -85,22 +90,34 @@ class TestAuditAUDIT2ApprovalBinding:
 
         broker = build()
         task = Task(
-            task_id="audit-2", owner="User",
-            ceiling=Capability(owner="User", holder="EffectBroker", right="*",
-                               target="*", scope=frozenset({"*"}),
-                               expiry=float("inf"), nonce="audit-2-ceil"),
+            task_id="audit-2",
+            owner="User",
+            ceiling=Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="*",
+                target="*",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="audit-2-ceil",
+            ),
         )
         broker.register_task(task)
 
         send_req = Effect(
-            etype="send", target="internal@corp.com", metadata={},
+            etype="send",
+            target="internal@corp.com",
+            metadata={},
             provenance=(Data("req", Confidentiality.INTERNAL, Integrity.USER),),
-            capability_nonce="req:audit-2", delegation_chain=(),
+            capability_nonce="req:audit-2",
+            delegation_chain=(),
         )
         nonce = broker.grant_approval(send_req, expiry=100.0, task_id="audit-2")
 
         write_effect = Effect(
-            etype="write", target="file:///reports", metadata={},
+            etype="write",
+            target="file:///reports",
+            metadata={},
             provenance=(Data("msg", Confidentiality.INTERNAL, Integrity.USER),),
             capability_nonce=nonce,
             delegation_chain=(),
@@ -108,7 +125,10 @@ class TestAuditAUDIT2ApprovalBinding:
         allow, ev = broker.commit(Commit(write_effect, task))
         assert not allow, "send approval must NOT authorize write"
         assert ev["primary_blocker"] in ("Auth", "ApprovalBinding")
-        assert "right-mismatch" in ev["predicates"]["Auth"] or ev["primary_blocker"] == "ApprovalBinding"  # noqa: E501
+        assert (
+            "right-mismatch" in ev["predicates"]["Auth"]
+            or ev["primary_blocker"] == "ApprovalBinding"
+        )  # noqa: E501
 
 
 class TestAuditAUDIT3RightSubstitution:
@@ -125,22 +145,36 @@ class TestAuditAUDIT3RightSubstitution:
 
         broker = build()
         task = Task(
-            task_id="audit-3", owner="User",
-            ceiling=Capability(owner="User", holder="EffectBroker", right="*",
-                               target="*", scope=frozenset({"*"}),
-                               expiry=float("inf"), nonce="audit-3-ceil"),
+            task_id="audit-3",
+            owner="User",
+            ceiling=Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="*",
+                target="*",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="audit-3-ceil",
+            ),
         )
         broker.register_task(task)
         broker.capabilities["audit-3-read"] = Capability(
-            owner="User", holder="EffectBroker", right="read",
-            target="file:///reports", scope=frozenset({"*"}),
-            expiry=float("inf"), nonce="audit-3-read",
+            owner="User",
+            holder="EffectBroker",
+            right="read",
+            target="file:///reports",
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce="audit-3-read",
         )
 
         write_effect = Effect(
-            etype="write", target="file:///reports", metadata={},
+            etype="write",
+            target="file:///reports",
+            metadata={},
             provenance=(Data("msg", Confidentiality.INTERNAL, Integrity.USER),),
-            capability_nonce="audit-3-read", delegation_chain=(),
+            capability_nonce="audit-3-read",
+            delegation_chain=(),
         )
         allow, ev = broker.commit(Commit(write_effect, task))
         assert not allow
@@ -155,22 +189,36 @@ class TestAuditAUDIT3RightSubstitution:
 
         broker = build()
         task = Task(
-            task_id="audit-3-wildcard", owner="User",
-            ceiling=Capability(owner="User", holder="EffectBroker", right="*",
-                               target="*", scope=frozenset({"*"}),
-                               expiry=float("inf"), nonce="audit-3-wc-ceil"),
+            task_id="audit-3-wildcard",
+            owner="User",
+            ceiling=Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="*",
+                target="*",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="audit-3-wc-ceil",
+            ),
         )
         broker.register_task(task)
         broker.capabilities["audit-3-wildcard"] = Capability(
-            owner="User", holder="EffectBroker", right="*",
-            target="file:///reports", scope=frozenset({"file:///reports"}),
-            expiry=float("inf"), nonce="audit-3-wildcard",
+            owner="User",
+            holder="EffectBroker",
+            right="*",
+            target="file:///reports",
+            scope=frozenset({"file:///reports"}),
+            expiry=float("inf"),
+            nonce="audit-3-wildcard",
         )
 
         write_effect = Effect(
-            etype="write", target="file:///reports", metadata={},
+            etype="write",
+            target="file:///reports",
+            metadata={},
             provenance=(Data("msg", Confidentiality.INTERNAL, Integrity.USER),),
-            capability_nonce="audit-3-wildcard", delegation_chain=(),
+            capability_nonce="audit-3-wildcard",
+            delegation_chain=(),
         )
         allow, ev = broker.commit(Commit(write_effect, task))
         # right='*' is intentional — ALLOWs any etype (documented semantics)
@@ -193,27 +241,43 @@ class TestAuditAUDIT4SessionClosure:
         broker.store._unsafe_bootstrap_file("file:///audit-4", Confidentiality.PUBLIC)
 
         task = Task(
-            task_id="audit-4", owner="User",
-            ceiling=Capability(owner="User", holder="EffectBroker", right="write",
-                               target="*", scope=frozenset({"*"}),
-                               expiry=float("inf"), nonce="audit-4-ceil"),
+            task_id="audit-4",
+            owner="User",
+            ceiling=Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="write",
+                target="*",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="audit-4-ceil",
+            ),
         )
         broker.register_task(task)
         broker.capabilities["audit-4-cap"] = Capability(
-            owner="User", holder="EffectBroker", right="write",
-            target="file:///audit-4", scope=frozenset({"file:///audit-4"}),
-            expiry=float("inf"), nonce="audit-4-cap",
+            owner="User",
+            holder="EffectBroker",
+            right="write",
+            target="file:///audit-4",
+            scope=frozenset({"file:///audit-4"}),
+            expiry=float("inf"),
+            nonce="audit-4-cap",
         )
 
         effect = Effect(
-            etype="write", target="file:///audit-4", metadata={},
+            etype="write",
+            target="file:///audit-4",
+            metadata={},
             provenance=(Data("msg", Confidentiality.INTERNAL, Integrity.USER),),
-            capability_nonce="audit-4-cap", delegation_chain=(),
+            capability_nonce="audit-4-cap",
+            delegation_chain=(),
         )
         broker.commit(Commit(effect, task))  # First use — nonce consumed
 
         fresh_task = Task(task_id="audit-4", owner="User", ceiling=task.ceiling)
-        with pytest.raises((AssertionError, ValueError), match="already been used|already registered"):  # noqa: E501
+        with pytest.raises(
+            (AssertionError, ValueError), match="already been used|already registered"
+        ):  # noqa: E501
             broker.register_task(fresh_task)
 
 
@@ -233,17 +297,28 @@ class TestAuditAUDIT5Provenance:
         broker = build()
         broker.store._unsafe_bootstrap_file("file:///audit-5", Confidentiality.INTERNAL)
         broker.capabilities["audit-5-cap"] = Capability(
-            owner="User", holder="EffectBroker", right="write",
-            target="file:///audit-5", scope=frozenset({"file:///audit-5"}),
-            expiry=float("inf"), nonce="audit-5-cap",
+            owner="User",
+            holder="EffectBroker",
+            right="write",
+            target="file:///audit-5",
+            scope=frozenset({"file:///audit-5"}),
+            expiry=float("inf"),
+            nonce="audit-5-cap",
         )
         # Register default task if not already registered
         if "default" not in broker.tasks:
             broker.tasks["default"] = Task(
-                task_id="default", owner="User",
-                ceiling=Capability(owner="User", holder="EffectBroker", right="*",
-                           target="*", scope=frozenset({"*"}),
-                           expiry=float("inf"), nonce="default-ceil"),
+                task_id="default",
+                owner="User",
+                ceiling=Capability(
+                    owner="User",
+                    holder="EffectBroker",
+                    right="*",
+                    target="*",
+                    scope=frozenset({"*"}),
+                    expiry=float("inf"),
+                    nonce="default-ceil",
+                ),
             )
         shim = FileShim(broker=broker, task_id="default", tool_name="audit-5-tool")
         tool_api = {m for m in dir(shim) if not m.startswith("_")}
@@ -278,22 +353,36 @@ class TestAuditAUDIT6PathNormalization:
 
         broker = build()
         task = Task(
-            task_id="audit-6", owner="User",
-            ceiling=Capability(owner="User", holder="EffectBroker", right="write",
-                               target="*", scope=frozenset({"*"}),
-                               expiry=float("inf"), nonce="audit-6-ceil"),
+            task_id="audit-6",
+            owner="User",
+            ceiling=Capability(
+                owner="User",
+                holder="EffectBroker",
+                right="write",
+                target="*",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="audit-6-ceil",
+            ),
         )
         broker.register_task(task)
         broker.capabilities["audit-6-cap"] = Capability(
-            owner="User", holder="EffectBroker", right="write",
-            target="file:///reports", scope=frozenset({"file:///reports"}),
-            expiry=float("inf"), nonce="audit-6-cap",
+            owner="User",
+            holder="EffectBroker",
+            right="write",
+            target="file:///reports",
+            scope=frozenset({"file:///reports"}),
+            expiry=float("inf"),
+            nonce="audit-6-cap",
         )
 
         aliased_effect = Effect(
-            etype="write", target="file:///../reports/secrets", metadata={},
+            etype="write",
+            target="file:///../reports/secrets",
+            metadata={},
             provenance=(Data("msg", Confidentiality.INTERNAL, Integrity.USER),),
-            capability_nonce="audit-6-cap", delegation_chain=(),
+            capability_nonce="audit-6-cap",
+            delegation_chain=(),
         )
         allow, ev = broker.commit(Commit(aliased_effect, task))
         assert not allow

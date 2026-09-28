@@ -33,6 +33,7 @@ from effect_broker.traces import build
 
 def _provenance(name: str) -> tuple[Data, ...]:
     from effect_broker.lattice import Confidentiality, Integrity
+
     return (Data(name, Confidentiality.INTERNAL, Integrity.USER),)
 
 
@@ -97,9 +98,7 @@ class TestCanonicalCompleteTargets:
         nonce = broker3.grant_approval(effect, expiry=100.0, task_id="default")
         stored = broker3._approved_requests.get(nonce)
 
-        expected = frozenset({
-            "internal@corp.com", "bcc1@corp.com", "bcc2@corp.com"
-        })
+        expected = frozenset({"internal@corp.com", "bcc1@corp.com", "bcc2@corp.com"})
 
         # Verify: executor recorded correct authorized_targets
         # Ledger stores authorization entries; merge all entries for this nonce
@@ -157,15 +156,16 @@ class TestCanonicalCompleteTargets:
         )
 
         # Verify canonical complete_targets() produces correct result
-        expected = frozenset({
-            "internal@corp.com",
-            "bcc_a@corp.com",
-            "bcc_b@corp.com",
-            "bcc_c@corp.com",
-        })
+        expected = frozenset(
+            {
+                "internal@corp.com",
+                "bcc_a@corp.com",
+                "bcc_b@corp.com",
+                "bcc_c@corp.com",
+            }
+        )
         assert effect.complete_targets() == expected, (
-            f"complete_targets() mismatch: expected={expected}, "
-            f"got={effect.complete_targets()}"
+            f"complete_targets() mismatch: expected={expected}, got={effect.complete_targets()}"
         )
 
         # Also verify that grant_approval stores the correct set
@@ -173,9 +173,9 @@ class TestCanonicalCompleteTargets:
         stored = broker._approved_requests.get(nonce)
         assert stored is not None
         assert stored.targets.primary == "internal@corp.com"
-        assert stored.targets.additional == frozenset({
-            "bcc_a@corp.com", "bcc_b@corp.com", "bcc_c@corp.com"
-        }), (
+        assert stored.targets.additional == frozenset(
+            {"bcc_a@corp.com", "bcc_b@corp.com", "bcc_c@corp.com"}
+        ), (
             f"grant_approval fallback path targets.additional mismatch: "
             f"expected={frozenset({'bcc_a@corp.com', 'bcc_b@corp.com', 'bcc_c@corp.com'})}, "
             f"got={stored.targets.additional}"
@@ -232,10 +232,12 @@ class TestCanonicalCompleteTargets:
             ),
         )
         # known_targets.additional is authoritative; metadata is skipped
-        expected = frozenset({
-            "internal@corp.com",
-            "known-bcc@corp.com",
-        })
+        expected = frozenset(
+            {
+                "internal@corp.com",
+                "known-bcc@corp.com",
+            }
+        )
         assert effect.complete_targets() == expected, (
             f"known_targets should be authoritative. expected={expected}, "
             f"got={effect.complete_targets()}"
@@ -261,6 +263,7 @@ class TestCanonicalCompleteTargets:
 
         # Add capability with scope={internal} so BCC recipients pass NoAmp
         from effect_broker.model import BROKER, USER
+
         broker.capabilities["bcc-send-cap"] = Capability(
             owner=USER,
             holder=BROKER,
@@ -402,6 +405,7 @@ class TestLedgerObservationRecorded:
 
         verdict = broker._local_ledger.verify(task.task_id, effect.capability_nonce)
         from effect_broker.ledger import LedgerVerdict
+
         assert verdict == LedgerVerdict.CONFIRMED_COMMITTED, (
             f"Expected CONFIRMED_COMMITTED, got {verdict}. "
             "Observation recording may have been silently dropped."
@@ -839,9 +843,7 @@ class TestLedgerVerdictUnknownAfterCrash:
             timestamp=3.0,
             source="unknown-source",
         )
-        broker._local_ledger._observations[
-            ("default", "over-obs-cap")
-        ].append(extra_obs)
+        broker._local_ledger._observations[("default", "over-obs-cap")].append(extra_obs)
 
         verdict = broker._local_ledger.verify("default", "over-obs-cap")
         assert verdict == LedgerVerdict.UNKNOWN or (

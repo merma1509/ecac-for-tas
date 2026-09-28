@@ -54,8 +54,9 @@ def _effect(
     )
 
 
-def _grant_for(broker, etype: str, target: str, expiry: float = 100.0,
-               additional: frozenset[str] | None = None) -> tuple[str, Task]:
+def _grant_for(
+    broker, etype: str, target: str, expiry: float = 100.0, additional: frozenset[str] | None = None
+) -> tuple[str, Task]:
     """Grant an approval for (etype, target) and return (nonce, task).
 
     grant_approval creates a capability with the exact target, bypassing
@@ -131,9 +132,7 @@ class TestFlowDeclassRegression:
         )
         allow, evidence = broker.commit(Commit(conf_write, task))
 
-        assert allow is False, (
-            "Write with CONFIDENTIAL provenance should be BLOCKed by FlowOK"
-        )
+        assert allow is False, "Write with CONFIDENTIAL provenance should be BLOCKed by FlowOK"
         assert evidence["primary_blocker"] == "FlowOK"
         assert "conf-leak" in evidence["predicates"]["FlowOK"]
         assert len(broker.store.effects_log) == 0
@@ -327,9 +326,7 @@ class TestFlowDeclassExactIdentity:
             etype="send",
             target="internal@corp.com",
             nonce=nonce,
-            provenance=(
-                Data("secret", Confidentiality.CONFIDENTIAL, Integrity.USER),
-            ),
+            provenance=(Data("secret", Confidentiality.CONFIDENTIAL, Integrity.USER),),
             label_exceptions=(declass,),
         )
         # Simulate BCC via known_targets
@@ -367,7 +364,9 @@ class TestFlowDeclassExactIdentity:
         broker = build()
         bcc_recipient = "team@internal.corp.com"
         nonce, task = _grant_for(
-            broker, "send", "internal@corp.com",
+            broker,
+            "send",
+            "internal@corp.com",
             additional=frozenset({bcc_recipient}),
         )
 
@@ -403,9 +402,7 @@ class TestFlowDeclassExactIdentity:
 
         # Should ALLOW: additional_targets explicitly includes BCC,
         # BCC is same domain (passes NoAmp), FlowOK covered by grant
-        assert allow is True, (
-            f"Grant with additional_targets should ALLOW. Evidence: {evidence}"
-        )
+        assert allow is True, f"Grant with additional_targets should ALLOW. Evidence: {evidence}"
 
     def test_declass_with_etype_matching(self) -> None:
         """Grant with etype='send' does NOT cover etype='write'."""

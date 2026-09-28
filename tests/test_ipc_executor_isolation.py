@@ -33,6 +33,7 @@ class TestExecutorSubprocessIPC:
         import uuid
 
         from effect_broker.executor_subprocess import ExecutorProcessHandle
+
         uid = uuid.uuid4().hex[:8]
         sock = Path(f"/tmp/ecac-exec-{uid}.sock")
         store_sock = Path(f"/tmp/ecac-store-{uid}.sock")
@@ -104,17 +105,19 @@ class TestExecutorSubprocessIPC:
         client = ProcessExecutorClient(self._sock)
 
         # Apply a write effect
-        client.execute({
-            "etype": "write",
-            "target": "file:///secrets/db.txt",
-            "metadata": {},
-            "provenance": [],
-            "capability_nonce": "cap-read",
-            "delegation_chain": [],
-            "label_exceptions": [],
-            "task_id": None,
-            "known_targets": None,
-        })
+        client.execute(
+            {
+                "etype": "write",
+                "target": "file:///secrets/db.txt",
+                "metadata": {},
+                "provenance": [],
+                "capability_nonce": "cap-read",
+                "delegation_chain": [],
+                "label_exceptions": [],
+                "task_id": None,
+                "known_targets": None,
+            }
+        )
 
         # Observer reads the executor's actual store state
         store = client.read_store()
@@ -125,17 +128,19 @@ class TestExecutorSubprocessIPC:
         from effect_broker.executor_ipc import ProcessExecutorClient
 
         client = ProcessExecutorClient(self._sock)
-        client.execute({
-            "etype": "send",
-            "target": "alice@internal.corp.com",
-            "metadata": {"body": "hello"},
-            "provenance": [],
-            "capability_nonce": "cap-send",
-            "delegation_chain": [],
-            "label_exceptions": [],
-            "task_id": None,
-            "known_targets": None,
-        })
+        client.execute(
+            {
+                "etype": "send",
+                "target": "alice@internal.corp.com",
+                "metadata": {"body": "hello"},
+                "provenance": [],
+                "capability_nonce": "cap-send",
+                "delegation_chain": [],
+                "label_exceptions": [],
+                "task_id": None,
+                "known_targets": None,
+            }
+        )
 
         store = client.read_store()
         assert "alice" in store["mailboxes"]
@@ -154,17 +159,19 @@ class TestExecutorSubprocessIPC:
         client = ProcessExecutorClient(self._sock)
 
         # Write something via IPC
-        client.execute({
-            "etype": "write",
-            "target": "file:///test/file.txt",
-            "metadata": {},
-            "provenance": [],
-            "capability_nonce": "cap-test",
-            "delegation_chain": [],
-            "label_exceptions": [],
-            "task_id": None,
-            "known_targets": None,
-        })
+        client.execute(
+            {
+                "etype": "write",
+                "target": "file:///test/file.txt",
+                "metadata": {},
+                "provenance": [],
+                "capability_nonce": "cap-test",
+                "delegation_chain": [],
+                "label_exceptions": [],
+                "task_id": None,
+                "known_targets": None,
+            }
+        )
 
         # read_store() works — this is the ONLY way to observe state
         store = client.read_store()
@@ -192,6 +199,7 @@ class TestLedgerReadsExecutorStore:
 
         from effect_broker.executor_subprocess import ExecutorProcessHandle
         from effect_broker.ipc import LedgerProcessHandle
+
         uid = uuid.uuid4().hex[:8]
         exec_sock = Path(f"/tmp/ecac-exec-{uid}.sock")
         store_sock = Path(f"/tmp/ecac-store-{uid}.sock")
@@ -235,12 +243,12 @@ class TestLedgerReadsExecutorStore:
         # (from executor's IPC response — which is actual store state)
         obs_targets = frozenset(exec_result["observed_targets"])
         ledger_client.record_authorization(
-            "task-1", "audit-cap", frozenset({"file:///audit/log.txt"}),
+            "task-1",
+            "audit-cap",
+            frozenset({"file:///audit/log.txt"}),
             source="test.broker",
         )
-        ledger_client.record_observation(
-            "task-1", "audit-cap", obs_targets, source="executor.IPC"
-        )
+        ledger_client.record_observation("task-1", "audit-cap", obs_targets, source="executor.IPC")
 
         # Verify: ledger can confirm the effect was applied
         from effect_broker.ledger import LedgerVerdict
@@ -264,15 +272,15 @@ class TestLedgerReadsExecutorStore:
         # Broker authorizes a capability but no executor observation exists
         # (simulates: broker authorized but store was NOT actually mutated)
         ledger_client.record_authorization(
-            "task-2", "bypass-attempt", frozenset({"file:///secrets"}),
+            "task-2",
+            "bypass-attempt",
+            frozenset({"file:///secrets"}),
             source="test.broker.simulated",
         )
         # No record_observation() called — no executor IPC response
 
         verdict = ledger_client.verify("task-2", "bypass-attempt")
-        assert isinstance(verdict, UnknownLedgerResult), (
-            "No observation → UNKNOWN (not safe)"
-        )
+        assert isinstance(verdict, UnknownLedgerResult), "No observation → UNKNOWN (not safe)"
 
     def test_complete_three_process_mediation(self) -> None:
         """End-to-end: broker → executor → ledger verification.
@@ -307,7 +315,9 @@ class TestLedgerReadsExecutorStore:
 
         # Step 2: Ledger records authorization + observation
         ledger_client.record_authorization(
-            "default", "send-bob-cap", frozenset({"bob@internal.corp.com"}),
+            "default",
+            "send-bob-cap",
+            frozenset({"bob@internal.corp.com"}),
             source="test.broker",
         )
         ledger_client.record_observation(

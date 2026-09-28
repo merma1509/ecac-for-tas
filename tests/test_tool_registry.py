@@ -48,35 +48,60 @@ def _make_broker_and_shim(
     # holder="EffectBroker" is the shim's effective holder (the shim acts on behalf of the tool).
     # _find_capability searches by (holder, right, target) → holder="EffectBroker" matches.
     broker.capabilities["r-read:reports"] = Capability(
-        owner="User", holder="EffectBroker", right="read", target="file:///reports",
-        scope=frozenset({"file:///reports"}), expiry=float("inf"),
-        nonce="r-read:reports", derives_from=None,
+        owner="User",
+        holder="EffectBroker",
+        right="read",
+        target="file:///reports",
+        scope=frozenset({"file:///reports"}),
+        expiry=float("inf"),
+        nonce="r-read:reports",
+        derives_from=None,
     )
     broker.capabilities["r-write:reports"] = Capability(
-        owner="User", holder="EffectBroker", right="write", target="file:///reports",
-        scope=frozenset({"file:///reports"}), expiry=float("inf"),
-        nonce="r-write:reports", derives_from=None,
+        owner="User",
+        holder="EffectBroker",
+        right="write",
+        target="file:///reports",
+        scope=frozenset({"file:///reports"}),
+        expiry=float("inf"),
+        nonce="r-write:reports",
+        derives_from=None,
     )
     broker.capabilities["r-write:secrets"] = Capability(
-        owner="User", holder="EffectBroker", right="write", target="file:///secrets",
-        scope=frozenset({"file:///secrets"}), expiry=float("inf"),
-        nonce="r-write:secrets", derives_from=None,
+        owner="User",
+        holder="EffectBroker",
+        right="write",
+        target="file:///secrets",
+        scope=frozenset({"file:///secrets"}),
+        expiry=float("inf"),
+        nonce="r-write:secrets",
+        derives_from=None,
     )
     broker.capabilities["r-send:corp"] = Capability(
-        owner="User", holder="EffectBroker", right="send", target="*",
+        owner="User",
+        holder="EffectBroker",
+        right="send",
+        target="*",
         # Domain-level scope: covers ALL internal email recipients.
         # This is the correct pattern for email capabilities: capability scope
         # is at the domain level, so BCC to team@corp.com passes NoAmp
         # (both "internal@corp.com" and "team@corp.com" → domain label "internal").
-        scope=frozenset({"internal"}), expiry=float("inf"),
-        nonce="r-send:corp", derives_from=None,
+        scope=frozenset({"internal"}),
+        expiry=float("inf"),
+        nonce="r-send:corp",
+        derives_from=None,
     )
     # Note: r-send:team is not needed for this test. The domain-level
     # r-send:corp covers all internal.com recipients.
     broker.capabilities["r-read:secrets"] = Capability(
-        owner="User", holder="EffectBroker", right="read", target="file:///secrets",
-        scope=frozenset({"file:///secrets"}), expiry=float("inf"),
-        nonce="r-read:secrets", derives_from=None,
+        owner="User",
+        holder="EffectBroker",
+        right="read",
+        target="file:///secrets",
+        scope=frozenset({"file:///secrets"}),
+        expiry=float("inf"),
+        nonce="r-read:secrets",
+        derives_from=None,
     )
 
     registry = ToolRegistry(strict=strict)
@@ -92,7 +117,11 @@ class TestToolRegistryStructuralEnforcement:
         """A tool that declared read may read."""
         broker, shim, registry = _make_broker_and_shim("read-tool")
         registry.declare(
-            ToolDeclaration("read-tool", declared_rights=frozenset({"read"}), declared_targets=frozenset({"file:///reports"}))
+            ToolDeclaration(
+                "read-tool",
+                declared_rights=frozenset({"read"}),
+                declared_targets=frozenset({"file:///reports"}),
+            )
         )
 
         content = shim.read("file:///reports")
@@ -111,7 +140,11 @@ class TestToolRegistryStructuralEnforcement:
         """
         broker, shim, registry = _make_broker_and_shim("read-only-tool")
         registry.declare(
-            ToolDeclaration("read-only-tool", declared_rights=frozenset({"read"}), declared_targets=frozenset({"file:///reports"}))
+            ToolDeclaration(
+                "read-only-tool",
+                declared_rights=frozenset({"read"}),
+                declared_targets=frozenset({"file:///reports"}),
+            )
         )
 
         with pytest.raises(SecurityError, match="undeclared-right"):
@@ -121,7 +154,11 @@ class TestToolRegistryStructuralEnforcement:
         """A tool may only access its declared targets."""
         broker, shim, registry = _make_broker_and_shim("reports-tool")
         registry.declare(
-            ToolDeclaration("reports-tool", declared_rights=frozenset({"read", "write"}), declared_targets=frozenset({"file:///reports"}))
+            ToolDeclaration(
+                "reports-tool",
+                declared_rights=frozenset({"read", "write"}),
+                declared_targets=frozenset({"file:///reports"}),
+            )
         )
 
         # Read on declared target → OK
@@ -196,7 +233,11 @@ class TestToolRegistryStructuralEnforcement:
         """A tool that declared both read and write may perform both."""
         broker, shim, registry = _make_broker_and_shim("读写-tool")
         registry.declare(
-            ToolDeclaration("读写-tool", declared_rights=frozenset({"read", "write"}), declared_targets=frozenset({"file:///reports"}))
+            ToolDeclaration(
+                "读写-tool",
+                declared_rights=frozenset({"read", "write"}),
+                declared_targets=frozenset({"file:///reports"}),
+            )
         )
 
         shim.read("file:///reports")
@@ -206,7 +247,11 @@ class TestToolRegistryStructuralEnforcement:
         """T13: tool declares "read reports" but attempts "write secrets"."""
         broker, shim, registry = _make_broker_and_shim("reports-reader")
         registry.declare(
-            ToolDeclaration("reports-reader", declared_rights=frozenset({"read"}), declared_targets=frozenset({"file:///reports"}))
+            ToolDeclaration(
+                "reports-reader",
+                declared_rights=frozenset({"read"}),
+                declared_targets=frozenset({"file:///reports"}),
+            )
         )
 
         # Even if the tool tries to write to a different file, it's blocked
@@ -217,7 +262,11 @@ class TestToolRegistryStructuralEnforcement:
         """Undeclared right: no Effect is built → no ledger entry → complete mediation."""
         broker, shim, registry = _make_broker_and_shim("safe-tool")
         registry.declare(
-            ToolDeclaration("safe-tool", declared_rights=frozenset({"read"}), declared_targets=frozenset({"file:///reports"}))
+            ToolDeclaration(
+                "safe-tool",
+                declared_rights=frozenset({"read"}),
+                declared_targets=frozenset({"file:///reports"}),
+            )
         )
 
         initial_log_len = len(broker.store.effects_log)
@@ -292,7 +341,11 @@ class TestToolRegistryStructuralEnforcement:
         """ToolRegistry.check_operation_by_name() for pre-Effect validation."""
         registry = ToolRegistry()
         registry.declare(
-            ToolDeclaration("test-tool", declared_rights=frozenset({"read", "send"}), declared_targets=frozenset({"file:///a", "internal@corp.com"}))  # noqa: E501
+            ToolDeclaration(
+                "test-tool",
+                declared_rights=frozenset({"read", "send"}),
+                declared_targets=frozenset({"file:///a", "internal@corp.com"}),
+            )  # noqa: E501
         )
 
         ok, reason = registry.check_operation_by_name("test-tool", "read", "file:///a")
@@ -306,7 +359,9 @@ class TestToolRegistryStructuralEnforcement:
         assert not ok
         assert "undeclared-target" in reason
 
-        ok, reason = registry.check_operation_by_name("test-tool", "send", "internal@corp.com", frozenset({"external@evil.com"}))  # noqa: E501
+        ok, reason = registry.check_operation_by_name(
+            "test-tool", "send", "internal@corp.com", frozenset({"external@evil.com"})
+        )  # noqa: E501
         assert not ok
         assert "undeclared-extra-target" in reason
 

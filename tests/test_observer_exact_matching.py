@@ -49,10 +49,9 @@ class TestEffectObserverExactMatching:
         assert isinstance(verdict, UnknownLedgerResult), (
             f"(auth>0, obs=0) should be UnknownLedgerResult, got {verdict}"
         )
-        assert (
-            "authorized_not_observed" in verdict.reason
-            or "possible_bypass" in verdict.reason
-        ), f"Unexpected reason: {verdict.reason}"
+        assert "authorized_not_observed" in verdict.reason or "possible_bypass" in verdict.reason, (
+            f"Unexpected reason: {verdict.reason}"
+        )
 
     def test_one_auth_multiple_obs_over_observed(self) -> None:
         """One auth, two obs → UnknownLedgerResult (over-observed: "unknown, not safe")."""
@@ -87,12 +86,9 @@ class TestEffectObserverExactMatching:
     def test_bcc_extra_target_observed_not_in_authorization(self) -> None:
         """BCC target observed but NOT authorized → UnknownLedgerResult."""
         ledger = IndependentEffectLedger()
-        ledger.record_authorization(
-            "default", "cap:send", frozenset({"internal@corp.com"})
-        )
+        ledger.record_authorization("default", "cap:send", frozenset({"internal@corp.com"}))
         ledger.record_observation(
-            "default", "cap:send",
-            frozenset({"internal@corp.com", "attacker@elsewhere.com"})
+            "default", "cap:send", frozenset({"internal@corp.com", "attacker@elsewhere.com"})
         )
 
         verdict = ledger.verify("default", "cap:send")
@@ -113,9 +109,7 @@ class TestEffectObserverExactMatching:
         assert ledger.verify("task-B", "cap:read") == LedgerVerdict.CONFIRMED_COMMITTED
 
         # Replay in task-A: adding a second unauthorized observation triggers over-observed
-        ledger.record_observation(
-            "task-A", "cap:read", frozenset({"file:///a", "file:///extra"})
-        )
+        ledger.record_observation("task-A", "cap:read", frozenset({"file:///a", "file:///extra"}))
         verdict_replay = ledger.verify("task-A", "cap:read")
         assert isinstance(verdict_replay, UnknownLedgerResult)
 
@@ -134,12 +128,9 @@ class TestEffectObserverExactMatching:
         """
         ledger = IndependentEffectLedger()
         # Pre-populate internal state (simulating broker records auth + executor records obs)
-        ledger.record_authorization(
-            "task-A", "cap:send", frozenset({"internal@corp.com"})
-        )
+        ledger.record_authorization("task-A", "cap:send", frozenset({"internal@corp.com"}))
         ledger.record_observation(
-            "task-A", "cap:send",
-            frozenset({"internal@corp.com", "attacker@elsewhere.com"})
+            "task-A", "cap:send", frozenset({"internal@corp.com", "attacker@elsewhere.com"})
         )
 
         # verify() directly catches the over-observed case

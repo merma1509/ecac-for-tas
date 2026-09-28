@@ -398,6 +398,7 @@ class TestMediatorMetadataLimitation:
         The capability-level predicates (Auth/FlowOK/NoAmp/Fresh) still gate.
         """
         from effect_broker.model import Task
+
         broker = EffectBroker()
 
         # Bootstrap the resource so apply_effect() doesn't KeyError
@@ -408,9 +409,13 @@ class TestMediatorMetadataLimitation:
             task_id="default",
             owner=USER,
             ceiling=Capability(
-                owner=USER, holder="EffectBroker", right="*",
-                target="*", scope=frozenset({"*"}),
-                expiry=float("inf"), nonce="default-ceiling",
+                owner=USER,
+                holder="EffectBroker",
+                right="*",
+                target="*",
+                scope=frozenset({"*"}),
+                expiry=float("inf"),
+                nonce="default-ceiling",
             ),
         )
         broker.tasks["default"] = default_task
@@ -552,6 +557,7 @@ class TestBCCScopeEnforcement:
         assert "extra-target-outside-scope" in evidence["predicates"]["NoAmp"]
         assert broker.store.effects_log == []
 
+
 # ---- Fresh-first BCC: approval for send(internal) + extra external → BLOCK ----
 class TestFreshFirstBCCExtraRecipient:
     """Gap: approval for send(internal) must not allow extra external recipient.
@@ -575,8 +581,13 @@ class TestFreshFirstBCCExtraRecipient:
             task_id="default",
             owner=USER,
             ceiling=Capability(
-                USER, "EffectBroker", "send", "internal@corp.com",
-                frozenset({"internal"}), float("inf"), "ceiling-send",
+                USER,
+                "EffectBroker",
+                "send",
+                "internal@corp.com",
+                frozenset({"internal"}),
+                float("inf"),
+                "ceiling-send",
             ),
         )
         broker.register_task(task)
@@ -629,8 +640,13 @@ class TestFreshFirstBCCExtraRecipient:
             task_id="default",
             owner=USER,
             ceiling=Capability(
-                USER, "EffectBroker", "send", "internal@corp.com",
-                frozenset({"internal"}), float("inf"), "ceiling-send",
+                USER,
+                "EffectBroker",
+                "send",
+                "internal@corp.com",
+                frozenset({"internal"}),
+                float("inf"),
+                "ceiling-send",
             ),
         )
         broker.register_task(task)
@@ -684,8 +700,13 @@ class TestFreshFirstBCCExtraRecipient:
             task_id="task-a",
             owner=USER,
             ceiling=Capability(
-                USER, "EffectBroker", "send", "internal@corp.com",
-                frozenset({"internal"}), float("inf"), "ceiling-send",
+                USER,
+                "EffectBroker",
+                "send",
+                "internal@corp.com",
+                frozenset({"internal"}),
+                float("inf"),
+                "ceiling-send",
             ),
         )
         broker.register_task(task_a)
@@ -708,8 +729,13 @@ class TestFreshFirstBCCExtraRecipient:
             task_id="task-b",
             owner=USER,
             ceiling=Capability(
-                USER, "EffectBroker", "send", "internal@corp.com",
-                frozenset({"internal"}), float("inf"), "ceiling-send",
+                USER,
+                "EffectBroker",
+                "send",
+                "internal@corp.com",
+                frozenset({"internal"}),
+                float("inf"),
+                "ceiling-send",
             ),
         )
         broker.register_task(task_b)

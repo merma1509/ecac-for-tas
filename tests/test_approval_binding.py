@@ -403,11 +403,17 @@ class TestApprovalExactBinding:
 
         field_names = {f.name for f in fields(ApprovedRequest)}
         # content_hash is now part of the immutable binding
-        assert (
-            "content_hash" in field_names
-        ), "content_hash must be in ApprovedRequest binding"
+        assert "content_hash" in field_names, "content_hash must be in ApprovedRequest binding"
         # Verify all binding fields exist
-        assert field_names >= {"nonce", "etype", "targets", "expiry", "task_id", "granted_by", "content_hash"}
+        assert field_names >= {
+            "nonce",
+            "etype",
+            "targets",
+            "expiry",
+            "task_id",
+            "granted_by",
+            "content_hash",
+        }
 
     def test_approval_allows_with_exact_binding_match(self) -> None:
         """Exact match: etype + target + task_id → ALLOW."""

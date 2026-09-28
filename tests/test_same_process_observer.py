@@ -44,10 +44,7 @@ class TestLedgerUnknownForUnobservable:
         assert isinstance(verdict, UnknownLedgerResult), (
             f"(auth>0, obs=0) should be UnknownLedgerResult, got {verdict}"
         )
-        assert (
-            "authorized_not_observed" in verdict.reason
-            or "possible_bypass" in verdict.reason
-        )
+        assert "authorized_not_observed" in verdict.reason or "possible_bypass" in verdict.reason
 
     def test_ledger_never_returns_safe_for_unverifiable(self) -> None:
         """No combination of (auth, obs) produces 'safe'."""
@@ -120,13 +117,9 @@ class TestLedgerUnknownForUnobservable:
     def test_extra_targets_in_observation_not_in_authorization(self) -> None:
         """Extra observed target not in authorization → UnknownLedgerResult."""
         ledger = IndependentEffectLedger()
-        ledger.record_authorization(
-            "default", "send-cap",
-            frozenset({"internal@corp.com"})
-        )
+        ledger.record_authorization("default", "send-cap", frozenset({"internal@corp.com"}))
         ledger.record_observation(
-            "default", "send-cap",
-            frozenset({"internal@corp.com", "attacker@external.com"})
+            "default", "send-cap", frozenset({"internal@corp.com", "attacker@external.com"})
         )
 
         verdict = ledger.verify("default", "send-cap")
@@ -143,9 +136,7 @@ class TestLedgerCompleteMediationSemantics:
         ledger.record_authorization("default", "cap-1", frozenset({"file:///reports"}))
         ledger.record_observation("default", "cap-1", frozenset({"file:///reports"}))
 
-        failures = ledger.verify_all(
-            {("default", "cap-1"): frozenset({"file:///reports"})}
-        )
+        failures = ledger.verify_all({("default", "cap-1"): frozenset({"file:///reports"})})
         assert failures == [], f"Exact match should have 0 failures, got: {failures}"
 
     def test_unverifiable_effects_produce_failures(self) -> None:
@@ -155,12 +146,8 @@ class TestLedgerCompleteMediationSemantics:
         ledger.record_authorization("default", "bypass-cap", frozenset({"file:///secrets"}))
         # No observation — possible direct bypass
 
-        failures = ledger.verify_all(
-            {("default", "bypass-cap"): frozenset({"file:///secrets"})}
-        )
-        assert len(failures) > 0, (
-            "Unverifiable effect should produce failure, not silent 'safe'"
-        )
+        failures = ledger.verify_all({("default", "bypass-cap"): frozenset({"file:///secrets"})})
+        assert len(failures) > 0, "Unverifiable effect should produce failure, not silent 'safe'"
         assert "UNKNOWN" in failures[0]
         assert "possible_bypass" in failures[0]
 
@@ -178,15 +165,16 @@ class TestLedgerCompleteMediationSemantics:
         # extra-obs-cap: observed with extra target
         ledger.record_authorization("task-2", "extra-obs-cap", frozenset({"internal@corp.com"}))
         ledger.record_observation(
-            "task-2", "extra-obs-cap",
-            frozenset({"internal@corp.com", "external@evil.com"})
+            "task-2", "extra-obs-cap", frozenset({"internal@corp.com", "external@evil.com"})
         )
 
-        failures = ledger.verify_all({
-            ("task-1", "good-cap"): frozenset({"file:///reports"}),
-            ("task-1", "bypass-cap"): frozenset({"file:///secrets"}),
-            ("task-2", "extra-obs-cap"): frozenset({"internal@corp.com"}),
-        })
+        failures = ledger.verify_all(
+            {
+                ("task-1", "good-cap"): frozenset({"file:///reports"}),
+                ("task-1", "bypass-cap"): frozenset({"file:///secrets"}),
+                ("task-2", "extra-obs-cap"): frozenset({"internal@corp.com"}),
+            }
+        )
 
         # Two failures: bypass-cap (unverifiable) + extra-obs-cap (extra observed)
         assert len(failures) == 2, (
@@ -209,12 +197,8 @@ class TestLedgerCompleteMediationSemantics:
             "default", "flow-blocked-cap", frozenset(), source="broker.commit:BLOCKED"
         )
 
-        failures = ledger.verify_all(
-            {("default", "flow-blocked-cap"): frozenset({"target"})}
-        )
-        assert failures == [], (
-            f"CONFIRMED_BLOCKED should not produce failure, got: {failures}"
-        )
+        failures = ledger.verify_all({("default", "flow-blocked-cap"): frozenset({"target"})})
+        assert failures == [], f"CONFIRMED_BLOCKED should not produce failure, got: {failures}"
 
 
 class TestLedgerBackwardsCompatibility:
