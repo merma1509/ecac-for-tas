@@ -726,3 +726,112 @@ class TestApprovalGlobalRevocation:
         assert allow2_task2 is True, (
             f"Task2 should ALLOW — different task, revocation in task1 is isolated. Evidence: {ev2_task2}"  # noqa: E501
         )
+
+
+class TestApprovalContentBinding:
+    """Content binding: content changes after approval are BLOCKED."""
+
+    def test_content_hash_binds_actual_write_content(self) -> None:
+        """Shim includes actual content in metadata → content_hash is computed."""
+        # Simulate: tool requests approval for write with body="original"
+        # Then tries to write body="modified" → should BLOCK
+
+        from effect_broker.model import Commit, Effect, Task
+        from effect_broker.traces import build
+
+        broker = build()
+
+        # Create task with capability
+        ceiling = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="write",
+            target="file:///test.txt",
+            scope=frozenset({"file:///test.txt"}),
+            expiry=float("inf"),
+            nonce="ceiling-write",
+        )
+        task = Task(task_id="test", owner="User", ceiling=ceiling)
+        broker.register_task(task)
+
+        # Step 1: Tool requests approval for write with content="original"
+        request_effect = Effect(
+            etype="write",
+            target="file:///test.txt",
+            metadata={"content": b"original content"},
+            provenance=_provenance("request"),
+            capability_nonce="r-write:Agent:EffectBroker",
+            delegation_chain=("Approver",),
+        )
+        nonce = broker.grant_approval(request_effect, expiry=100.0, task_id="test")
+        stored = broker._approved_requests.get(nonce)
+
+        # Verify content_hash was stored
+        assert stored is not None
+        assert stored.content_hash is not None, "content_hash must be stored on approval"
+
+        # Content hash should match original content
+        original_hash = request_effect.compute_content_hash()
+        assert stored.content_hash == original_hash
+
+        # Step 2: Tool tries to commit with DIFFERENT content
+        modified_effect = Effect(
+            etype="write",
+            target="file:///test.txt",
+            metadata={"content": b"modified content"},  # Different!
+            provenance=_provenance("modified"),
+            capability_nonce=nonce,
+            delegation_chain=("Approver",),
+        )
+        commit = Commit(effect=modified_effect, task=task, approved_request=stored)
+        allow, evidence = broker.commit(commit)
+
+        # Should BLOCK - content mismatch
+        assert allow is False, "Content modification after approval should BLOCK"
+        assert evidence["primary_blocker"] == "ApprovalBinding"
+        assert "content-hash-mismatch" in evidence["approval_binding"]
+
+    def test_content_hash_allows_exact_content_match(self) -> None:
+        """Exact content match → ALLOW."""
+        from effect_broker.model import Commit, Effect, Task
+        from effect_broker.traces import build
+
+        broker = build()
+
+        ceiling = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="write",
+            target="file:///test.txt",
+            scope=frozenset({"file:///test.txt"}),
+            expiry=float("inf"),
+            nonce="ceiling-write",
+        )
+        task = Task(task_id="test", owner="User", ceiling=ceiling)
+        broker.register_task(task)
+
+        content = b"exact content"
+        request_effect = Effect(
+            etype="write",
+            target="file:///test.txt",
+            metadata={"content": content},
+            provenance=_provenance("request"),
+            capability_nonce="r-write:Agent:EffectBroker",
+            delegation_chain=("Approver",),
+        )
+        nonce = broker.grant_approval(request_effect, expiry=100.0, task_id="test")
+        stored = broker._approved_requests.get(nonce)
+
+        # Same content → ALLOW
+        exact_effect = Effect(
+            etype="write",
+            target="file:///test.txt",
+            metadata={"content": content},  # Same!
+            provenance=_provenance("exact"),
+            capability_nonce=nonce,
+            delegation_chain=("Approver",),
+        )
+        commit = Commit(effect=exact_effect, task=task, approved_request=stored)
+        allow, evidence = broker.commit(commit)
+
+        assert allow is True, f"Exact content match should ALLOW. Evidence: {evidence}"
