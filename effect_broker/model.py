@@ -539,16 +539,17 @@ class Effect:
         if self.etype == "send":
             body = self.metadata.get("body", "")
             subject = self.metadata.get("subject", "")
-            # Combine body and subject for a single content hash
-            combined = f"{subject}|{body}"
-            return compute_content_hash(combined)
+            if isinstance(body, str) and isinstance(subject, str):
+                # Combine body and subject for a single content hash
+                combined = f"{subject}|{body}"
+                return compute_content_hash(combined)
 
         # For write effects, hash the content being written
         if self.etype == "write":
             content = self.metadata.get("content", "")
             if isinstance(content, bytes):
                 content = content.decode("utf-8", errors="replace")
-            if content:
+            if isinstance(content, str) and content:
                 return compute_content_hash(content)
 
         # For read/delete effects, there's no mutable content to bind
