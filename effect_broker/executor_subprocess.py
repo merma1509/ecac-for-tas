@@ -929,3 +929,26 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ---- Architectural Limitation Note ----
+# The subprocess confinement is EFFECT-TYPE LEVEL, not CODE-LEVEL.
+#
+# What IS confined:
+#   - Only Effect types (write, read, delete, send, network) are executed
+#   - The subprocess cannot execute arbitrary Python code
+#   - Only pre-defined operations via _apply_effect()
+#
+# What is NOT confined:
+#   - The subprocess runs as a full Python process with access to all stdlib
+#   - If an attacker compromises the subprocess, they could import os, subprocess, etc.
+#   - This is an architectural limitation of Python (no fine-grained syscall filtering)
+#
+# For true subprocess code confinement, use:
+#   1. seccompBerkeley BPF (Linux): restrict syscalls
+#   2. Landlock (Linux 5.13+): filesystem sandboxing
+#   3. AppArmor/SELinux profiles
+#   4. WebAssembly isolation (Wasmtime, WasmEdge)
+#   5. gVisor (Google's container sandbox)
+#
+# Current protection: process isolation + IPC serialization + ledger audit
