@@ -9,6 +9,7 @@ authors = [{ name = "Niyonshuti Martin" }]
 keywords = ["agent-security", "tool-agents", "authority", "information-flow", "capabilities", "mcp"]
 
 dependencies = [
+    "aiosmtpd>=1.4",
     "pytest-asyncio>=1.4.0",
 ]
 
@@ -17,7 +18,6 @@ dev = [
     "pytest>=8.0",
     "mypy>=1.10",
     "ruff>=0.6",
-    "aiosmtpd>=1.4",
 ]
 
 [build-system]
