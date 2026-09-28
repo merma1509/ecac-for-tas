@@ -115,12 +115,12 @@ name = "effect-broker"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiosmtpd" },
     { name = "pytest-asyncio" },
 ]
 
 [package.optional-dependencies]
 dev = [
-    { name = "aiosmtpd" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "ruff" },
@@ -135,7 +135,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiosmtpd", marker = "extra == 'dev'", specifier = ">=1.4" },
+    { name = "aiosmtpd", specifier = ">=1.4" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
