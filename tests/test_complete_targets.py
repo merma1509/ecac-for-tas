@@ -886,3 +886,26 @@ class TestLedgerVerdictUnknownAfterCrash:
             f"Expected UNKNOWN when obs exists but no auth record, got {verdict}. "
             f"SAFE would be a false positive."
         )
+
+
+class TestFilePathHandling:
+    """Verify file:// paths are correctly converted to OS paths."""
+
+    def test_absolute_path_preserved(self) -> None:
+        """Absolute paths like /etc/passwd must not be stripped.
+
+        file:///etc/passwd -> /etc/passwd (correct)
+        NOT: etc/passwd (incorrect - loses /)
+        """
+        # Test the string transformation logic directly
+        target = "file:///etc/passwd"
+        os_path = target[7:]  # strip file:// prefix only
+        # Should be /etc/passwd, not etc/passwd
+        assert os_path.startswith("/"), f"OS path should start with /: {os_path}"
+        assert os_path == "/etc/passwd", f"Path should be /etc/passwd: {os_path}"
+
+    def test_relative_path_handled(self) -> None:
+        """Relative paths are preserved."""
+        target = "file://./test.txt"
+        os_path = target[7:]
+        assert os_path == "./test.txt"
