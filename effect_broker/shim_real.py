@@ -476,6 +476,11 @@ class RealFileShim:
           7. Commit to ledger
           8. Return result
         """
+        # SECURITY: Convert mutable content to immutable bytes to prevent TOCTOU
+        # where tool modifies content after authorization but before execution
+        if content is not None and not isinstance(content, bytes):
+            content = bytes(content)  # Convert mutable types to immutable
+
         # Broker uses file:// URIs internally — canonicalize to OS path for open/remove,
         # then convert back to file:// for the effect target
         canon = self._canonical_path(path)
@@ -528,10 +533,11 @@ class RealFileShim:
 
         known_targets = EffectTarget(primary=uri, additional=extras)
 
-        effect = Effect(
-            etype=op_type,
-            target=uri,
-            metadata={
+        # Include actual content in metadata BEFORE broker.commit
+        # This binds the content to the effect for content_hash verification
+        if op_type == "write" and content is not None:
+            metadata = {
+                "content": content,  # Actual bytes being written - bound for content_hash
                 "os_statx": statx_meta,
                 "confidentiality_source": "os-statx"
                 if statx_meta.get("stx_unavailable") is None
@@ -539,7 +545,22 @@ class RealFileShim:
                 if conf == Confidentiality.CONFIDENTIAL or conf == Confidentiality.PUBLIC
                 else "path-keyword-fallback",
                 "pre_exists": pre_exists,
-            },
+            }
+        else:
+            metadata = {
+                "os_statx": statx_meta,
+                "confidentiality_source": "os-statx"
+                if statx_meta.get("stx_unavailable") is None
+                else "permission-bits"
+                if conf == Confidentiality.CONFIDENTIAL or conf == Confidentiality.PUBLIC
+                else "path-keyword-fallback",
+                "pre_exists": pre_exists,
+            }
+
+        effect = Effect(
+            etype=op_type,
+            target=uri,
+            metadata=metadata,
             provenance=(
                 Data(f"shim-{op_type}", conf, integ),
                 Data(f"real-path={canon}", conf, Integrity.USER),
