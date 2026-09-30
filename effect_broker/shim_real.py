@@ -23,6 +23,7 @@ that has no filesystem access except via a whitelisted wrapper.
 
 from __future__ import annotations
 
+import base64
 import os
 import pathlib
 import re
@@ -475,6 +476,11 @@ class RealFileShim:
           7. Commit to ledger
           8. Return result
         """
+        # SECURITY: Convert mutable content to immutable bytes to prevent TOCTOU
+        # where tool modifies content after authorization but before execution
+        if content is not None and not isinstance(content, bytes):
+            content = bytes(content)  # Convert mutable types to immutable
+
         # Broker uses file:// URIs internally — canonicalize to OS path for open/remove,
         # then convert back to file:// for the effect target
         canon = self._canonical_path(path)
@@ -529,11 +535,9 @@ class RealFileShim:
 
         # Include actual content in metadata BEFORE broker.commit
         # This binds the content to the effect for content_hash verification
-        # For IPC-safe serialization, base64 encode the content
-        import base64
         if op_type == "write" and content is not None:
             metadata = {
-                "content_b64": base64.b64encode(content).decode(),  # Base64 for JSON safety
+                "content": content,  # Actual bytes being written - bound for content_hash
                 "os_statx": statx_meta,
                 "confidentiality_source": "os-statx"
                 if statx_meta.get("stx_unavailable") is None

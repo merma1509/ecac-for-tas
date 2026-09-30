@@ -64,11 +64,21 @@ class ExecutorRequest(Enum):
 # All classes are imported from .model and converted explicitly here.
 def effect_to_dict(effect: Any) -> dict[str, Any]:
     """Serialize an Effect to a plain dict for IPC."""
+    import base64
+
+    # Handle metadata with bytes content - convert to base64 for JSON safety
+    metadata = dict(effect.metadata)
+    if "content" in metadata and isinstance(metadata["content"], bytes):
+        metadata["content_b64"] = base64.b64encode(metadata["content"]).decode()
+        del metadata["content"]
+    elif "content" not in metadata and "content_b64" not in metadata:
+        # Ensure metadata is JSON-safe
+        pass  # Already handled
 
     return {
         "etype": effect.etype,
         "target": effect.target,
-        "metadata": dict(effect.metadata),
+        "metadata": metadata,
         "provenance": [
             {
                 "name": d.name,
