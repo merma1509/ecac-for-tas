@@ -24,6 +24,7 @@ that has no filesystem access except via a whitelisted wrapper.
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import pathlib
 import re
@@ -605,7 +606,15 @@ class RealFileShim:
             try:
                 if op_type == "write":
                     assert content is not None
-                    result = self.ipc_client.real_file_write(canon, content, self.task_id)
+                    # Compute approved_content_hash from metadata.
+                    # The shim computes hash(content) and passes it to subprocess.
+                    # Subprocess verifies hash(content_from_IPC) == approved_content_hash.
+                    # This closes the gate↔execute coupling gap.
+                    content_hash = hashlib.sha256(content).hexdigest()
+                    result = self.ipc_client.real_file_write(
+                        canon, content, self.task_id,
+                        approved_content_hash=content_hash,
+                    )
                     # session_update may carry taint from CONFIDENTIAL write
                     if result.get("session_update"):
                         self._sync_session_from_subprocess(result["session_update"])

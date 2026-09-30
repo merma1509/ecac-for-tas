@@ -395,24 +395,31 @@ class ProcessExecutorClient:
         task_id: str,
         session_snapshot: dict[str, Any],
         reserve_nonce: bool = True,
+        approved_content_hash: str | None = None,
     ) -> dict[str, Any]:
-        """Atomic commit: Fresh check + nonce reserve + apply in subprocess.
+        """Atomic commit: Fresh check + content_hash verify + apply in subprocess.
 
-        This implements the atomic commit protocol from the session sync fix:
-        1. Subprocess receives A's session snapshot
-        2. Fresh check (replay + revoked) in subprocess using A's snapshot
-        3. If Fresh: nonce reserved, effect applied, taint tracked
-        4. Returns session_update with updated state
+        ATOMIC COMMIT PROTOCOL (gate↔execute coupling):
+        ─────────────────────────────────────────────────────────
+        This is the ONLY path for effects in multi-process mode. It ensures:
+          1. Broker gate() authorizes effect with content_hash
+          2. IPC sends (effect, approved_content_hash) — both HMAC-protected
+          3. Subprocess verifies hash(content_from_metadata) == approved_content_hash
+          4. On match: apply_effect; on mismatch: BLOCK
+
+        This closes the gap where Broker authorizes content_A but subprocess
+        could apply content_B. Both values are in the same HMAC-signed payload.
 
         Args:
-            effect_dict: Serialized effect to apply
+            effect_dict: Serialized effect to apply (includes content in metadata)
             task_id: Task ID for session tracking
             session_snapshot: A's session state at gate time
             reserve_nonce: Whether to reserve the nonce in the subprocess
+            approved_content_hash: SHA256 hash of authorized content (from ApprovedRequest)
 
         Returns:
             Success: {"status": "ok", "observed_targets": [...], "session_update": {...}}
-            Blocked: {"status": "blocked", "blocker": "Fresh", "reason": "replay|revoked|expired"}
+            Blocked: {"status": "blocked", "blocker": "Fresh|ContentBinding", "reason": str}
             Error: {"status": "error", "reason": str}
         """
         with self._lock:
@@ -424,6 +431,7 @@ class ProcessExecutorClient:
                     "task_id": task_id,
                     "session_snapshot": session_snapshot,
                     "reserve_nonce": reserve_nonce,
+                    "approved_content_hash": approved_content_hash, 
                 },
             )
         if not resp.get("ok"):
@@ -518,9 +526,27 @@ class ProcessExecutorClient:
         return resp
 
     def real_file_write(
-        self, path: str, content: bytes, task_id: str = "default"
+        self,
+        path: str,
+        content: bytes,
+        task_id: str = "default",
+        approved_content_hash: str | None = None,
     ) -> dict[str, Any]:
         """Write content to a real file in the executor subprocess.
+
+        SECURITY: content_hash verification closes the gap between broker gate()
+        and subprocess execution. Both the effect (via broker.commit) and the
+        content (via this IPC call) are signed by HMAC. The subprocess verifies
+        that hash(content) == approved_content_hash before writing.
+
+        This prevents a compromised subprocess from writing content_B when the
+        broker authorized content_A.
+
+        Args:
+            path: File path to write to
+            content: Actual bytes to write (HMAC-protected in payload)
+            task_id: Task ID for session tracking
+            approved_content_hash: SHA256 hash of authorized content (from Effect metadata)
 
         Returns: {"ok": bool, "path": str, "confidentiality": str,
                   "session_update": dict, "error": str | None}
@@ -536,6 +562,7 @@ class ProcessExecutorClient:
                     "path": path,
                     "content": base64.b64encode(content).decode(),
                     "task_id": task_id,
+                    "approved_content_hash": approved_content_hash,
                 },
             )
         if not resp.get("ok"):

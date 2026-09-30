@@ -312,13 +312,36 @@ class SubprocessExecutor:
             session_snapshot = session_state_to_dict(session) if session else {}
             effect_dict = effect_to_dict(effect)
 
-            # APPLY_COMMIT: Fresh check + nonce reserve + apply_effect in B
+            # Compute approved_content_hash for atomic commit verification.
+            # The subprocess verifies hash(effect.metadata.content) == approved_content_hash.
+            # This closes the gate↔execute coupling gap.
+            approved_content_hash: str | None = None
+            metadata = effect.metadata or {}
+            content_raw = metadata.get("content", "")
+            if isinstance(content_raw, bytes) and content_raw:
+                import hashlib
+                approved_content_hash = hashlib.sha256(content_raw).hexdigest()
+            elif isinstance(content_raw, str) and content_raw:
+                import hashlib
+                approved_content_hash = hashlib.sha256(content_raw.encode("utf-8")).hexdigest()
+            elif "content_b64" in metadata:
+                # Content was base64-encoded for JSON transport
+                import base64
+                try:
+                    decoded = base64.b64decode(metadata["content_b64"])
+                    import hashlib
+                    approved_content_hash = hashlib.sha256(decoded).hexdigest()
+                except Exception:
+                    pass  # Invalid base64 — skip hash binding
+
+            # APPLY_COMMIT: Fresh check + content_hash verify + apply_effect in B
             # B returns session_update with updated state (taint, used, logical_time)
             resp = self._client.apply_commit(
                 effect_dict=effect_dict,
                 task_id=task.task_id,
                 session_snapshot=session_snapshot,
                 reserve_nonce=True,
+                approved_content_hash=approved_content_hash,
             )
 
             if resp.get("status") == "ok":
