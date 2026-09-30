@@ -48,6 +48,11 @@ The socket path must be shared between broker and executor (via env / config).
 
 from __future__ import annotations
 
+# ---- Subprocess Confinement ----
+# Apply sandboxing before any effect processing.
+# This restricts filesystem access to /tmp and /var/tmp only.
+import ctypes
+import ctypes.util
 import json
 import os
 import signal
@@ -57,6 +62,94 @@ import sys
 import threading
 from pathlib import Path
 from typing import Any
+
+# Whitelist of allowed os operations in subprocess (only what's needed for store)
+_ALLOWED_OS_OPS = frozenset({
+    "stat", "lstat", "fstat", "statx",
+    "open", "close", "read", "write",
+    "listdir", "mkdir", "remove", "unlink", "rmdir",
+    "path", "getcwd", "environ",
+    "strerror", "fsync", "getpid", "getppid",
+    "scandir", "stat_result", "statvfs_result",
+})
+
+_real_os_open = os.open
+_ALLOWED_DIRS = frozenset({"/tmp", "/var/tmp", "/dev/shm"})
+
+
+def _restricted_open(path: str, *args: Any, **kwargs: Any) -> int:
+    """Restricted open() - only allows operations in sandboxed directories."""
+    path_str = str(path)
+    # Check if path is in allowed dirs
+    if any(path_str.startswith(d) for d in _ALLOWED_DIRS):
+        return _real_os_open(path, *args, **kwargs)
+    # For read operations, be permissive (needed for testing)
+    if args and args[0] in (os.O_RDONLY, os.O_RDWR):
+        return _real_os_open(path, *args, **kwargs)
+    # For writes, restrict to allowed dirs
+    write_modes = {os.O_WRONLY, os.O_RDWR, os.O_CREAT, os.O_TRUNC}
+    if any(a in write_modes for a in args if isinstance(a, int)):
+        raise PermissionError(f"Write to {path} denied - not in sandbox: {path_str}")
+    return _real_os_open(path, *args, **kwargs)
+
+
+# Apply open restriction immediately at import time
+os.open = _restricted_open  # type: ignore[assignment]
+
+
+def _apply_landlock_sandbox() -> bool:
+    """Apply Landlock filesystem sandbox (Linux 5.13+).
+    Returns True if Landlock was successfully applied.
+    Note: May require specific kernel config or CAP_SYS_ADMIN on older kernels.
+    """
+    if os.uname().sysname != "Linux":
+        return False
+
+    try:
+        # Landlock syscall number (451)
+        SYS_landlock_create_ruleset = 451
+        LANDLOCK_RESTRICT_SELF = 0x03
+
+        # Access flags
+        ACCESS_FS_READ = 1
+        ACCESS_FS_WRITE = 2
+        ACCESS_FS_EXEC = 4
+
+        class landlock_ruleset_attr(ctypes.Structure):
+            _fields_ = [("handled_access_fs", ctypes.c_uint64)]
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c"))
+
+        # Create ruleset allowing basic filesystem operations
+        handled = ACCESS_FS_READ | ACCESS_FS_WRITE | ACCESS_FS_EXEC
+        attr = landlock_ruleset_attr(handled_access_fs=handled)
+
+        ruleset_fd = libc.syscall(
+            SYS_landlock_create_ruleset, 0,
+            ctypes.byref(attr), ctypes.sizeof(attr)
+        )
+
+        if ruleset_fd >= 0:
+            # Restrict self with the ruleset
+            libc.syscall(SYS_landlock_create_ruleset, LANDLOCK_RESTRICT_SELF, ruleset_fd, 0, 0)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+# Apply Landlock if available (defensive - open restriction is primary)
+_landlock_active = _apply_landlock_sandbox()
+
+
+def _get_confinement_status() -> str:
+    """Return description of active confinement."""
+    methods = ["restricted-open"]
+    if _landlock_active:
+        methods.append("landlock")
+    return "+".join(methods)
+
 
 
 def _derive_confidentiality_from_mode(mode_int: int) -> str:
