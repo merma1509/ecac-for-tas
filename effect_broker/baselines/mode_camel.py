@@ -61,6 +61,7 @@ class CaMeLBroker:
 
         if effect.etype == "send":
             # CaMeL only checks confidentiality in provenance
+            # No taint propagation - same confidential data allows send
             for d in effect.provenance:
                 if d.confidentiality == Confidentiality.CONFIDENTIAL:
                     # CaMeL doesn't propagate session taint!
@@ -75,4 +76,31 @@ class CaMeLBroker:
             "blocker": None,
             "reason": "CaMeL: IFC OK",
             "policy": "CaMeL",
+        }
+
+
+# ---- Simpler, more honest weak baseline for comparison ----
+class CaMeLWeakBaseline:
+    """
+    Simplified CaMeL: checks confidentiality labels, no other security.
+
+    This is the BASE CASE - no security beyond basic label checking.
+    We use this to show our ECAC's improvement over label-only approaches.
+    """
+
+    def commit_effect(self, effect: Effect, task_id: str = "default") -> tuple[bool, dict]:
+        """Allow all effects with INTERNAL or lower confidentiality."""
+        # Only check that provenance doesn't exceed PUBLIC
+        for d in effect.provenance:
+            if d.confidentiality.value > Confidentiality.INTERNAL.value:
+                return False, {
+                    "blocker": "CONFIDENTIAL-flow",
+                    "reason": "CaMeLWeak: CONFIDENTIAL not allowed without taint check",
+                    "policy": "CaMeL-Weak",
+                }
+
+        return True, {
+            "blocker": None,
+            "reason": "CaMeLWeak: label OK",
+            "policy": "CaMeL-Weak",
         }
