@@ -416,9 +416,10 @@ class RealEmailShim:
             },
             provenance=(
                 Data("shim-send", conf, integ),
-                # Sender confidentiality based on domain (corp.com → INTERNAL)
-                Data(f"sender={sender}", conf, Integrity.HIGH),
-                Data(f"mta-accepted={actual_accepted}", conf, Integrity.HIGH),
+                # Sender info is metadata, not content — use USER integrity.
+                # HIGH integrity is reserved for broker-monitored read output.
+                Data(f"sender={sender}", conf, Integrity.USER),
+                Data(f"mta-accepted={actual_accepted}", conf, Integrity.USER),
             ),
             capability_nonce=nonce,
             delegation_chain=(self.tool_name, "RealEmailShim"),
@@ -501,7 +502,8 @@ class RealEmailShim:
             metadata={},
             provenance=(
                 Data("shim-read-inbox", conf, integ),
-                Data(f"user={user}", Confidentiality.INTERNAL, Integrity.HIGH),
+                # User metadata is not content — use USER integrity.
+                Data(f"user={user}", Confidentiality.INTERNAL, Integrity.USER),
             ),
             capability_nonce=f"{self.tool_name}:read:imap:{user}",
             delegation_chain=(self.tool_name, "RealEmailShim"),

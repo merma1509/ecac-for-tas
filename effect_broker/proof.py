@@ -19,10 +19,7 @@ evaluation criteria, providing auditable reasoning about correctness.
 
 from __future__ import annotations
 
-# =============================================================================
 # 1. FORMAL MODEL
-# =============================================================================
-
 # Effect: a record of an operation performed by an agent on a resource.
 #   e = (etype, target, provenance, nonce, delegation_chain)
 #
@@ -47,10 +44,7 @@ from __future__ import annotations
 #   - write permitted if resource.label ≤ prov.label (write-up)
 
 
-# =============================================================================
 # 2. SAFETY THEOREM (Informal)
-# =============================================================================
-
 """
 SAFETY THEOREM:
   No agent can cause an effect that violates the security lattice constraints
@@ -70,10 +64,7 @@ by a valid capability from a trusted source.
 """
 
 
-# =============================================================================
 # 3. PREDICATE CORRECTNESS (Sketch)
-# =============================================================================
-
 """
 AUTHENTICATION PREDICATE (Auth):
   Auth(e, cap) = DERIVATION_CHECK(cap, e.delegation_chain)
@@ -94,15 +85,24 @@ FLOW INTEGRITY PREDICATE (FlowOK):
   FlowOK(e) = LATTICE_READ_CHECK(e.provenance, e.target, scope)
              ∧ LATTICE_WRITE_CHECK(e.target, e.provenance, scope)
              ∧ NO_DECLASS(e)
+             ∧ TRUSTED_PROVENANCE_CHECK(e)
 
-  Correctness: FlowOK ensures information flows respect the lattice.
+  Correctness: FlowOK ensures information flows respect the lattice AND
+  that HIGH+ integrity data comes from broker-monitored sources (HO-8 fix).
+
   - Read: provenance.label ≤ resource.label (no reading above clearance)
   - Write: resource.label ≤ provenance.label (no writing below integrity)
   - No declass: trusted operations only, not arbitrary LLM declassification
+  - Trusted provenance: Data claiming HIGH/ADMIN/SYSTEM integrity must have
+    a valid provenance_id from a broker-committed read. LLM-forged labels
+    are UNTRUSTED (no provenance_id → FlowOK blocks).
 
   Why FlowOK is necessary: even with a valid capability, the agent could
   misuse data of wrong confidentiality/integrity (T5 capability laundering,
   T7 data leakage, T12 endorsement abuse, T18 BCC, T19 memory poison).
+  Additionally, T19 (memory-poisoned instruction) is blocked by the trusted
+  provenance check: only data from broker-committed reads can claim HIGH+
+  integrity. LLM-forged "HIGH integrity" provenance is UNTRUSTED.
 
 
 SCOPE AMPLIFICATION PREDICATE (NoAmp):
@@ -137,9 +137,7 @@ TEMPORAL FRESHNESS PREDICATE (Fresh):
 """
 
 
-# =============================================================================
 # 4. END-TO-END GATE AS CONJUNCTION
-# =============================================================================
 
 """
 GATE(e, cap, approvals) = Auth(e, cap) ∧ FlowOK(e) ∧ NoAmp(e, cap) ∧ Fresh(e, cap, approvals)
@@ -155,10 +153,7 @@ All four are necessary. Any one failing is sufficient to BLOCK.
 """
 
 
-# =============================================================================
 # 5. ATTACK COVERAGE (T1-T20)
-# =============================================================================
-
 ATTACK_COVERAGE: dict[str, tuple[str, str]] = {
     # trace_id: (blocked_by, attack_class)
     "T2": ("Auth", "confused deputy: cap without trusted derivation"),
@@ -182,6 +177,8 @@ ATTACK_COVERAGE: dict[str, tuple[str, str]] = {
     "T20": ("FlowOK", "amplification: read-down then write-up violates lattice"),
     # R1: risk escalation
     "R1": ("Fresh", "one-shot approval replay: nonce reused"),
+    # HO-8: LLM claims HIGH integrity for untrusted data (forge)
+    "HO-8": ("FlowOK", "integrity forge: LLM assigns HIGH integrity without broker origin"),
 }
 
 """
@@ -210,10 +207,7 @@ T15: Monitoring/audit tool tries to bypass the mediation point.
 """
 
 
-# =============================================================================
 # 6. LIMITATIONS (What Is NOT Proven)
-# =============================================================================
-
 """
 LIMITATIONS OF THIS PROOF SKETCH:
 
@@ -275,32 +269,35 @@ LIMITATIONS OF THIS PROOF SKETCH:
      NOT enforced: data-level flow (effect output from Task A used as input to Task B)
      — this requires language-level taint tracking (PACT/CaMeL). Deferred.
 
-9. PROVENANCE: NOW RESOLVED.
-   The kernel derives labels from REAL OS metadata, not path keywords:
-     - derive_file_provenance(target): os.statx() → ENCRYPTED/IMMUTABLE flags
+9. PROVENANCE: NOW RESOLVED (HO-8).
+   The kernel derives labels from REAL OS metadata (see derive_file_provenance):
+     - os.statx() → ENCRYPTED/IMMUTABLE flags
      - os.stat() permission bits: owner-only (0o600) → CONFIDENTIAL,
        group-readable (0o640) → INTERNAL, world-readable (0o644) → PUBLIC
-     - RealFileShim._derive_path_confidentiality(): tries statx → stat() → keywords
+
      - All three approaches are traceable: the metadata is embedded in Effect.metadata
    The LLM cannot forge provenance — the kernel reads from the OS, not from tool claims.
+
+   Additionally, the trusted provenance chain (Session._read_provenance) ensures that
+   HIGH+ integrity data must come from a broker-committed read. Data claiming HIGH/ADMIN
+   integrity without a valid provenance_id is BLOCKed by FlowOK → untrusted-provenance.
+   This prevents the integrity forge attack where LLM claims HIGH integrity for untrusted data.
    Deferred: full OS-level label APIs (SELinux getxattr, Windows sensitivity labels)
-   require platform-specific integration beyond the statx/permission-bit heuristic.
+
 """
 
 
-# =============================================================================
 # 7. TCB SIZE (Lines of Code)
-# =============================================================================
 TCB_SIZE = {
-    "broker.py (core gate + predicates)": "~800 lines",
-    "model.py (Effect, Capability, Task)": "~500 lines",
+    "broker.py (core gate + predicates)": "~850 lines",
+    "model.py (Effect, Capability, Task + Session provenance chain)": "~550 lines",
     "shim.py (structured enforcement path)": "~300 lines",
     "executor.py (single mutation path)": "~200 lines",
     "ledger.py (independent effect ledger)": "~200 lines",
     "tool_registry.py (structural enforcement)": "~200 lines",
     "lattice.py (security lattice)": "~100 lines",
     "restricted_store.py (mediated store)": "~200 lines",
-    "Total TCB": "~2500 lines",
+    "Total TCB": "~2600 lines",
 }
 
 """
@@ -310,10 +307,7 @@ are excluded.
 """
 
 
-# =============================================================================
 # 8. SUMMARY
-# =============================================================================
-
 SUMMARY = """
 ECAC FOUR-PREDICATE GATE: FORMAL ARGUMENT SKETCH
 

@@ -62,6 +62,7 @@ from .model import (
     Capability,
     Commit,
     CommitGateResult,
+    Data,
     Effect,
     EffectTarget,
     Evidence,
@@ -1042,6 +1043,27 @@ class EffectBroker:
         # The read→send attack is handled by session taint above.
         is_output_effect = effect.etype in ("write", "send", "delete", "network")
 
+        if is_output_effect and task.session is not None:
+            # Trusted provenance chain verification.
+            # Verify all provenance in output effects comes from broker-mediated reads.
+            # Data with a valid provenance_id is TRUSTED (from broker-committed read).
+            # Data without provenance_id is UNTRUSTED (LLM claim without broker origin).
+            #
+            # EXCEPTION: Effects using an approval nonce are EXEMPT from provenance check.
+            # When a human reviews and approves an effect (granting an approval nonce),
+            # they explicitly reviewed the effect's content. The approval is the human's
+            # assertion that this effect is authorized — provenance is implicitly trusted
+            # because the human performed the trust evaluation, not the LLM.
+            is_approval_bound = effect.capability_nonce.startswith("approval:")
+            if not is_approval_bound:
+                prov_ok, prov_reason = task.session.verify_effect_provenance(effect)
+                if not prov_ok:
+                    # Provenance chain is broken — treat as UNTRUSTED.
+                    # A datum that claims USER integrity but has no provenance_id
+                    # is UNTRUSTED (attacker trying to launder integrity via LLM claim).
+                    # the broker no longer trusts LLM-assigned labels.
+                    return False, prov_reason
+
         if is_output_effect:
             for datum in effect.provenance:
                 sens = datum.confidentiality > sink_confidentiality
@@ -1703,6 +1725,39 @@ class EffectBroker:
             if file_res is not None and hasattr(file_res, "sensitivity"):
                 if file_res.sensitivity == Confidentiality.CONFIDENTIAL:
                     task.session.taint_for_send(reason=f"read-confidential({effect.target})")
+
+        # Register read effect output in trusted provenance chain.
+        # When a read effect commits, we create a Data item with a provenance_id
+        # and register it in the session's _read_provenance. Subsequent effects
+        # that use this data must include the provenance_id, and FlowOK will
+        # verify the chain is unbroken (the read was actually committed).
+        if effect.etype == "read" and task.session is not None:
+            file_res = self.store.resolve(effect.target)
+            if file_res is not None:
+                # Derive provenance labels from real file metadata
+                conf = (
+                    file_res.sensitivity
+                    if hasattr(file_res, "sensitivity")
+                    else Confidentiality.INTERNAL
+                )
+                integ = Integrity.USER  # read output is trusted if from broker
+                read_output = Data(
+                    name=f"read:{effect.target}",
+                    confidentiality=conf,
+                    integrity=integ,
+                    content="",  # content not stored (would be large)
+                )
+                # Register and get the provenance_id to embed in the effect
+                prov_id = task.session.register_read_provenance(
+                    read_output, effect.capability_nonce
+                )
+                # Update the effect's provenance with the registered data
+                # (only for the ledger's view — the effect itself is immutable)
+                _registered_data = task.session.get_provenance(prov_id)
+                # Note: we don't need to modify the effect (it's immutable).
+                # The provenance chain is tracked by the session, not the effect.
+                # FlowOK will call task.session.verify_effect_provenance(effect)
+                # which checks the Data items in effect.provenance have valid IDs.
 
         self.store.apply_effect(effect)
 

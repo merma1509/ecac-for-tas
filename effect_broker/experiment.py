@@ -580,14 +580,11 @@ class ParameterSmugglingTool:
 
 # ---- T17: Cross-task data flow ----
 class CrossTaskDataFlowTool:
-    """T17: Task A capability used to create data that Task B reads.
+    """T17: Task A capability used by Task B (cross-task isolation enforcement).
 
-    A task with write authority for file:///reports writes confidential data.
-    A different task (Task B) reads this data and tries to send it externally.
-    The broker tracks task boundaries: task A's write to reports is in A's log,
-    but Task B has no capability to read from file:///reports.
-    Additionally, FlowOK checks session taint: Task B's session should not be
-    able to read confidential data from Task A without explicit declass.
+    Task A gets a task-scoped capability for read(secrets).
+    Task B tries to use Task A's capability_nonce.
+    Auth's task_id check (capability.task_id != commit.task_id) blocks this.
     """
 
     def __init__(self, broker: EffectBroker, task_id: str = "default") -> None:
@@ -597,24 +594,56 @@ class CrossTaskDataFlowTool:
 
     def run(self) -> None:
         from .lattice import Confidentiality, Integrity
-        from .model import Data, Effect
+        from .model import Capability, Data, Effect, Task
 
-        # Task B has NO capability for read(file:///secrets).
-        # It tries to read confidential data created by Task A.
+        # Register Task A with a task-scoped capability for read(secrets).
+        # This capability is ONLY valid in task_id="task-a" (enforced at Auth check_auth sub-check 6).
+        from .model import Capability, Session, Task
+
+        task_a_capability = Capability(
+            owner="User",
+            holder="Agent",
+            right="read",
+            target="file:///secrets",
+            scope=frozenset({"internal"}),
+            expiry=100,
+            nonce="read-secrets-task-a",
+            task_id="task-a",  # scoped to Task A
+            derives_from=None,
+        )
+        self.broker.capabilities["read-secrets-task-a"] = task_a_capability
+        # Attenuate to broker holder (derivation chain: User → Agent → Broker)
+        broker_cap = Capability(
+            owner="User",
+            holder="EffectBroker",
+            right="read",
+            target="file:///secrets",
+            scope=frozenset({"internal"}),
+            expiry=100,
+            nonce="read-secrets-task-a:Agent",
+            derives_from="read-secrets-task-a",  # attenuated from Agent's cap
+            task_id="task-a",  # STILL scoped to Task A
+        )
+        self.broker.capabilities["read-secrets-task-a:Agent"] = broker_cap
+
+        # Task B tries to use Task A's capability — should be BLOCKed
+        # by check_auth sub-check 6: capability.task_id != commit.task_id
         cross_task_effect = Effect(
             etype="read",
             target="file:///secrets",
             metadata={},
             provenance=(Data("malicious", Confidentiality.CONFIDENTIAL, Integrity.UNTRUSTED),),
-            capability_nonce="no-cap-read-secrets",
+            capability_nonce="read-secrets-task-a:Agent",  # Task A's cap
             delegation_chain=("t17-tool",),
         )
-        commit = self.broker._make_commit(cross_task_effect, task_id=self.task_id)
+        # Commit in Task B's context (task_id="default", NOT "task-a")
+        commit = self.broker._make_commit(cross_task_effect, task_id="default")
         allow, evidence = self.broker.commit(commit)
         self.last_evidence = cast(dict[str, Any], evidence)
         if allow:
             raise AssertionError(
-                "T17: cross-task read of secrets should BLOCK (no cap in this task)"
+                "T17: Task B should not use Task A's task-scoped capability "
+                "(task_id mismatch should BLOCK at Auth)"
             )
 
 

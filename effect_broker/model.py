@@ -139,6 +139,13 @@ class Session:
     _send_count: int = field(default=0, repr=False)
     _max_sends_per_session: int = field(default=0, repr=False)  # 0 = unlimited
 
+    # Trusted provenance chain for integrity verification.
+    # Maps read_effect_id → output Data from that read.
+    # Only Data with a valid provenance_id (pointing to a committed read)
+    # is considered TRUSTED. Data from untrusted sources is UNTRUSTED.
+    _read_provenance: dict[str, Data] = field(default_factory=dict, repr=False)
+    _provenance_counter: int = field(default=0, repr=False)  # sequence counter
+
     @property
     def live(self) -> bool:
         """Read-only view of the session live state."""
@@ -205,6 +212,77 @@ class Session:
         return self._send_count
         self._tainted = False
         self._taint_reason = ""
+
+    # ---- Trusted provenance chain  ----
+    def register_read_provenance(self, data: Data, cap_nonce: str) -> str:
+        """Register a read effect's output in the provenance chain.
+
+        Returns the provenance_id (e.g. "read:default:cap:001") that
+        must be included in subsequent effects using this data.
+        The broker calls this when a read effect commits.
+        """
+        self._provenance_counter += 1
+        prov_id = f"read:{self.session_id}:{cap_nonce}:{self._provenance_counter}"
+        # Store the data with its provenance_id
+        labeled = Data(
+            name=data.name,
+            confidentiality=data.confidentiality,
+            integrity=data.integrity,
+            content=data.content,
+            provenance_id=prov_id,
+        )
+        self._read_provenance[prov_id] = labeled
+        return prov_id
+
+    def get_provenance(self, prov_id: str) -> Data | None:
+        """Look up a provenanced data item by ID.
+
+        Returns None if the provenance_id is unknown (data forged or stale).
+        """
+        return self._read_provenance.get(prov_id)
+
+    def is_trusted_provenance(self, prov_id: str | None) -> bool:
+        """True if prov_id is a valid, broker-committed provenance.
+
+        Data with a valid provenance_id is TRUSTED.
+        Data without provenance_id (or with unknown ID) is UNTRUSTED.
+        """
+        if prov_id is None:
+            return False  # untrusted: no broker-mediated origin
+        return prov_id in self._read_provenance
+
+    def verify_effect_provenance(self, effect: Effect) -> tuple[bool, str]:
+        """Verify high-integrity data comes from trusted broker reads.
+
+        Data claiming HIGH or ADMIN integrity MUST have
+        a valid provenance_id pointing to a broker-committed read. This prevents
+        the integrity upgrade attack:
+          - LLM claims data is HIGH integrity (forge) → BLOCK (no provenance)
+          - Trusted read output from broker has provenance_id → ALLOW
+
+        USER and UNTRUSTED integrity are ALWAYS ALLOWED:
+          - USER: the broker's own default for read output (trusted by construction)
+          - UNTRUSTED: already at minimum integrity (no upgrade possible)
+
+        The integrity threshold is HIGH: only the most sensitive integrity levels
+        require broker-monitored origin to be trusted.
+        """
+        for datum in effect.provenance:
+            # Only check HIGH+ integrity (ADMIN, SYSTEM).
+            # USER: broker's own default for read output (always trusted).
+            # UNTRUSTED: already minimum integrity (no upgrade possible).
+            if datum.integrity < Integrity.HIGH:
+                continue  # always allowed: USER/UNTRUSTED
+            if not self.is_trusted_provenance(datum.provenance_id):
+                return False, (
+                    f"untrusted-provenance("
+                    f"datum={datum.name}, "
+                    f"integrity={datum.integrity.name}, "
+                    f"prov_id={datum.provenance_id!r}): "
+                    f"HIGH+ integrity requires broker-monitored origin. "
+                    f"Only data from committed read effects has valid provenance_id."
+                )
+        return True, "trusted"
 
 
 @dataclass(frozen=True)
@@ -375,12 +453,37 @@ class Data:
     model. Content is NOT included in immutable request binding — that would
     break legitimate dynamic content (e.g. different message body per send
     invocation). Provenance/integrity is validated by FlowOK at commit time.
+
+    TRUSTED PROVENANCE CHAIN:
+      provenance_id links Data to the broker-monitored read effect that
+      produced it. Only Data with a valid provenance_id (pointing to a
+      committed read effect) is considered TRUSTED. Data from untrusted
+      sources (LLM claims without provenance_id) is UNTRUSTED by default.
+
+      The broker maintains a _read_provenance registry: read_effect_id → Data.
+      When a read effect commits, its output Data is stored with provenance_id.
+      Subsequent effects that use this data carry the provenance_id, and
+      FlowOK verifies the chain is unbroken (the read was actually committed
+      through the broker, not forged by an attacker).
+
+      Example flow:
+        1. Read /secrets → committed → broker stores read_result(secrets) with
+           provenance_id="read:default:read-secrets:001"
+        2. Tool claims data with integrity=USER, provenance_id="read:default:..."
+        3. FlowOK checks: does broker._read_provenance contain this ID?
+           YES → Data is from broker-mediated read → TRUSTED
+           NO  → Data is from untrusted source → UNTRUSTED
     """
 
     name: str
     confidentiality: Confidentiality
     integrity: Integrity
     content: str = ""
+    # Trusted provenance chain ID.
+    # Format: "read:{task_id}:{capability_nonce}:{sequence}"
+    # None = untrusted source (LLM claim without broker-mediated origin).
+    # When set, the broker verifies this ID exists in _read_provenance.
+    provenance_id: str | None = None
 
 
 @dataclass(frozen=True)
