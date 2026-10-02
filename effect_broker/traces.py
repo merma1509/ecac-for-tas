@@ -70,8 +70,18 @@ def build() -> EffectBroker:
     ledger = IndependentEffectLedger()
     broker = EffectBroker(ledger=ledger)
 
-    # Register default task for backward compatibility
-    # This allows Commit(effect) without explicit task to work with a registered task.
+    # RESTRICTIVE default task (no wildcard) — fail-closed for unknown callers.
+    # The default task exists only for backward compatibility with tests that pass
+    # task=None. Its ceiling scope is the UNION of all bootstrapped resources,
+    # NOT a wildcard. This means any effect targeting a resource NOT in the
+    # bootstrap list is BLOCKed by Auth (target not in ceiling scope).
+    _all_resource_scopes: frozenset[str] = frozenset({
+        "internal",           # email domain: internal@corp.com
+        "external",           # email domain: external@elsewhere.com
+        "file:///reports",    # file: file:///reports
+        "file:///secrets",    # file: file:///secrets
+        "file:///trusted",    # file: file:///trusted
+    })
     default_task = Task(
         task_id="default",
         owner=USER,
@@ -80,7 +90,9 @@ def build() -> EffectBroker:
             holder=BROKER,
             right="*",
             target="*",
-            scope=frozenset({"*"}),
+            # RESTRICTIVE: only resources in bootstrap list are in scope.
+            # Unregistered resources (e.g., file:///etc/passwd) are BLOCKed by Auth.
+            scope=_all_resource_scopes,
             expiry=float("inf"),
             nonce="default-task-ceiling",
         ),

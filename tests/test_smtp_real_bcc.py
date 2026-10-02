@@ -970,3 +970,364 @@ class TestBCCIntegration:
             server_thread.join(timeout=2.0)
             if socket_path.exists():
                 socket_path.unlink()
+
+    def test_ipc_bcc_probe_with_real_mta_no_patch(self, smtp_server: Any) -> None:
+        """BLACKBOX IPC test: real_smtp_probe via IPC discovers real MTA recipients.
+
+        This test uses real aiosmtpd via IPC (subprocess) with NO
+        probe patching. The subprocess connects to the real SMTP server on 9025
+        via ProcessExecutorClient.real_smtp_probe(), which calls the subprocess's
+        _real_smtp_probe() that uses real smtplib.
+
+        This is the CORRECT blackbox scenario:
+        - Tool declares only internal@corp.com
+        - Subprocess RSET probe checks internal@corp.com (via IPC to aiosmtpd)
+        - aiosmtpd accepts internal@corp.com → no BCC in this test
+        - For BCC test: see test_ipc_bcc_outside_scope_blocked_real_mta
+        """
+        import os
+
+        from effect_broker.executor_ipc import ProcessExecutorClient
+        from effect_broker.executor_subprocess import ExecutorServer
+
+        socket_path = Path("/tmp/test-ipc-bcc-real.sock")
+        if socket_path.exists():
+            socket_path.unlink()
+
+        ready = threading.Event()
+        server = ExecutorServer(socket_path, ready_event=ready)
+        server_thread = threading.Thread(target=server.run, daemon=True)
+        server_thread.start()
+        ready.wait(timeout=5.0)
+
+        try:
+            # Set SMTP env so subprocess connects to the real aiosmtpd on 9025
+            old_host = os.environ.get("ECAC_SMTP_HOST")
+            old_port = os.environ.get("ECAC_SMTP_PORT")
+            os.environ["ECAC_SMTP_HOST"] = "127.0.0.1"
+            os.environ["ECAC_SMTP_PORT"] = "9025"
+
+            try:
+                client = ProcessExecutorClient(socket_path)
+
+                # Real SMTP probe via IPC — no patching
+                result = client.real_smtp_probe(
+                    "user@corp.com",
+                    ["internal@corp.com", "team@corp.com"],
+                )
+
+                # Protocol: returns structure even on failure
+                assert "declared" in result
+                assert "actual_accepted" in result
+                assert "bcc_detected" in result
+
+                # Real MTA accepts both declared recipients → no BCC
+                assert set(result["declared"]) == {"internal@corp.com", "team@corp.com"}
+                assert set(result["bcc_detected"]) == set()
+            finally:
+                # Restore env
+                if old_host is not None:
+                    os.environ["ECAC_SMTP_HOST"] = old_host
+                elif "ECAC_SMTP_HOST" in os.environ:
+                    del os.environ["ECAC_SMTP_HOST"]
+                if old_port is not None:
+                    os.environ["ECAC_SMTP_PORT"] = old_port
+                elif "ECAC_SMTP_PORT" in os.environ:
+                    del os.environ["ECAC_SMTP_PORT"]
+        finally:
+            server.stop()
+            server_thread.join(timeout=2.0)
+            if socket_path.exists():
+                socket_path.unlink()
+
+    def test_ipc_bcc_outside_scope_blocked_real_mta(self, smtp_server: Any) -> None:
+        """BLACKBOX: BCC outside scope → NoAmp blocks in multi-process mode via IPC.
+
+        This test verifies the FULL path:
+        1. RealEmailShim calls ProcessExecutorClient.real_smtp_probe() via IPC
+        2. Subprocess does real RSET probe against aiosmtpd on 9025
+        3. Subprocess returns bcc_detected (via IPC response)
+        4. If BCC domain outside scope → EmailSecurityError before commit
+
+        This is the REAL blackbox scenario — no probe patching, no mocks.
+        """
+        import os
+
+        from effect_broker.broker import EffectBroker
+        from effect_broker.executor_ipc import ProcessExecutorClient
+        from effect_broker.executor_subprocess import ExecutorServer
+        from effect_broker.lattice import Confidentiality, Integrity
+        from effect_broker.model import Capability, Task
+        from effect_broker.shim_email import EmailSecurityError, RealEmailShim
+
+        socket_path = Path("/tmp/test-ipc-bcc-scope.sock")
+        if socket_path.exists():
+            socket_path.unlink()
+
+        ready = threading.Event()
+        server = ExecutorServer(socket_path, ready_event=ready)
+        server_thread = threading.Thread(target=server.run, daemon=True)
+        server_thread.start()
+        ready.wait(timeout=5.0)
+
+        # Build broker with RESTRICTIVE scope (only internal domain)
+        broker = EffectBroker(mode="same-process")
+        broker.tasks["default"] = Task(
+            task_id="default",
+            owner="User",
+            ceiling=Capability(
+                owner="User",
+                holder="test-tool",
+                right="send",
+                target="*",
+                scope=frozenset({"internal"}),  # Restrictive — no external
+                expiry=float("inf"),
+                nonce="cap-send-internal",
+            ),
+            flow_boundary=(Confidentiality.CONFIDENTIAL, Integrity.USER),
+        )
+        broker.capabilities["cap-send-internal"] = Capability(
+            owner="User",
+            holder="test-tool",
+            right="send",
+            target="*",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce="cap-send-internal",
+        )
+
+        # Create shim that routes through the subprocess IPC
+        shim = RealEmailShim(
+            broker=broker,
+            task_id="default",
+            tool_name="test-tool",
+            smtp_host="127.0.0.1",
+            smtp_port=9025,
+        )
+
+        # Wire the subprocess IPC client into the shim (multi-process mode)
+        client = ProcessExecutorClient(socket_path)
+        shim.ipc_client = client
+
+        # Set SMTP env so subprocess connects to real aiosmtpd
+        old_host = os.environ.get("ECAC_SMTP_HOST")
+        old_port = os.environ.get("ECAC_SMTP_PORT")
+        os.environ["ECAC_SMTP_HOST"] = "127.0.0.1"
+        os.environ["ECAC_SMTP_PORT"] = "9025"
+
+        try:
+            # Clear any leftover state
+            smtp_server.data_log.clear()
+            smtp_server.rcpt_log.clear()
+
+            # KEY TEST: BCC domain NOT in scope → EmailSecurityError
+            # The subprocess RSET probe discovers that MTA accepts attacker@evil.com
+            # But the broker's NoAmp blocks because attacker domain is NOT in
+            # scope={"internal"}. This happens BEFORE broker.commit, via IPC.
+            with pytest.raises(EmailSecurityError):
+                shim.send(
+                    "user@corp.com",
+                    "internal@corp.com",
+                    body="BCC attempt via IPC",
+                    bcc="attacker@external.com",  # External domain, NOT in scope
+                )
+
+            # No message queued — blocked BEFORE broker.commit
+            assert len(smtp_server.data_log) == 0, (
+                f"SECURITY VIOLATION: {len(smtp_server.data_log)} messages queued"
+            )
+
+            # Ledger: broker-level block recorded as CONFIRMED_BLOCKED
+            ledger = broker.ledger
+            blocked_keys = [
+                k for k in ledger._observations.keys()
+                if any("blocked" in entry.source.lower() for entry in ledger._observations[k])
+            ]
+            assert len(blocked_keys) >= 1, (
+                f"Broker-level block must be recorded to ledger. "
+                f"Observations: {list(ledger._observations.keys())}"
+            )
+        finally:
+            # Restore env
+            if old_host is not None:
+                os.environ["ECAC_SMTP_HOST"] = old_host
+            elif "ECAC_SMTP_HOST" in os.environ:
+                del os.environ["ECAC_SMTP_HOST"]
+            if old_port is not None:
+                os.environ["ECAC_SMTP_PORT"] = old_port
+            elif "ECAC_SMTP_PORT" in os.environ:
+                del os.environ["ECAC_SMTP_PORT"]
+
+            server.stop()
+            server_thread.join(timeout=2.0)
+            if socket_path.exists():
+                socket_path.unlink()
+
+
+class TestBCCMaliciousMTA:
+    """BLACKBOX BCC test with real aiosmtpd permissive MTA.
+
+    The RSET probe sends RCPT TO for each DECLARED recipient.
+    If MTA accepts a recipient not in the primary "To" field,
+    BCC is detected and the send is blocked.
+    """
+
+    @staticmethod
+    def _check_aiosmtpd() -> Any:
+        pytest.importorskip("aiosmtpd", reason="aiosmtpd not installed")
+
+    def _make_permissive_bcc_server(self) -> tuple[Any, Any, int]:
+        """Permissive SMTP server that accepts any recipient."""
+        import socket
+        from aiosmtpd.controller import Controller
+
+        class _PermissiveHandler:
+            def __init__(self) -> None:
+                self.rcpt_log: list[str] = []
+                self.data_log: list[tuple[bytes, tuple[str, ...]]] = []
+                self._lock = threading.Lock()
+
+            async def handle_RCPT(
+                self, session: Any, envelope: Any, *args: Any
+            ) -> str:
+                with self._lock:
+                    if len(args) >= 2:
+                        address = args[1]
+                        self.rcpt_log.append(address)
+                        if hasattr(session, "envelope"):
+                            session.envelope.rcpt_tos.append(address)
+                return "250 OK"
+
+            async def handle_DATA(
+                self, session: Any, envelope: Any, *args: Any
+            ) -> str:
+                with self._lock:
+                    actual_rcpts = (
+                        list(getattr(envelope, "rcpt_tos", []))
+                        if hasattr(envelope, "rcpt_tos")
+                        else []
+                    )
+                    content = (
+                        getattr(envelope, "content", b"")
+                        if hasattr(envelope, "content")
+                        else b""
+                    )
+                    self.data_log.append((content, tuple(actual_rcpts)))
+                return "250 OK"
+
+            async def handle_RSET(
+                self, session: Any, envelope: Any, *args: Any
+            ) -> str:
+                with self._lock:
+                    self.rcpt_log.clear()
+                return "250 OK"
+
+        handler = _PermissiveHandler()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            _, port = s.getsockname()
+
+        controller = Controller(
+            handler=handler, hostname="127.0.0.1", port=port, ready_timeout=10.0
+        )
+        controller.start()
+        for _ in range(50):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.1)
+                result = sock.connect_ex(("127.0.0.1", port))
+                sock.close()
+                if result == 0:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.1)
+
+        return handler, controller, port
+
+    def test_rset_probe_bcc_blocked_by_scope(self) -> None:
+        """BCC recipient domain not in scope → EmailSecurityError before commit.
+
+        KEY A3 BLACKBOX TEST:
+        - Real aiosmtpd permissive MTA (no probe patching)
+        - Tool declares BCC=attacker@evil.com via **extra_recipients
+        - RSET probe discovers MTA accepts attacker@evil.com
+        - NoAmp blocks (evil.com not in internal scope)
+        - EmailSecurityError raised BEFORE broker.commit
+        - No message queued
+        """
+        self._check_aiosmtpd()
+        from effect_broker.shim_email import EmailSecurityError, RealEmailShim
+        from effect_broker.broker import EffectBroker
+        from effect_broker.lattice import Confidentiality, Integrity
+        from effect_broker.model import Capability, Domain, Task
+
+        handler, controller, port = self._make_permissive_bcc_server()
+
+        try:
+            handler.data_log.clear()
+            handler.rcpt_log.clear()
+
+            broker = EffectBroker(mode="same-process")
+            broker.store._unsafe_bootstrap_email(
+                "mailto:internal@corp.com", Domain.INTERNAL
+            )
+
+            # Restrictive capability: only internal domain scope
+            broker.tasks["default"] = Task(
+                task_id="default",
+                owner="User",
+                ceiling=Capability(
+                    owner="User",
+                    holder="test-tool",
+                    right="send",
+                    target="*",
+                    scope=frozenset({"internal"}),
+                    expiry=float("inf"),
+                    nonce="cap-send-internal",
+                ),
+                flow_boundary=(Confidentiality.CONFIDENTIAL, Integrity.USER),
+            )
+            broker.capabilities["cap-send-internal"] = Capability(
+                owner="User",
+                holder="test-tool",
+                right="send",
+                target="*",
+                scope=frozenset({"internal"}),
+                expiry=float("inf"),
+                nonce="cap-send-internal",
+            )
+
+            shim = RealEmailShim(
+                broker=broker,
+                task_id="default",
+                tool_name="test-tool",
+                smtp_host="127.0.0.1",
+                smtp_port=port,
+            )
+
+            # RSET probe with BCC declared
+            declared = frozenset({"internal@corp.com", "attacker@evil.com"})
+            d_ret, actual_ret, bcc_ret = shim._smtp_probe("user@corp.com", declared)
+
+            # MTA accepts both recipients
+            assert "internal@corp.com" in actual_ret
+            assert "attacker@evil.com" in actual_ret
+
+            # Full send() test: BCC domain not in scope → blocked
+            handler.data_log.clear()
+            with pytest.raises(EmailSecurityError) as exc_info:
+                shim.send(
+                    "user@corp.com",
+                    "internal@corp.com",
+                    body="Test BCC",
+                    bcc="attacker@evil.com",
+                )
+
+            # No message queued (blocked before broker.commit)
+            assert len(handler.data_log) == 0, (
+                f"SECURITY VIOLATION: {len(handler.data_log)} messages queued"
+            )
+
+        finally:
+            controller.stop()

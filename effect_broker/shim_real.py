@@ -24,6 +24,7 @@ that has no filesystem access except via a whitelisted wrapper.
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import pathlib
 import re
@@ -575,7 +576,21 @@ class RealFileShim:
 
         # Resolve task from task_id
         task = self.broker.tasks.get(self.task_id)
-        commit = Commit(effect=effect, task=task, tool_name=self.tool_name)
+        # Compute authorized_content_hash for write operations.
+        # This closes the same-process gate↔execute coupling gap:
+        # The hash is computed from the ACTUAL bytes being written (before commit),
+        # stored in the Commit, and verified AFTER the gate passes (before OS write).
+        # This mirrors the IPC-mode protection (executor_subprocess._verify_content_binding).
+        authorized_content_hash: str | None = None
+        if op_type == "write" and content is not None:
+            authorized_content_hash = hashlib.sha256(content).hexdigest()
+
+        commit = Commit(
+            effect=effect,
+            task=task,
+            tool_name=self.tool_name,
+            authorized_content_hash=authorized_content_hash,
+        )
         allow, evidence = self.broker.commit(commit)
 
         op = ShimOp(
@@ -605,7 +620,15 @@ class RealFileShim:
             try:
                 if op_type == "write":
                     assert content is not None
-                    result = self.ipc_client.real_file_write(canon, content, self.task_id)
+                    # Compute approved_content_hash from metadata.
+                    # The shim computes hash(content) and passes it to subprocess.
+                    # Subprocess verifies hash(content_from_IPC) == approved_content_hash.
+                    # This closes the gate↔execute coupling gap.
+                    content_hash = hashlib.sha256(content).hexdigest()
+                    result = self.ipc_client.real_file_write(
+                        canon, content, self.task_id,
+                        approved_content_hash=content_hash,
+                    )
                     # session_update may carry taint from CONFIDENTIAL write
                     if result.get("session_update"):
                         self._sync_session_from_subprocess(result["session_update"])

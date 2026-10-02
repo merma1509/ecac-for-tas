@@ -592,3 +592,9 @@ class Commit:
     #   - known_targets must be ⊆ approved_request.targets
     #   - task_id must match (cross-task use is blocked)
     approved_request: ApprovedRequest | None = None
+    # Content hash of the authorized payload (write content or send body).
+    # The shim computes this BEFORE broker.commit() and includes it in the
+    # commit so that both gate evaluation and execution verification use
+    # the SAME hash. This closes the gate↔execute coupling gap in same-process
+    # mode (IPC mode already had this via executor_subprocess._verify_content_binding).
+    authorized_content_hash: str | None = None

@@ -181,7 +181,59 @@ class TestExecutorSubprocessIPC:
         # we never created a broker. In the real deployment, broker and
         # executor are separate processes with no shared memory.
         # The IPC channel is the sole interface.
+        # The IPC channel is the sole interface.
 
+    def test_executor_verifies_content_hash_at_commit(self, tmp_path: Path) -> None:
+        """Executor verifies content_hash binding at APPLY_COMMIT.
+
+        Cross-runtime conformance test:
+        - Broker gate() authorizes effect with SHA256(content) hash
+        - IPC sends (effect, approved_content_hash) to executor
+        - Executor verifies hash(effect.metadata.content) == approved_content_hash
+        - Mismatch → BLOCKED
+        """
+        import hashlib
+
+        from effect_broker.executor_ipc import ProcessExecutorClient
+
+        client = ProcessExecutorClient(self._sock)
+
+        # Create effect with content
+        effect_dict = {
+            "etype": "write",
+            "target": "file:///test.txt",
+            "metadata": {"content": "original content"},
+            "provenance": [],
+            "capability_nonce": "write-cap",
+            "delegation_chain": [],
+            "known_targets": None,
+        }
+
+        # Compute correct content hash
+        correct_hash = hashlib.sha256("original content".encode()).hexdigest()
+
+        # apply_commit with WRONG hash → must block
+        wrong_result = client.apply_commit(
+            effect_dict=effect_dict,
+            task_id="default",
+            session_snapshot={},
+            approved_content_hash="wrong_hash_value_0000000",
+        )
+        assert wrong_result.get("status") == "blocked", (
+            "Executor MUST block when content_hash doesn't match"
+        )
+        assert "content" in wrong_result.get("blocker", "").lower()
+
+        # apply_commit with CORRECT hash → must succeed
+        correct_result = client.apply_commit(
+            effect_dict=effect_dict,
+            task_id="default",
+            session_snapshot={},
+            approved_content_hash=correct_hash,
+        )
+        assert correct_result.get("status") == "ok", (
+            f"Executor should allow with correct hash: {correct_result}"
+        )
 
 class TestLedgerReadsExecutorStore:
     """The ledger reads actual executor state for independent verification.
@@ -334,3 +386,6 @@ class TestLedgerReadsExecutorStore:
 
         verdict = ledger_client.verify("default", "send-bob-cap")
         assert verdict == LedgerVerdict.CONFIRMED_COMMITTED
+
+
+
