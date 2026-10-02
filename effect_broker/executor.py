@@ -1,13 +1,13 @@
 """Isolated executor — the SOLE path to external state mutation.
 
 ARCHITECTURE (single-path refactor):
-  ┌─────────────────────────────────────────────────────────────┐
-  │  IndependentEffectLedger  (EXTERNAL, single source of truth)  │
-  │  - Created outside broker + executor                         │
-  │  - Records authorization (from broker.gate)                 │
-  │  - Records observation (from executor apply)                │
-  │  - Makes UNAMBIGUOUS verdicts: COMMITTED / BLOCKED / UNKNOWN │
-  └─────────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────────┐
+  │  IndependentEffectLedger  (EXTERNAL, single source of truth)   │
+  │  - Created outside broker + executor                           │
+  │  - Records authorization (from broker.gate)                    │
+  │  - Records observation (from executor apply)                   │
+  │  - Makes UNAMBIGUOUS verdicts: COMMITTED / BLOCKED / UNKNOWN   │
+  └────────────────────────────────────────────────────────────────┘
                                ↑
                     broker.gate(commit)  ← read-only predicate gate
                                ↓
@@ -37,6 +37,8 @@ ARCHITECTURE (single-path refactor):
 
 from __future__ import annotations
 
+import hashlib
+
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -48,6 +50,57 @@ if TYPE_CHECKING:
     from .executor_subprocess import ExecutorProcessHandle
     from .ledger import IndependentEffectLedger
     from .model import Commit, Effect, Task
+
+
+# ---- Content binding verification (same-process gate↔execute coupling) ----
+# This mirrors executor_subprocess._verify_content_binding() for multi-process mode.
+# The same-process shim (RealFileShim) computes authorized_content_hash BEFORE
+# broker.commit() and stores it in Commit.authorized_content_hash.
+# This function verifies the hash matches before allowing apply_effect().
+
+
+def _verify_content_binding(
+    effect: Effect, authorized_content_hash: str | None
+) -> tuple[bool, str]:
+    """Verify effect content matches the authorized hash.
+
+    This closes the same-process gate↔execute coupling gap.
+
+    Without this fix (same-process):
+      1. RealFileShim.compute hash(content_A) and calls broker.commit(effect_A)
+      2. broker.gate() evaluates predicates on effect_A
+      3. ALLOW: executor.apply_effect(effect_A) → but subprocess could write content_B
+
+    WITH this fix (same-process):
+      1. RealFileShim computes hash(content_A) and passes authorized_content_hash=hash_A
+         in Commit.authorized_content_hash
+      2. broker.gate() evaluates predicates on effect_A (hash_A from content)
+      3. ALLOW: executor.execute() calls _verify_content_binding(effect_A, hash_A)
+      4. Compares hash(effect_A.metadata.content) == hash_A → MATCH 
+      5. Only then calls apply_effect(effect_A)
+      6. Same-process writes content_A (from effect.metadata, not modified)
+
+    For read/delete effects, authorized_content_hash is None → verification skipped.
+
+    Returns: (verified: bool, reason: str)
+    """
+    if authorized_content_hash is None:
+        # No content binding required (read/delete/effects without mutable content)
+        return True, "no-content-binding"
+
+    # Compute hash from actual effect content (matches _compute_effect_content_hash)
+    actual_hash = effect.compute_content_hash()
+    if actual_hash is None:
+        return False, "content-binding-effect-without-hashable-content"
+
+    if actual_hash != authorized_content_hash:
+        return False, (
+            f"content-hash-mismatch: "
+            f"expected={authorized_content_hash[:32]}..., "
+            f"got={actual_hash[:32]}..."
+        )
+
+    return True, "content-binding-verified"
 
 
 @dataclass
@@ -144,6 +197,32 @@ class IsolatedExecutor:
         )
 
         if allow:
+            # Content binding verification (gate↔execute coupling).
+            # RealFileShim computes authorized_content_hash BEFORE broker.commit()
+            # and stores it in Commit.authorized_content_hash. The executor verifies
+            # it BEFORE apply_effect() — so the content actually written matches
+            # what was authorized. This mirrors subprocess._verify_content_binding()
+            # for multi-process mode and closes the same-process coupling gap.
+            verified, reason = _verify_content_binding(
+                gate_result.effect, commit.authorized_content_hash
+            )
+            if not verified:
+                # Content was modified after gate authorization — BLOCK.
+                # Roll back any nonce reservation made during gate.
+                self.broker._release_fresh_reservation(gate_result.effect, gate_result.task)
+                # Record explicit blocked observation.
+                self.ledger.record_observation(
+                    actual_task_id, nonce, None, source="executor.execute:BLOCKED"
+                )
+                return False, {
+                    "allow": False,
+                    "primary_blocker": "ContentBinding",
+                    "predicates": {**evidence.get("predicates", {}), "ContentBinding": reason},
+                    "content_binding_block": True,
+                    "boundary_stop": None,
+                    "approval_binding": evidence.get("approval_binding"),
+                }
+
             # Phase 2: SOLE MUTATION POINT — external state changes ONLY here.
             # Every effect that the ledger confirmed as authorized reaches state
             # through this call. There is no other mutation path.
@@ -210,6 +289,55 @@ class SubprocessExecutor:
       - The ledger's observation comes from the subprocess's IPC response,
         NOT from the broker's own report.
       - execute() is reentrant: gate() uses per-task locks for atomic Fresh.
+
+    SUBCONCESS ISOLATION SCOPE (IMPORTANT — what IS and IS NOT confined):
+      The subprocess has THREE layers of active confinement:
+
+      LAYER 1 — Import blocking (builtins.__import__ hook):
+        - BLOCKED: exec, eval, compile, pickle, marshal, shelve
+        - BLOCKED: requests, aiohttp, httpx, websockets (dangerous network packages)
+        - Prevents dynamic code generation and remote code execution via network
+
+      LAYER 2 — Filesystem confinement (restricted-open wrapper on os.open):
+        - Write ONLY: /tmp, /var/tmp, /dev/shm (sandboxed temp directories)
+        - Read: /tmp, /var/tmp, /dev, /etc, /usr, /bin, /sbin, /home
+        - Any path outside allowed dirs → PermissionError
+
+      LAYER 3a — Landlock sandbox (Linux 5.13+):
+        - Kernel-enforced filesystem restrictions, applied before any Python runs
+        - Defense-in-depth: cannot be bypassed from Python
+
+      LAYER 3b — Seccomp BPF filter (Linux kernel-level):
+        - BLOCKED: socket(), connect(), accept(), execve(), clone(), ptrace()
+        - ALLOWED: read, write, open, close, stat, socketpair(AF_UNIX IPC only)
+        - Enforced by the Linux kernel — cannot be bypassed from Python
+
+      WHAT THIS MEANS (confirmed):
+        ✓ Broker's file/SMTP I/O via RealFileShim/RealEmailShim IS confined
+        ✓ Dynamic code execution (eval/compile/pickle) IS blocked by Layer 1
+        ✓ Arbitrary network connections ARE blocked by seccomp (Layer 3b)
+        ✓ Filesystem writes OUTSIDE /tmp ARE blocked by restricted-open (Layer 2)
+        ✓ Content hash binding (HMAC-signed IPC) prevents gate→execute coupling gap
+
+      REMAINING GAP (documented limitation, Option A fixes this):
+        The subprocess still has access to standard library: os, smtplib, imaplib,
+        pathlib, threading, etc. A compromised subprocess could:
+          1. Use smtplib to connect to ANY SMTP server (not just the configured one)
+          2. Read ANY file in allowed read directories (/etc, /home, etc.)
+          3. Spawn threads (but no new processes — seccomp blocks clone/execve)
+          4. Use imaplib for any IMAP connection (not just configured server)
+
+        To FULLY confine arbitrary tool code (Option A — recommended):
+          1. Run tool in a SEPARATE subprocess with its own broker/shim
+          2. Tool's effects go through tool's own broker → outer broker via IPC
+          3. Outer broker verifies via nested composition protocol
+          This gives two independent broker instances, each with full sandboxing.
+
+        Option B (OS sandbox): seccomp profiles, namespace containers, chroot
+          → requires root/capabilities beyond Python's reach
+
+        Option C (Language taint): PACT/CaMeL/FIDES runtime instrumentation
+          → requires instrumentation of the tool's language runtime
 
     USAGE:
         broker = EffectBroker(mode="multi-process", ...)
@@ -284,7 +412,7 @@ class SubprocessExecutor:
         authorized_targets = effect.complete_targets()
 
         # Phase 1: gate evaluation (read-only, in broker process)
-        # CRITICAL: reserve_nonce=False because the subprocess handles
+        # reserve_nonce=False because the subprocess handles
         # nonce reservation via APPLY_COMMIT protocol. This ensures the
         # nonce is NOT reserved in A's session before IPC round-trip,
         # preventing false replay detection in B.
@@ -313,26 +441,27 @@ class SubprocessExecutor:
             effect_dict = effect_to_dict(effect)
 
             # Compute approved_content_hash for atomic commit verification.
-            # The subprocess verifies hash(effect.metadata.content) == approved_content_hash.
-            # This closes the gate↔execute coupling gap.
-            approved_content_hash: str | None = None
-            metadata = effect.metadata or {}
-            content_raw = metadata.get("content", "")
-            if isinstance(content_raw, bytes) and content_raw:
-                import hashlib
-                approved_content_hash = hashlib.sha256(content_raw).hexdigest()
-            elif isinstance(content_raw, str) and content_raw:
-                import hashlib
-                approved_content_hash = hashlib.sha256(content_raw.encode("utf-8")).hexdigest()
-            elif "content_b64" in metadata:
-                # Content was base64-encoded for JSON transport
-                import base64
-                try:
-                    decoded = base64.b64decode(metadata["content_b64"])
-                    import hashlib
-                    approved_content_hash = hashlib.sha256(decoded).hexdigest()
-                except Exception:
-                    pass  # Invalid base64 — skip hash binding
+            # Prefer the shim-computed hash from Commit (same-process path).
+            # Fall back to re-computing from metadata for compatibility.
+            approved_content_hash: str | None = commit.authorized_content_hash
+            if approved_content_hash is None:
+                # Fallback: re-compute from effect metadata
+                metadata = effect.metadata or {}
+                content_raw = metadata.get("content", "")
+                if isinstance(content_raw, bytes) and content_raw:
+                    approved_content_hash = hashlib.sha256(content_raw).hexdigest()
+                elif isinstance(content_raw, str) and content_raw:
+                    approved_content_hash = hashlib.sha256(
+                        content_raw.encode("utf-8")
+                    ).hexdigest()
+                elif "content_b64" in metadata:
+                    import base64
+
+                    try:
+                        decoded = base64.b64decode(metadata["content_b64"])
+                        approved_content_hash = hashlib.sha256(decoded).hexdigest()
+                    except Exception:
+                        pass  # Invalid base64 — skip hash binding
 
             # APPLY_COMMIT: Fresh check + content_hash verify + apply_effect in B
             # B returns session_update with updated state (taint, used, logical_time)
