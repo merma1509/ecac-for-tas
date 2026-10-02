@@ -576,7 +576,21 @@ class RealFileShim:
 
         # Resolve task from task_id
         task = self.broker.tasks.get(self.task_id)
-        commit = Commit(effect=effect, task=task, tool_name=self.tool_name)
+        # Compute authorized_content_hash for write operations.
+        # This closes the same-process gate↔execute coupling gap:
+        # The hash is computed from the ACTUAL bytes being written (before commit),
+        # stored in the Commit, and verified AFTER the gate passes (before OS write).
+        # This mirrors the IPC-mode protection (executor_subprocess._verify_content_binding).
+        authorized_content_hash: str | None = None
+        if op_type == "write" and content is not None:
+            authorized_content_hash = hashlib.sha256(content).hexdigest()
+
+        commit = Commit(
+            effect=effect,
+            task=task,
+            tool_name=self.tool_name,
+            authorized_content_hash=authorized_content_hash,
+        )
         allow, evidence = self.broker.commit(commit)
 
         op = ShimOp(
