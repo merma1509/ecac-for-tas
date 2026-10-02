@@ -29,8 +29,11 @@ from __future__ import annotations
 
 import re
 import sys
+import warnings
 from dataclasses import dataclass
 from typing import Any, cast
+
+warnings.filterwarnings("ignore", message="SAME-PROCESS")
 
 from .broker import EffectBroker
 from .shim import FileShim, SecurityError

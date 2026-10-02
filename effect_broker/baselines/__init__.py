@@ -10,6 +10,12 @@ Compares ECAC against external systems:
 - ArgProv: Argument provenance
 """
 
+from __future__ import annotations
+
+import warnings
+
+warnings.filterwarnings("ignore", message="SAME-PROCESS")
+
 from .mode_allowlist import AllowlistBroker
 from .mode_argument_provenance import ArgumentProvenanceBroker
 from .mode_camel import CaMeLBroker
