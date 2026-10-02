@@ -23,21 +23,30 @@ from effect_broker.traces import build
 
 
 def _build() -> EffectBroker:
-    """Build a fresh broker with default task and wildcard ceiling."""
+    """Build a fresh broker. Overrides the default task's ceiling to be permissive.
+
+    NOTE: We override the ceiling because build() now uses a RESTRICTIVE default
+    task ceiling (only known bootstrap resources are in scope). This is the
+    correct security default, but the SSRF/NoAmp edge case tests need a
+    permissive ceiling so they can test their specific predicate blocks.
+    """
+    from effect_broker.model import USER
     broker = build()
+    # Override the restrictive default ceiling with wildcard for these tests.
+    # The specific predicates (NoAmp SSRF containment, Auth derivation) are
+    # tested with cap-level restrictions, not ceiling-level restrictions.
+    permissive_ceiling = Capability(
+        owner=USER,
+        holder=BROKER,
+        right="*",
+        target="*",
+        scope=frozenset({"*"}),
+        expiry=float("inf"),
+        nonce="default-ceiling",
+    )
     task = broker.tasks.get("default")
-    if task is None:
-        ceiling = Capability(
-            owner=USER,
-            holder=BROKER,
-            right="*",
-            target="*",
-            scope=frozenset({"*"}),
-            expiry=float("inf"),
-            nonce="default-ceiling",
-        )
-        task = Task(task_id="default", owner=USER, ceiling=ceiling)
-        broker.tasks["default"] = task
+    if task is not None:
+        task.ceiling = permissive_ceiling  # type: ignore[misc]
     return broker
 
 
