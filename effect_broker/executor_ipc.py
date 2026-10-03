@@ -431,7 +431,7 @@ class ProcessExecutorClient:
                     "task_id": task_id,
                     "session_snapshot": session_snapshot,
                     "reserve_nonce": reserve_nonce,
-                    "approved_content_hash": approved_content_hash, 
+                    "approved_content_hash": approved_content_hash,
                 },
             )
         if not resp.get("ok"):
