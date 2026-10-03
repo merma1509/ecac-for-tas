@@ -210,7 +210,7 @@ class TestExecutorSubprocessIPC:
         }
 
         # Compute correct content hash
-        correct_hash = hashlib.sha256("original content".encode()).hexdigest()
+        correct_hash = hashlib.sha256(b"original content").hexdigest()
 
         # apply_commit with WRONG hash → must block
         wrong_result = client.apply_commit(

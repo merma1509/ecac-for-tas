@@ -8,8 +8,6 @@ Verifies that:
 
 from __future__ import annotations
 
-import pytest
-
 from effect_broker.baselines import run_comparison
 
 
@@ -85,7 +83,8 @@ class TestBaselineComparison:
             f"This proves ECAC's kill-criterion contribution beyond PACT."
         )
         assert len(chaincaps_gaps) >= 4, (
-            f"ECAC must block ≥4 traces ChainCaps misses. Got {len(chaincaps_gaps)}: {chaincaps_gaps}. "
+            f"ECAC must block ≥4 traces ChainCaps misses. "
+            f"Got {len(chaincaps_gaps)}: {chaincaps_gaps}. "
             f"This proves ECAC's kill-criterion contribution beyond ChainCaps."
         )
 
@@ -115,9 +114,9 @@ class TestBaselineComparison:
         # Find T4 (replay)
         t4_names = [n for n in ecac_traces if "replay" in n.lower() or "T4" in n]
         if t4_names:
-            assert ecac_traces[t4_names[0]], f"T4 must be blocked by ECAC"
+            assert ecac_traces[t4_names[0]], "T4 must be blocked by ECAC"
             assert not camel_traces[t4_names[0]], (
-                f"T4 must NOT be blocked by CaMeL (proving ledger adds value)"
+                "T4 must NOT be blocked by CaMeL (proving ledger adds value)"
             )
 
     def test_all_traces_have_expected_failures_listed(self) -> None:

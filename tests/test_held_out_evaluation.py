@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import pytest
-
 
 class TestHoldOutEvaluation:
     """Tests for the sealed held-out evaluation framework."""
+
+    HO_IDS = ["HO-1", "HO-2", "HO-3", "HO-4", "HO-5", "HO-6", "HO-7", "HO-8"]
 
     def test_hold_out_traces_not_in_experiment(self) -> None:
         """Verify hold-out traces are not imported by experiment.py.
@@ -34,7 +34,10 @@ class TestHoldOutEvaluation:
         with open(experiment_path) as f:
             experiment_content = f.read()
 
-        leaked = [tid for tid in ho_ids if f'"{tid}"' in experiment_content or f"'{tid}'" in experiment_content]
+        leaked = [
+            tid for tid in ho_ids
+            if f'"{tid}"' in experiment_content or f"'{tid}'" in experiment_content
+        ]
         assert len(leaked) == 0, (
             f"Hold-out trace IDs {leaked} appear in experiment.py — "
             f"traces are NOT sealed. Move them to held_out_evaluation.py only."
@@ -58,7 +61,10 @@ class TestHoldOutEvaluation:
             if os.path.exists(full_path):
                 with open(full_path) as f:
                     content = f.read()
-                ho_mentions = [tid for tid in ["HO-1", "HO-2", "HO-3", "HO-4", "HO-5", "HO-6", "HO-7", "HO-8"] if f'"{tid}"' in content or f"'{tid}'" in content]
+                ho_mentions = [
+                    tid for tid in self.HO_IDS
+                    if f'"{tid}"' in content or f"'{tid}'" in content
+                ]
                 assert len(ho_mentions) == 0, (
                     f"Hold-out trace ID {ho_mentions} found in {path} — "
                     f"broker code must NOT reference hold-out traces."
@@ -68,7 +74,10 @@ class TestHoldOutEvaluation:
         """Every hold-out trace must have all required metadata fields."""
         from effect_broker.held_out_evaluation import HOLD_OUT_TRACES
 
-        required = {"id", "name", "attack_class", "severity", "effect", "expected_blocker", "description"}
+        required = {
+            "id", "name", "attack_class", "severity",
+            "effect", "expected_blocker", "description",
+        }
         for trace in HOLD_OUT_TRACES:
             missing = required - set(trace.keys())
             assert len(missing) == 0, (
@@ -87,8 +96,8 @@ class TestHoldOutEvaluation:
 
         warnings.filterwarnings("ignore")
         from effect_broker.held_out_evaluation import (
-            evaluate_all_hold_out,
             HOLD_OUT_TRACES,
+            evaluate_all_hold_out,
         )
         from effect_broker.traces import build
 
@@ -163,3 +172,4 @@ class TestHoldOutEvaluation:
         broker = build()
         report = evaluate_all_hold_out(broker)
         print_evaluation_report(report)  # Should not raise
+

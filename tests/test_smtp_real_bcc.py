@@ -1179,6 +1179,7 @@ class TestBCCMaliciousMTA:
     def _make_permissive_bcc_server(self) -> tuple[Any, Any, int]:
         """Permissive SMTP server that accepts any recipient."""
         import socket
+
         from aiosmtpd.controller import Controller
 
         class _PermissiveHandler:
@@ -1257,10 +1258,10 @@ class TestBCCMaliciousMTA:
         - No message queued
         """
         self._check_aiosmtpd()
-        from effect_broker.shim_email import EmailSecurityError, RealEmailShim
         from effect_broker.broker import EffectBroker
         from effect_broker.lattice import Confidentiality, Integrity
         from effect_broker.model import Capability, Domain, Task
+        from effect_broker.shim_email import EmailSecurityError, RealEmailShim
 
         handler, controller, port = self._make_permissive_bcc_server()
 
@@ -1316,7 +1317,7 @@ class TestBCCMaliciousMTA:
 
             # Full send() test: BCC domain not in scope → blocked
             handler.data_log.clear()
-            with pytest.raises(EmailSecurityError) as exc_info:
+            with pytest.raises(EmailSecurityError):
                 shim.send(
                     "user@corp.com",
                     "internal@corp.com",
