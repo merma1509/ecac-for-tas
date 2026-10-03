@@ -38,7 +38,6 @@ ARCHITECTURE (single-path refactor):
 from __future__ import annotations
 
 import hashlib
-
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -76,7 +75,7 @@ def _verify_content_binding(
          in Commit.authorized_content_hash
       2. broker.gate() evaluates predicates on effect_A (hash_A from content)
       3. ALLOW: executor.execute() calls _verify_content_binding(effect_A, hash_A)
-      4. Compares hash(effect_A.metadata.content) == hash_A → MATCH 
+      4. Compares hash(effect_A.metadata.content) == hash_A → MATCH
       5. Only then calls apply_effect(effect_A)
       6. Same-process writes content_A (from effect.metadata, not modified)
 
@@ -458,7 +457,8 @@ class SubprocessExecutor:
                     import base64
 
                     try:
-                        decoded = base64.b64decode(metadata["content_b64"])
+                        b64_str = metadata["content_b64"]
+                        decoded = base64.b64decode(b64_str)  # type: ignore[arg-type]
                         approved_content_hash = hashlib.sha256(decoded).hexdigest()
                     except Exception:
                         pass  # Invalid base64 — skip hash binding
