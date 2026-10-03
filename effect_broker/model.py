@@ -30,6 +30,7 @@ class Evidence(TypedDict, total=False):
     boundary_stop: str | None
     approval_binding: str | None
     block_reason: str | None
+    content_binding_block: bool | None
 
 
 # Principals
