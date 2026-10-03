@@ -511,7 +511,9 @@ class EndorsementAbuseTool:
         from .model import Data, Effect
 
         # LLM creates an endorsement REQUEST (does NOT grant it)
-        fake_endorsement = EffectBroker.request_label_exception(
+        # This demonstrates the LLM cannot self-grant labels.
+        # (Result not used — effect below is the actual test.)
+        _unused_request = EffectBroker.request_label_exception(
             kind="endorse",
             target="internal@corp.com",
             etype="send",
@@ -597,11 +599,11 @@ class CrossTaskDataFlowTool:
 
     def run(self) -> None:
         from .lattice import Confidentiality, Integrity
-        from .model import Capability, Data, Effect, Task
 
         # Register Task A with a task-scoped capability for read(secrets).
-        # This capability is ONLY valid in task_id="task-a" (enforced at Auth check_auth sub-check 6).
-        from .model import Capability, Session, Task
+        # This capability is ONLY valid in task_id="task-a" (enforced
+        # at Auth check_auth sub-check 6).
+        from .model import Capability, Data, Effect
 
         task_a_capability = Capability(
             owner="User",
@@ -776,7 +778,7 @@ class ToctouRaceTool:
         # Import here to compute hash
         import hashlib
 
-        original_hash = hashlib.sha256(original_content).hexdigest()
+        _original_hash = hashlib.sha256(original_content).hexdigest()  # for audit/logging
 
         effect = Effect(
             etype="write",
@@ -1070,7 +1072,7 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_t9.store.effects_log),
-        mediation_complete=actual_allow_t9 == False,  # blocked = safe
+        mediation_complete=not actual_allow_t9,  # blocked = safe
     )
     assert t9_passed, f"T9 hidden network should BLOCK: {t9_error}"
 
@@ -1326,7 +1328,7 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         t18_error = str(e)
     # Only 3 sends should succeed (max_sends_per_session=3)
     actual_sends_t18 = len(broker_t18.store.effects_log)
-    t18_blocked = actual_sends_t18 == 3  # exactly 3 allowed, rest blocked
+    _t18_ok = actual_sends_t18 == 3  # exactly 3 allowed, rest blocked (asserted below)
     results["T18-send-rate-limit"] = ExperimentResult(
         name="T18: send rate limit amplification (NoAmp blocks excess)",
         tool_class=SendRateLimitTool,

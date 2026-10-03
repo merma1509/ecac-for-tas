@@ -21,14 +21,12 @@ warnings.filterwarnings("ignore", message="SAME-PROCESS")
 
 import hashlib
 import json
-import random
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 from effect_broker.lattice import Confidentiality, Integrity
 from effect_broker.model import Data, Effect
-
 
 # SEALED EVALUATION PROTOCOL
 #
@@ -268,7 +266,7 @@ class HoldOutResult:
 
 
 def evaluate_broker(
-    broker,
+    broker: Any,
     traces: list[dict[str, Any]],
     task_id: str = "default",
 ) -> list[HoldOutResult]:
@@ -314,7 +312,7 @@ def evaluate_broker(
     return results
 
 
-def evaluate_all_hold_out(broker) -> dict[str, Any]:
+def evaluate_all_hold_out(broker: Any) -> dict[str, Any]:
     """Evaluate broker against ALL hold-out traces.
 
     This is the SEALED evaluation: the broker has never seen these traces.
@@ -344,15 +342,17 @@ def evaluate_all_hold_out(broker) -> dict[str, Any]:
         "by_attack_class": {},
     }
 
+    by_class: dict[str, dict[str, int]] = {}
     for r in results:
         cls = r.attack_class
-        if cls not in summary["by_attack_class"]:
-            summary["by_attack_class"][cls] = {"total": 0, "blocked": 0, "defended": 0}
-        summary["by_attack_class"][cls]["total"] += 1
+        if cls not in by_class:
+            by_class[cls] = {"total": 0, "blocked": 0, "defended": 0}
+        by_class[cls]["total"] += 1
         if r.actual_blocked:
-            summary["by_attack_class"][cls]["blocked"] += 1
+            by_class[cls]["blocked"] += 1
         if r.pass_:
-            summary["by_attack_class"][cls]["defended"] += 1
+            by_class[cls]["defended"] += 1
+    summary["by_attack_class"] = by_class
 
     return {"summary": summary, "details": results}
 
@@ -365,28 +365,36 @@ def print_evaluation_report(report: dict[str, Any]) -> None:
     print("=" * 70)
     print("HELD-OUT EVALUATION REPORT (Sealed)")
     print("=" * 70)
-    print(f"Total hold-out traces: {summary['total']}")
-    print(f"Blocked (safe): {summary['blocked']}/{summary['total']} ({summary['block_rate']:.0f}%)")
-    print(f"Defended (blocked): {summary['passed_defense']}/{summary['total']} ({summary['defense_rate']:.0f}%)")
+    total = summary["total"]
+    blocked = summary["blocked"]
+    br = summary["block_rate"]
+    pd = summary["passed_defense"]
+    dr = summary["defense_rate"]
+    print(f"Total hold-out traces: {total}")
+    print(f"Blocked (safe): {blocked}/{total} ({br:.0f}%)")
+    print(f"Defended (blocked): {pd}/{total} ({dr:.0f}%)")
     print()
-    print(f"High-severity: {summary['high_severity_passed']}/{summary['high_severity_total']} defended")
+    hs_passed = summary["high_severity_passed"]
+    hs_total = summary["high_severity_total"]
+    print(f"High-severity: {hs_passed}/{hs_total} defended")
     print()
     print("By attack class:")
     for cls, stats in summary["by_attack_class"].items():
         rate = stats["defended"] / stats["total"] * 100
         print(f"  {cls}: {stats['defended']}/{stats['total']} ({rate:.0f}% defense rate)")
     print()
-    print(f"{'ID':<6} {'Pass':<6} {'Blocked':<8} {'Expected':<12} {'Actual':<20} {'Class'}")
+    print(f"{'ID':<6} {'Pass':<6} {'Blocked':<8} {'Expected':<20} {'Actual':<20} Class")
     print("-" * 80)
     for r in details:
         status = "PASS" if r.pass_ else "FAIL"
-        expected = r.expected_blocker
-        # Mark if actual differs from expected (informational only — still defended)
+        expected = r.expected_blocker or "—"
+        actual = r.actual_blocker or "ALLOW"
+        # If actual differs from expected, annotate expected with actual
         if r.actual_blocker and str(r.actual_blocker or "").lower() != expected.lower():
             expected = f"{expected}→{r.actual_blocker}"
         blocked = "BLOCK" if r.actual_blocked else "ALLOW"
         print(
-            f"{r.trace_id:<6} {status:<6} {blocked:<8} {expected:<20} {r.attack_class}"
+            f"{r.trace_id:<6} {status:<6} {blocked:<8} {expected:<20} {actual:<20} {r.attack_class}"
         )
     print("=" * 70)
 
