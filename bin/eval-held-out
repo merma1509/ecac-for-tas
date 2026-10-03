@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Held-out sealed evaluation — run: python bin/eval-held-out"""
+from effect_broker.held_out_evaluation import evaluate_all_hold_out, print_evaluation_report, get_traces_hash
+from effect_broker.traces import build
+
+broker = build()
+report = evaluate_all_hold_out(broker)
+print_evaluation_report(report)
+print()
+print("Traces SHA-256:", get_traces_hash())
