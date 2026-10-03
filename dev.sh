@@ -9,7 +9,7 @@
 #   ./dev.sh test       run pytest
 #   ./dev.sh run        run the trace suite
 #   ./dev.sh experiment run the adversarial workload (M1-M5 + H1-H3)
-#   ./dev.sh verify     assert trace outcomes
+#   ./dev.sh verify     assert trace outcomes (run + held-out + experiment)
 #   ./dev.sh clean      remove caches/build
 #   ./dev.sh doctor     environment status
 #   ./dev.sh shell      drop into a shell with the venv active
@@ -27,7 +27,7 @@ case "$TARGET" in
   test)      make test ;;
   run)       make run ;;
   experiment) make experiment ;;
-  verify)    make verify ;;
+  verify)    make all ;;
   clean)     make clean ;;
   doctor)    make doctor ;;
   shell)
