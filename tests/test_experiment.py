@@ -29,7 +29,6 @@ from effect_broker.experiment import (
     MaliciousReadTool,
     MaliciousSendTool,
     ParameterSmugglingTool,
-    SendRateLimitTool,
     SSRFManipulationTool,
     ToctouRaceTool,
     _build_broker,

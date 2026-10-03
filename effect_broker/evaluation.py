@@ -53,7 +53,7 @@ class SealedTrace:
     description: str
     attack_class: str
     difficulty: AttackerSophistication
-    expected_blocker: str  # which predicate or mechanism should block
+    expected_blocker: str | None  # which predicate or mechanism should block
     kill_criterion_category: str  # which kill criterion this traces
 
 SEALED_TRACES: list[SealedTrace] = [
@@ -201,9 +201,9 @@ class SealedResult:
     trace_id: str
     allow: bool
     actual_blocker: str | None
-    expected_blocker: str
+    expected_blocker: str | None
     latency_ms: float
-    passed: bool  # True if actual_blocker == expected_blocker
+    passed: bool  # True if actual_blocker == expected_blocker (None matches None)
 
 
 @dataclass
@@ -280,7 +280,7 @@ class HeldOutEvaluation:
         # Build the effect based on attack class
         # NOTE: This is the evaluation harness constructing the effect, not the broker.
         # The broker evaluates it, it does not construct it.
-        
+
         # Each case needs proper capability setup to reach its intended blocker.
 
         # H-S1: capability-cycle - should test Auth derivation chain
@@ -709,7 +709,7 @@ class HeldOutEvaluation:
                 derives_from=None,
             )
             # Set low rate limit
-            task.session.set_max_sends(2)  # Only 2 sends allowed
+            task.session.set_max_sends(2)  # type: ignore[union-attr]  # auto-created by __post_init__
             # Commit 2 sends (within limit)
             for i in range(2):
                 e = Effect(
@@ -744,7 +744,7 @@ class HeldOutEvaluation:
                 derives_from=None,
             )
             # Revoke the capability
-            task.session.revoked.add("revoked-cap")  # Add to revoked set
+            task.session.revoked.add("revoked-cap")  # type: ignore[union-attr]
             effect = Effect(
                 etype="send",
                 target="internal@corp.com",

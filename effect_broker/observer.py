@@ -109,7 +109,7 @@ class CompleteMediationResult:
 class IndependentObserver:
     """Independent effect observer.
 
-    In a real deployment, this wraps a filesystem watcher and/or MTA log.
+    In a real deployment, this observes the real OS filesystem/MTA independently.
     In this prototype, it wraps the broker's resource store to demonstrate
     the pattern.
 

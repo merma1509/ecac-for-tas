@@ -22,6 +22,10 @@ early set-based model got wrong
 
 from __future__ import annotations
 
+import warnings
+
+warnings.filterwarnings("ignore", message="SAME-PROCESS")
+
 from collections.abc import Callable  # noqa: UP035  # used in type annotations
 
 from .broker import EffectBroker

@@ -38,7 +38,7 @@ class Capability:
                 return True
         return False
 
-    def apply_transform(self, transformation: str) -> "Capability":
+    def apply_transform(self, transformation: str) -> Capability:
         """Apply transformation to create new capability."""
         if transformation == Transformation.EXPAND.value:
             # VULNERABILITY: EXPAND widens scope!

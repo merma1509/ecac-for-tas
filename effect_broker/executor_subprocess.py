@@ -22,7 +22,7 @@ the gap where Broker's gate() authorizes content_A but subprocess could
 apply content_B. With this:
   1. Broker computes content_hash and includes in ApprovedRequest
   2. IPC sends (effect, approved_content_hash) — both HMAC-protected
-  3. Subprocess computes hash(effect.metadata.content) 
+  3. Subprocess computes hash(effect.metadata.content)
   4. Compares against approved_content_hash -> mismatch = BLOCKED
 
 This ensures the executed content exactly matches the authorized content.
@@ -43,7 +43,7 @@ SUBCONFINEMENT (arbitrary code execution):
   ✓ Landlock sandbox (Linux 5.13+)
   ✓ seccomp BPF syscall filtering (defensive fallback)
   ✓ Network blocking (except local IPC socket)
-  
+
 IPC PROTOCOL
 ────────────
   Broker -> EXECUTE(commit_dict + approved_content_hash) -> Executor
@@ -102,8 +102,8 @@ _original_import = builtins.__import__
 
 def _secure_import(
     name: str,
-    globals: dict | None = None,
-    locals: dict | None = None,
+    globals: dict[str, Any] | None = None,
+    locals: dict[str, Any] | None = None,
     fromlist: tuple[str, ...] = (),
     level: int = 0,
 ) -> Any:
@@ -146,7 +146,7 @@ def _secure_import(
 
 
 # Install the secure import hook BEFORE any other imports
-builtins.__import__ = _secure_import
+builtins.__import__ = _secure_import  # type: ignore[assignment]
 
 # PHASE 2: Safe standard library imports (after blocking hook is installed)
 # These imports are ALLOWED by the secure import hook.
@@ -159,10 +159,10 @@ import os  # Used for path operations, stat, getpid, etc.
 import signal  # Needed for SIGINT/SIGTERM handlers
 import socket  # Needed for Unix socket IPC server
 import subprocess  # Needed for subprocess spawning at startup
-import sys
 import threading  # Needed for connection handler threads
 from pathlib import Path
 from typing import Any
+
 
 # PHASE 3: Content hash verification (atomic commit guarantee)
 def _compute_effect_content_hash(effect: dict[str, Any]) -> str | None:
@@ -274,7 +274,7 @@ _ALLOWED_READ_DIRS = frozenset({
 # The broker's subprocess.Popen() call uses the REAL os.open via _real_os_open
 # (which we saved before patching). We need to make sure the Popen in the broker
 # can still open /dev/null.
-# 
+#
 # Solution: patch os.open only AFTER we verify we're in the subprocess process.
 # We detect this by checking if we're being run as __main__ (executor script)
 # versus being imported by the broker.
@@ -395,184 +395,15 @@ _landlock_active = _apply_landlock_sandbox()
 # This provides defense-in-depth: even if Python-level blocks are bypassed,
 # the kernel will reject dangerous syscalls.
 def _apply_seccomp_filter() -> bool:
-    """Apply seccomp BPF filter to restrict syscalls.
+    """Stub: Landlock + import blocking + restricted-open are primary layers.
 
-    BLOCKED syscalls (return EPERM):
-      - socket() — prevents network connections
-      - connect() — prevents outgoing connections
-      - accept() — prevents listening sockets (except existing IPC socket)
-      - execve() — prevents spawning new processes
-      - clone() — prevents threading (we're already single-threaded)
-      - ptracer — prevents debuggers attaching
-
-    ALLOWED syscalls:
-      - read, write, open, close — file I/O (through restricted-open)
-      - stat, lstat, fstat — file metadata
-      - socketpair for IPC only (AF_UNIX)
-
-    This is the STRONGEST confinement layer — enforced by the Linux kernel itself.
+    This was an experimental seccomp BPF stub that never activated. Keeping
+    the stub in place in case it is re-implemented in future.
     """
-    if os.uname().sysname != "Linux":
-        return False
-
-    try:
-        import ctypes
-
-        libc = ctypes.CDLL(ctypes.util.find_library("c"))
-
-        # seccomp constants
-        SECCOMP_RET_ALLOW = 0x7FF00000
-        SECCOMP_RET_ERRNO = 0x00050000
-        SECCOMP_RET_KILL = 0x00000000
-
-        SECCOMP_SET_MODE_FILTER = 1
-        SECCOMP_FILTER_FLAG_NEW_LISTENER = 8
-        SECCOMP_FILTER_FLAG_TSYNC = 1
-
-        # syscall numbers (x86_64)
-        SYS_read = 0
-        SYS_write = 1
-        SYS_open = 2
-        SYS_close = 3
-        SYS_stat = 4
-        SYS_fstat = 5
-        SYS_lstat = 6
-        SYS_poll = 7
-        SYS_lseek = 8
-        SYS_mmap = 9
-        SYS_mprotect = 10
-        SYS_munmap = 11
-        SYS_brk = 12
-        SYS_rt_sigaction = 13
-        SYS_rt_sigreturn = 15
-        SYS_ioctl = 16
-        SYS_readlink = 89
-        SYS_sysinfo = 99
-        SYS_gettid = 186
-        SYS_socketcall = 66  # legacy socket syscalls
-        SYS_uname = 63
-        SYS_getuid = 102
-        SYS_getgid = 104
-        SYS_geteuid = 107
-        SYS_getegid = 108
-        SYS_getppid = 110
-        SYS_getpgrp = 111
-        SYS_getgroups = 115
-        SYS_getpgid = 121
-        SYS_getsid = 124
-        SYS_newuname = 63
-        SYS_getpriority = 141
-        SYS_setpriority = 140
-        SYS_sched_getaffinity = 204
-        SYS_sched_getparam = 156
-        SYS_time = 201
-        SYS_clock_gettime = 228
-        SYS_exit = 231
-        SYS_exit_group = 231
-        SYS_wait4 = 61
-        SYS_prlimit64 = 302
-        SYS_getrandom = 318
-        SYS_fcntl = 72
-        SYS_arch_prctl = 229
-
-        # Blocked syscall numbers
-        SYS_socket = 41
-        SYS_connect = 42
-        SYS_accept = 43
-        SYS_bind = 49
-        SYS_listen = 50
-        SYS_clone = 56
-        SYS_execve = 59
-        SYS_ptrace = 101
-        SYS_init_module = 105
-        SYS_delete_module = 176
-        SYS_capset = 125
-
-        # Build BPF filter: allow specific syscalls, kill everything else
-        # Architecture: x86_64
-        # BPF_STMT(op, k) = {op, k, 0}
-        # BPF_JUMP(op, jt, jf, k) = {op, jt, jf, k}
-        SECCOMP_AUDIT_ARCH = 0xC000003E  # AUDIT_ARCH_X86_64
-
-        class sock_filter(ctypes.Structure):
-            _fields_ = [
-                ("code", ctypes.c_uint16),  # BPF instruction
-                ("jt", ctypes.c_uint8),    # jump true
-                ("jf", ctypes.c_uint8),     # jump false
-                ("k", ctypes.c_uint32),     # generic multiplier
-            ]
-
-        class sock_fprog(ctypes.Structure):
-            _fields_ = [
-                ("len", ctypes.c_uint16),
-                ("filter", ctypes.POINTER(sock_filter)),
-            ]
-
-        # BPF program: load syscall number, compare against blocked list
-        # If blocked → return SECCOMP_RET_KILL
-        # If allowed → return SECCOMP_RET_ALLOW
-
-        # Instructions:
-        # 0: load syscall number from arch (offset 4 from sp)
-        # 1: check if socket (41) → kill
-        # 2: check if connect (42) → kill
-        # 3: check if accept (43) → kill
-        # 4: check if bind (49) → kill
-        # 5: check if listen (50) → kill
-        # 6: check if clone (56) → kill
-        # 7: check if execve (59) → kill
-        # 8: check if ptrace (101) → kill
-        # 9: allow everything else
-
-        # BPF_STMT(BPF_LD + BPF_W + BPF_ABS, 0) → load word from memory
-        # BPF code starts at offset 0 (arch field)
-        # syscall number is at offset 16 (arch(8) + number(8))
-
-        # Simpler approach: check syscall number directly
-        # SECCOMP_GET_ACTION_AVAIL returns whether action is available
-
-        BPF_LD = 0x00
-        BPF_W = 0x00
-        BPF_ABS = 0x20
-
-        BPF_JMP = 0x05
-        BPF_JEQ = 0x10
-        BPF_JGT = 0x20
-        BPF_JGE = 0x30
-        BPF_K = 0x00
-
-        BPF_RET = 0x10
-        BPF_A = 0x10
-
-        # We need to use seccomp syscall directly
-        # prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)
-        PR_SET_SECCOMP = 22
-        SECCOMP_MODE_FILTER = 2
-
-        SECCOMP_RET_LOG = SECCOMP_RET_ALLOW  # Log allowed calls (for audit)
-
-        # Simpler approach: use prctl-based seccomp
-        # This is the legacy approach, works without seccomp syscall
-
-        # Define a minimal BPF filter for blocking network/process syscalls
-        # This is a simplified version - full implementation would need
-        # more careful BPF program construction
-
-        # For now, use the Landlock + import blocking + restricted-open
-        # as the primary confinement layers, with seccomp as a defensive layer
-
-        # Attempt: use prctl with SECCOMP_MODE_STRICT (only allows read/write/exit)
-        try:
-            # SECCOMP_MODE_STRICT is the safest but too restrictive for our needs
-            # We use SECCOMP_MODE_FILTER instead
-            pass
-        except Exception:
-            pass
-
-    except Exception:
-        pass
-
-    return False  # seccomp BPF not applied — Landlock + import blocking + restricted-open are primary
+    # TODO: Implement seccomp BPF filter for Linux kernel-level syscall restriction.
+    #       Until then, Landlock, import blocking, and restricted-open provide
+    #       confinement.
+    return False
 
 
 _seccomp_active = _apply_seccomp_filter()
