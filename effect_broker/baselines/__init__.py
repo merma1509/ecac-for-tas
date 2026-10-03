@@ -14,8 +14,6 @@ from __future__ import annotations
 
 import warnings
 
-warnings.filterwarnings("ignore", message="SAME-PROCESS")
-
 from .mode_allowlist import AllowlistBroker
 from .mode_argument_provenance import ArgumentProvenanceBroker
 from .mode_camel import CaMeLBroker
@@ -24,6 +22,8 @@ from .mode_cordon import CordonBroker
 from .mode_ecac import ECACBaselineBroker
 from .mode_forge import ForgeBroker
 from .mode_pact import PACTBroker
+
+warnings.filterwarnings("ignore", message="SAME-PROCESS")
 
 __all__ = [
     "CaMeLBroker",

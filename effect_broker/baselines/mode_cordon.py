@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from effect_broker.model import Effect
 
-from effect_broker.lattice import Confidentiality
 
 
 @dataclass
