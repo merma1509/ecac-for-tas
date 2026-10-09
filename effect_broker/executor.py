@@ -225,14 +225,27 @@ class IsolatedExecutor:
             # Phase 2: SOLE MUTATION POINT — external state changes ONLY here.
             # Every effect that the ledger confirmed as authorized reaches state
             # through this call. There is no other mutation path.
-            self.apply_effect(gate_result.effect, gate_result.task)
+            applied = self.apply_effect(gate_result.effect, gate_result.task)
 
-            # Record observation — ledger sees the state change
-            identity_entries = self.broker.store.identity_log
-            if identity_entries:
-                last_entry = identity_entries[-1]
+            if applied:
+                # Effect successfully applied to external state
+                # Record observation — ledger sees the state change
+                identity_entries = self.broker.store.identity_log
+                if identity_entries:
+                    last_entry = identity_entries[-1]
+                    self.ledger.record_observation(
+                        actual_task_id, nonce, last_entry, source="executor.apply"
+                    )
+                # Don't increment send_count on failure (budget preserved)
+                if gate_result.effect.etype == "send":
+                    gate_result.task.session.increment_send_count()  # Only on success
+            else:
+                # Effect could NOT be applied ( resource not found).
+                # Record explicit FAILED observation — NOT a block, but a failure.
+                # This prevents auth > 0, obs = 0 → UNKNOWN (possible bypass).
+                # The ledger MUST know this effect was attempted but failed.
                 self.ledger.record_observation(
-                    actual_task_id, nonce, last_entry, source="executor.apply"
+                    actual_task_id, nonce, None, source="executor.apply:FAILED"
                 )
         else:
             # BLOCKed effect: explicit observation that the gate rejected it.
@@ -245,7 +258,7 @@ class IsolatedExecutor:
 
         return allow, evidence
 
-    def apply_effect(self, effect: Effect, task: Task) -> None:
+    def apply_effect(self, effect: Effect, task: Task) -> bool:
         """Apply an effect to external state. THIS is the SOLE mutation point.
 
         Called ONLY after broker.gate() has returned allow=True. This is the
@@ -253,10 +266,12 @@ class IsolatedExecutor:
         is recorded in identity_log, enabling the ledger to verify complete
         mediation.
 
-        There is no other call site for _apply_effect() in the broker — the
-        direct broker.commit() path also routes through here.
+        Returns:
+            True if the effect was applied successfully.
+            False if the effect could NOT be applied ( resource not found).
+            The caller MUST handle False and must NOT record CONFIRMED_COMMITTED.
         """
-        self.broker._apply_effect(effect, task)
+        return self.broker._apply_effect(effect, task)
 
     def verify_mediation(self) -> list[str]:
         """Verify complete mediation. Delegates to the independent ledger."""
