@@ -36,6 +36,7 @@ from typing import Any, cast
 warnings.filterwarnings("ignore", message="SAME-PROCESS")
 
 from .broker import EffectBroker
+from .model import AGENT, BROKER, USER
 from .shim import FileShim, SecurityError
 
 
@@ -715,21 +716,57 @@ class SendRateLimitTool:
 
     def run(self) -> None:
         from .lattice import Confidentiality, Integrity
-        from .model import Data, Effect
+        from .model import Data, Effect, Capability
 
         # Set max sends to 3
         task = self.broker.tasks.get(self.task_id)
         assert task is not None and task.session is not None
         task.session.set_max_sends(3)
 
-        # Attempt 10 sends — only 3 should succeed
+        # Grant 10 fresh capability chains (one per send) so each send has a
+        # unique nonce. Reusing the same nonce would trigger Fresh (replay
+        # prevention) and block ALL sends #2-#10 for a different reason than
+        # the rate limit. We need Fresh to PASS so that send #4-#10 are
+        # blocked by the rate limit (NoAmp), demonstrating the correct fix.
+        for i in range(10):
+            self.broker.grant_root(
+                Capability(
+                    USER,
+                    USER,
+                    "send",
+                    "internal@corp.com",
+                    frozenset({"internal"}),
+                    100,
+                    f"r-send-t18-{i}",
+                )
+            )
+            self.broker.attenuate(
+                f"r-send-t18-{i}", AGENT, "send", "internal@corp.com", frozenset({"internal"}), 100
+            )
+            self.broker.attenuate(
+                f"r-send-t18-{i}:Agent",
+                BROKER,
+                "send",
+                "internal@corp.com",
+                frozenset({"internal"}),
+                100,
+            )
+
+        # Attempt 10 sends — only 3 should succeed (max_sends_per_session=3).
+        # Sends #1-#3: Fresh passes (new nonce), can_send() returns True → ALLOW.
+        # Sends #4-#10: Fresh passes (new nonce), but can_send() returns False
+        # (rate limit exceeded) → NoAmp blocks with send-rate-limit reason.
+        # Note: use PUBLIC data (no explicit provenance with high confidentiality).
+        # Using CONFIDENTIAL data would trigger FlowOK (conf-leak) and block
+        # ALL sends, defeating the purpose of this test (verifying the rate limit).
         for i in range(10):
             effect = Effect(
                 etype="send",
                 target="internal@corp.com",
                 metadata={"body": f"chunk {i}: exfil data {i * 100}-{(i+1)*100}"},
-                provenance=(Data("exfil", Confidentiality.CONFIDENTIAL, Integrity.USER),),
-                capability_nonce="r-send:Agent:EffectBroker",
+                provenance=(),
+                # Each send uses its own capability chain (unique nonce per send)
+                capability_nonce=f"r-send-t18-{i}:Agent:EffectBroker",
                 delegation_chain=("t18-tool",),
             )
             commit = self.broker._make_commit(effect, task_id=self.task_id)

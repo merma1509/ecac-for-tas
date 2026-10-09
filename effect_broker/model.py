@@ -133,7 +133,7 @@ class Session:
     _tainted: bool = field(default=False, repr=False)
     _taint_reason: str = field(default="", repr=False)  # human-readable reason
 
-    # L4 FIX: Send rate limiting to prevent amplification via composition.
+    # Send rate limiting to prevent amplification via composition.
     # Tracks number of send effects committed in this session. When the
     # count exceeds max_sends_per_session, subsequent sends are blocked.
     # This prevents the "many small sends exfiltrate data" attack pattern.
@@ -190,7 +190,7 @@ class Session:
     def set_max_sends(self, max_sends: int) -> None:
         """Set the maximum number of sends allowed per session.
 
-        L4 fix: Prevents amplification via composition. When max_sends is reached,
+        Prevents amplification via composition. When max_sends is reached,
         subsequent sends are blocked by check_noamp().
         """
         self._max_sends_per_session = max_sends
@@ -207,14 +207,23 @@ class Session:
         self._send_count += 1
         return True, ""
 
+    def can_send(self) -> bool:
+        """Check if session can send more (without incrementing)."""
+        if self._max_sends_per_session <= 0:
+            return True
+        return self._send_count < self._max_sends_per_session
+
     @property
     def send_count(self) -> int:
         """Current send count for this session (read-only)."""
         return self._send_count
-        self._tainted = False
-        self._taint_reason = ""
 
-    # ---- Trusted provenance chain  ----
+    @property
+    def max_sends(self) -> int:
+        """Maximum sends allowed per session (read-only). 0 = unlimited."""
+        return self._max_sends_per_session
+
+    # ---- Trusted provenance chain ----
     def register_read_provenance(self, data: Data, cap_nonce: str) -> str:
         """Register a read effect's output in the provenance chain.
 
@@ -702,3 +711,7 @@ class Commit:
     # the SAME hash. This closes the gate↔execute coupling gap in same-process
     # mode (IPC mode already had this via executor_subprocess._verify_content_binding).
     authorized_content_hash: str | None = None
+
+
+
+

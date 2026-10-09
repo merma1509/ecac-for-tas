@@ -295,15 +295,25 @@ class IndependentEffectLedger:
         # Classify observations: committed (effect was applied) vs blocked (gate/shim rejected)
         committed_entries: list[LedgerEntry] = []
         blocked_entries: list[LedgerEntry] = []
+        failed_entries: list[LedgerEntry] = []  # executor.apply returned False
         for entry in obs_entries:
             if entry.source in BLOCKED_SOURCES:
                 blocked_entries.append(entry)
+            elif ":FAILED" in entry.source or entry.source == "executor.apply:FAILED":
+                # Executor confirmed the effect was attempted but could not be applied
+                # (e.g., resource not found). This is NOT a committed observation —
+                # the effect did NOT reach external state. Treat as failed, not committed.
+                failed_entries.append(entry)
             else:
                 committed_entries.append(entry)
 
-        # KEY FIX: committed takes precedence over blocked.
+        # Committed takes precedence over blocked.
         # If any observation has non-None observed_targets, the effect was applied.
         # Subsequent blocked retries (replay prevention) don't change this fact.
+        #
+        # IMPORTANT: failed_entries (apply returned False) are NOT committed.
+        # They indicate the effect was attempted but could NOT reach external state.
+        # auth > 0 with only failed observations → UNKNOWN (unknown, not safe).
         if committed_entries:
             # There ARE committed observations — verify they are within authorization
             for entry in committed_entries:
@@ -318,7 +328,7 @@ class IndependentEffectLedger:
             # when ALL observations are committed (no BLOCKED entries).
             # When BLOCKED entries exist, they don't count toward the limit
             # because they represent replay prevention, not extra applications.
-            only_committed_count = sum(1 for e in obs_entries if e not in blocked_entries)
+            only_committed_count = sum(1 for e in obs_entries if e not in blocked_entries and e not in failed_entries)
             if only_committed_count > len(auth_entries):
                 return UnknownLedgerResult(
                     reason=f"over-observed(task={task_id},nonce={nonce},"
@@ -326,6 +336,14 @@ class IndependentEffectLedger:
                     f"committed_count={only_committed_count})"
                 )
             return LedgerVerdict.CONFIRMED_COMMITTED
+
+        # Effect was attempted but could NOT reach external state (apply returned False).
+        # This is NOT a commit, NOT a block — it's a failure. auth > 0, obs = failed → UNKNOWN.
+        if failed_entries and auth_entries and not committed_entries:
+            return UnknownLedgerResult(
+                reason=f"apply_failed(task={task_id},nonce={nonce},"
+                f"reason=executor.apply_returned_false)"
+            )
 
         # Only blocked attempts — effect was NEVER applied to external state
         if blocked_entries and auth_entries:
