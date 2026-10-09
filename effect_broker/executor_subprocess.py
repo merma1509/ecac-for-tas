@@ -41,7 +41,6 @@ SUBCONFINEMENT (arbitrary code execution):
   ✓ Module import blocking (builtins.__import__ hook)
   ✓ restricted-open for filesystem writes
   ✓ Landlock sandbox (Linux 5.13+)
-  ✓ seccomp BPF syscall filtering (defensive fallback)
   ✓ Network blocking (except local IPC socket)
 
 IPC PROTOCOL
@@ -57,7 +56,7 @@ Run as:
 
 from __future__ import annotations
 
-# PHASE 1: IMPORT BLOCKING — applied FIRST, before any module loading
+# IMPORT BLOCKING — applied FIRST, before any module loading
 # Order is CRITICAL: block dangerous imports before anything else can import them.
 # This is the first code that runs in the subprocess.
 import builtins
@@ -244,105 +243,17 @@ def _verify_content_binding(
     return True, "content-binding-verified"
 
 
-# PHASE 4: Filesystem confinement (restricted open)
-_real_os_open = os.open  # Save BEFORE patching
+# Filesystem confinement (restricted open)
+# Re-export from enforcer.py for backward compatibility and self-documentation.
+# The enforcer module is the canonical source for restricted-open logic.
 
-_ALLOWED_WRITE_DIRS = frozenset({
-    "/tmp", "/var/tmp", "/dev/shm",
-    # macOS temp directories
-    "/var/folders",
-    # Device files (needed for subprocess.Popen stdin/stdout/stderr redirection)
-    "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom",
-})
-_ALLOWED_READ_DIRS = frozenset({
-    "/tmp", "/var/tmp", "/dev/shm",
-    # macOS temp directories
-    "/var/folders",
-    # System files for config
-    "/etc", "/usr", "/bin", "/sbin",
-    # Device files (needed for subprocess redirection: /dev/null)
-    "/dev",
-    # User home directories
-    "/home",
-})
-
-
-# Apply open restriction to os.open
-# This patches os.open in the EXECUTOR subprocess, NOT in the broker.
-# The broker process also imports this module for type references, but the
-# subprocess process is the one that actually uses _restricted_open for I/O.
-# The broker's subprocess.Popen() call uses the REAL os.open via _real_os_open
-# (which we saved before patching). We need to make sure the Popen in the broker
-# can still open /dev/null.
-#
-# Solution: patch os.open only AFTER we verify we're in the subprocess process.
-# We detect this by checking if we're being run as __main__ (executor script)
-# versus being imported by the broker.
-
-# Save real os.open for broker's subprocess.Popen usage
-_real_os_open_for_broker = os.open
-
-# Only apply restricted-open in the executor subprocess process
-# The subprocess can be detected by checking sys.argv[0] or by checking if
-# the current module is being run directly
-_EXECUTOR_MAIN = (
-    len(sys.argv) > 0
-    and "executor_subprocess" in str(sys.argv[0])
+from effect_broker.enforcer import (
+    _restricted_open as _restricted_open,
+    _real_os_open,
+    set_allowed_paths as _set_allowed_paths,
+    get_allowed_paths,
+    get_blocked_paths,
 )
-
-
-def _restricted_open(path: str, *args: Any, **kwargs: Any) -> int:
-    """Restricted open() — only allows operations in sandboxed directories.
-
-    SECURITY:
-      - Write operations ONLY allowed in /tmp, /var/tmp, /dev/shm
-      - Read operations allowed in broader set (system files, config)
-      - Any path outside allowed dirs → PermissionError
-
-    This prevents the subprocess from writing outside of allowed directories
-    even if subprocess code is somehow compromised.
-    """
-    path_str = str(path)
-
-    # Check write intent
-    write_modes = {os.O_WRONLY, os.O_RDWR, os.O_CREAT, os.O_TRUNC, os.O_EXCL}
-    has_write_intent = any(
-        a in write_modes for a in args if isinstance(a, int)
-    )
-
-    if has_write_intent:
-        # Write: only allowed in sandbox directories
-        if any(path_str.startswith(d) for d in _ALLOWED_WRITE_DIRS):
-            return _real_os_open(path, *args, **kwargs)
-        raise PermissionError(
-            f"Write to '{path_str}' denied. "
-            f"Only sandboxed directories allowed: {sorted(_ALLOWED_WRITE_DIRS)}"
-        )
-
-    # Read: allowed in wider set (system + sandbox)
-    if any(path_str.startswith(d) for d in _ALLOWED_READ_DIRS):
-        return _real_os_open(path, *args, **kwargs)
-
-    # Special case: device files (needed for subprocess redirection: /dev/null)
-    if path_str.startswith("/dev/"):
-        return _real_os_open(path, *args, **kwargs)
-
-    # Special case: IPC socket path (passed via command line, not filesystem)
-    # Allow reading if it's a socket-like path
-    if path_str.endswith(".sock") or ".ecac" in path_str:
-        return _real_os_open(path, *args, **kwargs)
-
-    raise PermissionError(
-        f"Read of '{path_str}' denied. "
-        f"Allowed directories: {sorted(_ALLOWED_READ_DIRS)}"
-    )
-
-
-# Apply the patch only if we're in the subprocess process
-# The broker process imports this module but should NOT apply the patch
-# because it needs os.open for subprocess.Popen operations
-if _EXECUTOR_MAIN:
-    os.open = _restricted_open  # type: ignore[assignment]
 
 
 def _apply_landlock_sandbox() -> bool:
@@ -391,31 +302,11 @@ def _apply_landlock_sandbox() -> bool:
 _landlock_active = _apply_landlock_sandbox()
 
 
-# PHASE 5: seccomp BPF syscall filtering (Linux kernel-level restriction)
-# This provides defense-in-depth: even if Python-level blocks are bypassed,
-# the kernel will reject dangerous syscalls.
-def _apply_seccomp_filter() -> bool:
-    """Stub: Landlock + import blocking + restricted-open are primary layers.
-
-    This was an experimental seccomp BPF stub that never activated. Keeping
-    the stub in place in case it is re-implemented in future.
-    """
-    # TODO: Implement seccomp BPF filter for Linux kernel-level syscall restriction.
-    #       Until then, Landlock, import blocking, and restricted-open provide
-    #       confinement.
-    return False
-
-
-_seccomp_active = _apply_seccomp_filter()
-
-
 def _get_confinement_status() -> str:
     """Return description of active confinement."""
     methods = ["restricted-open", "import-blocking"]
     if _landlock_active:
         methods.append("landlock")
-    if _seccomp_active:
-        methods.append("seccomp")
     return "+".join(methods)
 
 
@@ -1340,7 +1231,6 @@ if __name__ == "__main__":
 
 
 # ---- Subprocess Confinement Summary ----
-#
 # MULTI-LAYER DEFENSE (in order of application):
 #
 # Layer 1: Import blocking (builtins.__import__ hook) — FIRST
@@ -1354,27 +1244,23 @@ if __name__ == "__main__":
 #   - Both values are HMAC-signed in the same IPC payload
 #
 # Layer 3: Filesystem confinement (restricted-open wrapper)
-#   - Write operations only in /tmp, /var/tmp, /dev/shm
-#   - Read operations in broader set (system files + sandbox)
+#   - Write operations only in broker-configured allowed paths
+#   - Read operations in allowed paths + system directories + /dev
+#   - Blocked paths: /etc, /bin, /usr, /var, /root, /.ssh, /.config
 #   - Applied to os.open() at import time
 #
 # Layer 4: Landlock (Linux 5.13+)
 #   - Kernel-enforced filesystem restrictions
-#   - Best-effort (may fail silently on older kernels)
-#
-# Layer 5: seccomp BPF (defensive, incomplete)
-#   - Attempts kernel-level syscall filtering
-#   - Blocks: socket, connect, clone, execve, ptrace
-#   - Not fully implemented — Landlock + Layer 1 are primary
+#   - Best-effort (may fail silently on older kernels / macOS)
 #
 # WHAT IS PROTECTED:
 #   ✓ Content hash verification: executed content matches authorized content
 #   ✓ Import blocking: dangerous modules cannot be loaded
 #   ✓ Filesystem sandboxing: writes restricted to sandbox directories
-#   ✓ Kernel-level enforcement: Landlock restricts at OS level
+#   ✓ Kernel-level enforcement: Landlock restricts at OS level (Linux)
 #   ✓ Audit trail: all operations logged with pid/timestamp
 #
 # REMAINING LIMITATIONS:
-#   - seccomp BPF is partial (complex BPF program not fully implemented)
 #   - Python stdlib not fully blocked (only dangerous modules)
+#   - seccomp BPF is future work (not currently needed)
 #   - For stronger guarantees: AppArmor/SELinux profiles, Wasm, or gVisor
