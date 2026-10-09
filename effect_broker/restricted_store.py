@@ -362,7 +362,7 @@ class RestrictedResourceStore:
         local = email.address.split("@")[0]
         return self._mutable_mailboxes().setdefault(local, Mailbox(local))
 
-    def apply_effect(self, effect: Effect) -> None:
+    def apply_effect(self, effect: Effect) -> bool:
         """Mutate external state for a committed (allowed) effect.
 
         THIS IS THE SOLE PATH for external state mutation. Every call
@@ -372,26 +372,32 @@ class RestrictedResourceStore:
         Thread-safe: holds store lock during mutation.
         Raises RuntimeError if the store is sealed (bypass attempt).
 
+        Returns:
+            True if the effect was applied successfully.
+            False if the effect could NOT be applied (e.g., resource not found,
+            permission denied). The caller MUST handle False and must NOT record
+            CONFIRMED_COMMITTED to the ledger in this case.
+
         Semantics:
           - write/delete: files (dynamically resolved if not bootstrapped)
           - send: delivers to sender's outbox (address → mailbox)
           - read: logged, no persistent change
           - network: logged, no persistent change
-
-        Note: In the simulated store, write effects don't actually persist
-        file content — the real state is on disk. The store just logs the
-        effect for the observer. For real file I/O, see RealFileShim which
-        calls actual OS operations before committing to the broker.
         """
         self._lock.acquire()
         try:
             self._check_not_sealed()
-            self._apply_effect_inner(effect)
+            return self._apply_effect_inner(effect)
         finally:
             self._lock.release()
 
-    def _apply_effect_inner(self, effect: Effect) -> None:
-        """Inner apply_effect body — called while holding the store lock."""
+    def _apply_effect_inner(self, effect: Effect) -> bool:
+        """Inner apply_effect body — called while holding the store lock.
+
+        Returns:
+            True if effect was applied successfully.
+            False if effect could NOT be applied (resource not found, etc.)
+        """
         target_id = effect.target
         resource = self.resolve(target_id)
 
@@ -403,7 +409,9 @@ class RestrictedResourceStore:
             resource = File(target_id, conf)
             self._mutable_files()[target_id] = resource
         elif resource is None:
-            raise KeyError(f"effect targets unknown resource: {target_id}")
+            # Cannot apply effect — target doesn't exist and can't be created
+            # Return False so caller can handle this (don't record CONFIRMED_COMMITTED)
+            return False
 
         # Build complete set of resources this effect touches
         all_targets: set[str] = {target_id}
@@ -421,14 +429,17 @@ class RestrictedResourceStore:
             del self._mutable_files()[target_id]
             self.effects_log.append(("delete", f"file:{target_id}"))
             self.identity_log.append(all_targets_frozen)
+            return True
 
         elif effect.etype == "write" and isinstance(resource, File):
             self.effects_log.append(("write", f"file:{target_id}"))
             self.identity_log.append(all_targets_frozen)
+            return True
 
         elif effect.etype == "read" and isinstance(resource, File):
             self.effects_log.append(("read", f"file:{target_id}"))
             self.identity_log.append(all_targets_frozen)
+            return True
 
         elif effect.etype == "send" and isinstance(resource, Email):
             self._deliver_to_targets(
@@ -438,24 +449,25 @@ class RestrictedResourceStore:
             )
             self.effects_log.append(("send", f"email:{target_id}"))
             self.identity_log.append(all_targets_frozen)
+            return True
 
         elif effect.etype in ("read", "send") and isinstance(resource, Mailbox):
             self.effects_log.append((effect.etype, f"mailbox:{target_id}"))
             self.identity_log.append(all_targets_frozen)
+            return True
 
         elif effect.etype == "read" and isinstance(resource, Email):
             self.effects_log.append(("read", f"inbox:{self.mailbox_for(resource).user}"))
             self.identity_log.append(all_targets_frozen)
+            return True
 
         elif effect.etype == "network" and isinstance(resource, URL):
             self.effects_log.append(("network", f"url:{resource.uri}"))
             self.identity_log.append(all_targets_frozen)
+            return True
 
-        else:
-            raise ValueError(
-                f"effect type {effect.etype} not applicable to {type(resource).__name__}"
-            )
-
-
-# Backwards-compat alias (for existing code that imports ResourceStore)
-ResourceStore = RestrictedResourceStore
+        # If we reach here, the effect type doesn't match any known resource type
+        # This is an error condition, not a "couldn't apply" condition
+        raise ValueError(
+            f"effect type {effect.etype} not applicable to {type(resource).__name__}"
+        )
