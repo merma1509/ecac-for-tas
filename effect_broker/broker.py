@@ -1213,13 +1213,19 @@ class EffectBroker:
                             f"not in cap-scope={capability.scope}"
                         )
 
-        # L4 FIX: Send rate limiting for inter-effect amplification prevention.
+        # Send rate limiting for inter-effect amplification prevention.
         # Blocks when session exceeds max_sends_per_session. This prevents the
         # "many small sends exfiltrate data" attack pattern.
+
+        # Note: send_count is incremented AFTER successful apply_effect (in executor),
+        # not during gate. This ensures failed sends (SMTP server down) do
+        # not consume the budget. Gate only checks if count < max_sends (allow check).
         if effect.etype == "send" and task.session is not None:
-            allowed, reason = task.session.increment_send_count()
-            if not allowed:
-                return False, reason
+            if not task.session.can_send():
+                return False, (
+                    f"send-rate-limit(session={task.session.session_id}, "
+                    f"count={task.session.send_count}, max={task.session.max_sends})"
+                )
 
         return True, f"composition-ok(ceiling-scope={task.ceiling.scope})"
 
@@ -1705,7 +1711,7 @@ class EffectBroker:
             can_apply=allow,
         )
 
-    def _apply_effect(self, effect: Effect, task: Task) -> None:
+    def _apply_effect(self, effect: Effect, task: Task) -> bool:
         """Apply an effect to external state. Broker-internal.
 
         NOTE: The nonce is ALREADY reserved by _atomic_fresh_check() in gate().
@@ -1718,6 +1724,12 @@ class EffectBroker:
         SESSION TAINT (inter-effect composition):
           When a read effect reads a CONFIDENTIAL file, the session is marked
           as tainted. This prevents subsequent send effects without declass.
+
+        Returns:
+            True if the effect was applied successfully.
+            False if the effect could NOT be applied (e.g., resource not found).
+            The caller MUST handle False and must NOT record CONFIRMED_COMMITTED
+            to the ledger in this case.
         """
         # ---- Session taint: mark session as tainted on CONFIDENTIAL read ----
         if effect.etype == "read" and task.session is not None:
@@ -1751,15 +1763,13 @@ class EffectBroker:
                 prov_id = task.session.register_read_provenance(
                     read_output, effect.capability_nonce
                 )
-                # Update the effect's provenance with the registered data
-                # (only for the ledger's view — the effect itself is immutable)
-                _registered_data = task.session.get_provenance(prov_id)
                 # Note: we don't need to modify the effect (it's immutable).
                 # The provenance chain is tracked by the session, not the effect.
                 # FlowOK will call task.session.verify_effect_provenance(effect)
                 # which checks the Data items in effect.provenance have valid IDs.
 
-        self.store.apply_effect(effect)
+        # Pass through the store's success/failure indicator
+        return self.store.apply_effect(effect)
 
     def apply_effect(self, commit_or_effect: Commit | Effect, task: Task | None = None) -> None:
         """Apply an effect to external state. CALLER must verify gate first.
