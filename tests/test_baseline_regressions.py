@@ -1,9 +1,17 @@
-"""Tests for baseline comparison framework.
+"""Baseline REGRESSION tests (not a causal evaluation).
 
-Verifies that:
-1. ECAC blocks all 20 adversarial traces
-2. Each baseline fails at least one trace (proving it's not trivially correct)
-3. ECAC's advantage is documented (what ECAC blocks that baselines don't)
+What these tests DO demonstrate:
+1. ECAC's four predicates block all 20 named adversarial traces (regression
+   coverage of the gate logic).
+2. Each named baseline mechanism fails at least one trace (the baselines are
+   not trivially correct — the comparison is meaningful).
+3. ECAC's coverage is documented per trace (what ECAC blocks that baselines don't).
+
+What these tests do NOT demonstrate:
+- Mechanism EFFECTIVENESS under a live attacker. These are regression checks
+  on supplied traces, not attack-based causal evaluation. A baseline "failing
+  a trace" shows the mechanism as modeled does not cover that pattern; it is
+  not a demonstration of exploitability or of ECAC superiority in production.
 """
 
 from __future__ import annotations
@@ -11,8 +19,13 @@ from __future__ import annotations
 from effect_broker.baselines import run_comparison
 
 
-class TestBaselineComparison:
-    """Baseline comparison: ECAC vs CaMeL/PACT/ChainCaps/Cordon/FORGE."""
+class TestBaselineRegressionSuite:
+    """Baseline comparison: ECAC vs CaMeL/PACT/ChainCaps/Cordon/FORGE.
+
+    Demonstrates the mechanisms EXIST and their gate logic behaves on the
+    supplied traces. Does NOT demonstrate mechanism effectiveness against
+    adaptive attacks — see module docstring.
+    """
 
     def test_ecac_blocks_all_traces(self) -> None:
         """ECAC should block all 20 adversarial traces."""
