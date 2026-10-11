@@ -42,17 +42,23 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
-# Explicit statx constants with cross-platform fallback ----
-# Linux kernel constants (from <linux/stat.h>) — used when os.STATX_* not available
-_STATX_ALL: int = 0x00000FFF  # STATX_ALL = all statx fields
-_STATX_ATTR_ENCRYPTED: int = 1 << 0  # File encrypted with fscrypt
-_STATX_ATTR_IMMUTABLE: int = 1 << 1  # File is immutable (chattr +i)
-
-# Use Python's os constants if available (Linux with Python >= 3.8),
-# otherwise fall back to our explicit constants above
-_STATX_FLAGS_TO_USE: int = getattr(os, "STATX_ALL", _STATX_ALL)
-_STATX_ATTR_ENCRYPTED_BIT: int = getattr(os, "STATX_ATTR_ENCRYPTED", _STATX_ATTR_ENCRYPTED)
-_STATX_ATTR_IMMUTABLE_BIT: int = getattr(os, "STATX_ATTR_IMMUTABLE", _STATX_ATTR_IMMUTABLE)
+# Explicit statx constants — PLAN_2 S4: single source of truth in statx.py.
+# Local aliases kept for backwards compatibility, but the VALUES now come from
+# the shared module so no process can fork a divergent `1 << 0` / `1 << 1`.
+try:  # package context (normal imports — shim never runs standalone)
+    from .statx import (  # type: ignore[no-redef]
+        STATX_ALL as _STATX_ALL,
+        STATX_ALL as _STATX_FLAGS_TO_USE,  # statx() flag mask (all fields)
+        STATX_ATTR_ENCRYPTED as _STATX_ATTR_ENCRYPTED_BIT,
+        STATX_ATTR_IMMUTABLE as _STATX_ATTR_IMMUTABLE_BIT,
+    )
+except ImportError:  # pragma: no cover — unexpected standalone use
+    from statx import (  # type: ignore[no-redef]
+        STATX_ALL as _STATX_ALL,
+        STATX_ALL as _STATX_FLAGS_TO_USE,
+        STATX_ATTR_ENCRYPTED as _STATX_ATTR_ENCRYPTED_BIT,
+        STATX_ATTR_IMMUTABLE as _STATX_ATTR_IMMUTABLE_BIT,
+    )
 
 
 @dataclass
@@ -135,9 +141,21 @@ class RealFileShim:
         task = self.broker.tasks.get(self.task_id)
         if task is None or task.session is None:
             return
-        if session_update.get("tainted"):
-            task.session._tainted = True
-            task.session._taint_reason = session_update.get("_taint_reason", "subprocess-real-io")
+        # PLAN_2 S2 — absorb per-resource taint from the subprocess via the
+        # public API (taint_for_send), NOT by mutating private `_tainted`.
+        b_resources: dict[str, dict[str, Any]] = session_update.get("_tainted_resources", {})
+        if b_resources:
+            for resource, rec in b_resources.items():
+                task.session.taint_for_send(
+                    resource=resource,
+                    reason=rec.get("reason", f"read-confidential({resource})"),
+                )
+        elif session_update.get("tainted"):
+            # Legacy flat bool — fall back to a session-level resource key.
+            task.session.taint_for_send(
+                resource="<session>",
+                reason=session_update.get("_taint_reason", "subprocess-real-io"),
+            )
         if session_update.get("logical_time", 0) > task.session.logical_time:
             task.session.logical_time = session_update["logical_time"]
 
