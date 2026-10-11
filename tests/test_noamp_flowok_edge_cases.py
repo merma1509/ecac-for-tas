@@ -630,8 +630,10 @@ class TestSessionTaintInterEffectComposition:
             nonce="send-cap",
         )
 
-        # Session is taint-forced (read-secrets happened)
-        task.session.taint_for_send("read-confidential(file:///secrets)")
+        # Session is taint-forced (read-secrets happened) — per-resource (PLAN_2 S2)
+        task.session.taint_for_send(
+            resource="file:///secrets", reason="read-confidential(file:///secrets)"
+        )
         assert task.session.tainted is True
 
         # Broker records a declass exception (user approved)
@@ -658,6 +660,8 @@ class TestSessionTaintInterEffectComposition:
             additional_targets=frozenset(),
             etype="send",
             task_id="declass-test",
+            # PLAN_2 S2 NARROW declass: clears taint ONLY for this file resource.
+            data_resources=frozenset({"file:///secrets"}),
         )
 
         # Bootstrap the email (required for send effect to be valid)
