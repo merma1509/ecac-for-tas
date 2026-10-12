@@ -86,7 +86,11 @@ class IndependentOracle:
         """Verify a delete effect: observed = file is ABSENT on disk."""
         absent = not os.path.exists(target_path)
         return OracleVerdict(
-            "delete", target_path, claimed, absent, claimed == absent,
+            "delete",
+            target_path,
+            claimed,
+            absent,
+            claimed == absent,
             "file-absent" if absent else "file-still-present",
         )
 
@@ -107,9 +111,7 @@ class IndependentOracle:
         detail = "all-delivered" if observed else f"missing-recipients={sorted(missing)}"
         return OracleVerdict("send", primary, claimed, observed, claimed == observed, detail)
 
-    def verify_hidden_recipients(
-        self, declared: frozenset[str]
-    ) -> OracleVerdict:
+    def verify_hidden_recipients(self, declared: frozenset[str]) -> OracleVerdict:
         """Detect recipients in the real SMTP log that were NOT declared.
 
         This is the BCC-detection oracle: if the MTA accepted a recipient that
@@ -140,9 +142,7 @@ class IndependentOracle:
         verdicts: list[OracleVerdict] = []
         for etype, target in claimed_effects:
             if etype == "write":
-                verdicts.append(
-                    self.verify_write(target, expected_bytes.get(target), claimed=True)
-                )
+                verdicts.append(self.verify_write(target, expected_bytes.get(target), claimed=True))
             elif etype == "delete":
                 verdicts.append(self.verify_delete(target, claimed=True))
             elif etype == "send":
@@ -151,9 +151,7 @@ class IndependentOracle:
                 delivered = {rcpt for rcpt, _ in self.smtp_log}
                 observed = primary in delivered
                 detail = "primary-delivered" if observed else "primary-not-delivered"
-                verdicts.append(
-                    OracleVerdict("send", primary, True, observed, observed, detail)
-                )
+                verdicts.append(OracleVerdict("send", primary, True, observed, observed, detail))
             # additional hidden-recipient sweep
             if declared_recipients:
                 verdicts.append(self.verify_hidden_recipients(declared_recipients))
