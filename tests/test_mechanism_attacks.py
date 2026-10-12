@@ -238,9 +238,7 @@ class TestFlowOKDeclassUnblocksPair:
         # With declass the same send is now allowed.
         effect = _send("internal@corp.com", "cap-flow-declass-send", label_exceptions=(declass,))
         allow, _ = broker.commit(Commit(effect, task))
-        assert allow is True, (
-            "Tainted send WITH broker-recorded declass should be allowed"
-        )
+        assert allow is True, "Tainted send WITH broker-recorded declass should be allowed"
 
 
 class TestFreshReplayPair:
@@ -256,8 +254,11 @@ class TestFreshReplayPair:
         task = _task(frozenset({"*"}))
         broker.register_task(task)
         cap = _cap(
-            "User", "read", "file:///reports/summary.txt",
-            frozenset({"file:///reports"}), "cap-fresh",
+            "User",
+            "read",
+            "file:///reports/summary.txt",
+            frozenset({"file:///reports"}),
+            "cap-fresh",
         )
         broker.capabilities["cap-fresh"] = cap
 
