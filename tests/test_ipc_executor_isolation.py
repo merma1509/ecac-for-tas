@@ -302,6 +302,7 @@ class TestExecutorSubprocessIPC:
             f"Block must be a content-hash mismatch: {block_result}"
         )
 
+
 class TestLedgerReadsExecutorStore:
     """The ledger reads actual executor state for independent verification.
 
