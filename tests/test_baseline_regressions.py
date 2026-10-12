@@ -78,11 +78,13 @@ class TestBaselineRegressionSuite:
 
         # Find traces ECAC blocks that PACT misses
         pact_gaps = [
-            name for name in ecac_blocked
+            name
+            for name in ecac_blocked
             if ecac_blocked[name] and not pact_blocked.get(name, False)
         ]
         chaincaps_gaps = [
-            name for name in ecac_blocked
+            name
+            for name in ecac_blocked
             if ecac_blocked[name] and not chaincaps_blocked.get(name, False)
         ]
 
