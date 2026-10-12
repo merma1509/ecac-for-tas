@@ -112,13 +112,15 @@ class TestConventionalSandboxBaseline:
 
         # Trace classes the OS sandbox cannot model (send/BCC/replay/taint).
         dataflow_traces = [
-            n for n in by_name_ecac
+            n
+            for n in by_name_ecac
             if any(k in n for k in ("Session taint", "BCC", "Replay", "rate limit"))
         ]
         assert dataflow_traces, "Expected dataflow/BCC/replay traces in the comparison set"
 
         sandbox_blind = [
-            n for n in dataflow_traces
+            n
+            for n in dataflow_traces
             if by_name_ecac[n]["blocked"] and not by_name_sbx[n]["blocked"]
         ]
         assert len(sandbox_blind) >= 1, (
@@ -140,7 +142,8 @@ class TestConventionalSandboxBaseline:
 
         # Traces the sandbox blocks via path confinement: ECAC must also block.
         sandbox_blocked_write = [
-            t["name"] for t in results["ConvSandbox"]
+            t["name"]
+            for t in results["ConvSandbox"]
             if t["blocked"] and "write-outside-sandbox-root" in t["reason"]
         ]
         assert sandbox_blocked_write, (
