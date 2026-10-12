@@ -333,5 +333,3 @@ class IndependentObserver:
                     if self._broker.ledger.verify(task_id, nonce) != confirmed:
                         return False  # Bypass detected: observed but not confirmed
         return True
-
-
