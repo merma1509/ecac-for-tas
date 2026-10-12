@@ -58,9 +58,7 @@ class TestMetricsComputed:
         (Auth/FlowOK/NoAmp/Fresh), not a single coincidental predicate.
         """
         mech = report["per_mechanism"]
-        assert len(mech) >= 3, (
-            f"Per-mechanism contribution should span >= 3 predicates, got {mech}"
-        )
+        assert len(mech) >= 3, f"Per-mechanism contribution should span >= 3 predicates, got {mech}"
         # The four named predicates are the expected contributors.
         assert set(mech) <= {"Auth", "FlowOK", "NoAmp", "Fresh", "ApprovalBinding", "Structural"}
 
