@@ -111,10 +111,10 @@ class SessionTaintMetrics:
     """
 
     total_reads: int = 0
-    reads_that_tainted: int = 0             # read effects that set session taint
-    sends_blocked_by_taint: int = 0         # send effects blocked via "session-taint"
+    reads_that_tainted: int = 0  # read effects that set session taint
+    sends_blocked_by_taint: int = 0  # send effects blocked via "session-taint"
     blocked_sends_later_declassed: int = 0  # a taint-blocked send, then a declass
-                                            # was granted covering the same task
+    # was granted covering the same task
 
     @property
     def taint_rate(self) -> float:
@@ -886,6 +886,7 @@ class Effect:
         if self.etype == "write":
             # Handle both direct content (bytes/str) and base64-encoded content
             import base64
+
             content_raw = self.metadata.get("content", "")
             if content_raw is None or content_raw == "":
                 # Also check for base64 encoded content (from IPC-safe shim)
