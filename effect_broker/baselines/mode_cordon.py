@@ -9,7 +9,6 @@ if TYPE_CHECKING:
     from effect_broker.model import Effect
 
 
-
 @dataclass
 class CordonProposal:
     """Cordon-style proposal."""
