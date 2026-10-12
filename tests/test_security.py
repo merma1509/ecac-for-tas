@@ -20,14 +20,12 @@ from effect_broker.model import (
     compute_scope_hash,
 )
 from effect_broker.statx import (
-    STATX_ALL,
     STATX_ATTR_ENCRYPTED,
     STATX_ATTR_IMMUTABLE,
     derive_confidentiality_from_mode,
     derive_confidentiality_mode_str,
     try_statx_attributes,
 )
-from effect_broker.traces import build
 
 
 # ---------------------------------------------------------------------------
@@ -44,12 +42,21 @@ def _read_confidential_task(broker: EffectBroker, task_id: str = "t1") -> Task:
         expiry=float("inf"),
         nonce=f"ceil-{task_id}",
     )
-    task = Task(task_id=task_id, owner=USER, ceiling=ceil,
-                flow_boundary=(Confidentiality.INTERNAL, Integrity.USER))
+    task = Task(
+        task_id=task_id,
+        owner=USER,
+        ceiling=ceil,
+        flow_boundary=(Confidentiality.INTERNAL, Integrity.USER),
+    )
     broker.register_task(task)
     read_cap = Capability(
-        owner=USER, holder=BROKER, right="read", target="file:///secrets",
-        scope=frozenset({"*"}), expiry=float("inf"), nonce=f"read-cap-{task_id}",
+        owner=USER,
+        holder=BROKER,
+        right="read",
+        target="file:///secrets",
+        scope=frozenset({"*"}),
+        expiry=float("inf"),
+        nonce=f"read-cap-{task_id}",
         task_id=task_id,
     )
     broker.capabilities[f"read-cap-{task_id}"] = read_cap
@@ -91,9 +98,13 @@ class TestProvenanceCapabilityScope:
         broker.store._unsafe_bootstrap_file("file:///secrets", Confidentiality.CONFIDENTIAL)
 
         read_effect = Effect(
-            etype="read", target="file:///secrets", metadata={},
-            provenance=(), capability_nonce="read-cap-forge-scope",
-            delegation_chain=(BROKER,), task_id="forge-scope",
+            etype="read",
+            target="file:///secrets",
+            metadata={},
+            provenance=(),
+            capability_nonce="read-cap-forge-scope",
+            delegation_chain=(BROKER,),
+            task_id="forge-scope",
         )
         allow, _ = broker.commit(Commit(read_effect, task))
         assert allow is True
@@ -110,8 +121,7 @@ class TestProvenanceCapabilityScope:
             scope_hash="deadbeef" * 4,  # not the real scope hash
         )
         trusted, reason = task.session.verify_effect_provenance(
-            Effect("send", "internal@corp.com", {}, (forged,),
-                   "send-cap", (BROKER,))
+            Effect("send", "internal@corp.com", {}, (forged,), "send-cap", (BROKER,))
         )
         assert trusted is False, "forged scope_hash must be rejected"
         assert "untrusted-provenance" in reason
@@ -123,9 +133,13 @@ class TestProvenanceCapabilityScope:
         broker.store._unsafe_bootstrap_file("file:///secrets", Confidentiality.CONFIDENTIAL)
 
         effect = Effect(
-            etype="read", target="file:///secrets", metadata={},
-            provenance=(), capability_nonce="read-cap-no-scope",
-            delegation_chain=(BROKER,), task_id="no-scope",
+            etype="read",
+            target="file:///secrets",
+            metadata={},
+            provenance=(),
+            capability_nonce="read-cap-no-scope",
+            delegation_chain=(BROKER,),
+            task_id="no-scope",
         )
         allow, _ = broker.commit(Commit(effect, task))
         assert allow is True
@@ -139,8 +153,7 @@ class TestProvenanceCapabilityScope:
             scope_hash=None,  # legacy datum without binding
         )
         trusted, _ = task.session.verify_effect_provenance(
-            Effect("send", "internal@corp.com", {}, (legacy,),
-                   "send-cap", (BROKER,))
+            Effect("send", "internal@corp.com", {}, (legacy,), "send-cap", (BROKER,))
         )
         assert trusted is False
 
@@ -151,11 +164,20 @@ class TestProvenanceCapabilityScope:
 class TestNarrowDeclass:
     def _tainted_task(self, broker: EffectBroker, task_id: str, resource: str) -> Task:
         ceil = Capability(
-            owner=USER, holder=BROKER, right="send", target="internal@corp.com",
-            scope=frozenset({"*"}), expiry=float("inf"), nonce=f"ceil-{task_id}",
+            owner=USER,
+            holder=BROKER,
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce=f"ceil-{task_id}",
         )
-        task = Task(task_id=task_id, owner=USER, ceiling=ceil,
-                    flow_boundary=(Confidentiality.INTERNAL, Integrity.USER))
+        task = Task(
+            task_id=task_id,
+            owner=USER,
+            ceiling=ceil,
+            flow_boundary=(Confidentiality.INTERNAL, Integrity.USER),
+        )
         broker.register_task(task)
         broker.store._unsafe_bootstrap_email("internal@corp.com", None)
         task.session.taint_for_send(resource=resource, reason=f"read-confidential({resource})")
@@ -172,8 +194,12 @@ class TestNarrowDeclass:
         task = self._tainted_task(broker, "empty-dc", "file:///secrets")
 
         grant = LabelException(
-            kind="declass", match_target="*", from_label="CONFIDENTIAL",
-            to_label="INTERNAL", granted_by=USER, nonce="dc-empty",
+            kind="declass",
+            match_target="*",
+            from_label="CONFIDENTIAL",
+            to_label="INTERNAL",
+            granted_by=USER,
+            nonce="dc-empty",
             data_resources=frozenset(),  # clears nothing
         )
         broker.grant_label_exception(grant, task_id="empty-dc")
@@ -188,8 +214,12 @@ class TestNarrowDeclass:
         assert task.session.tainted is True
 
         grant = LabelException(
-            kind="declass", match_target="*", from_label="CONFIDENTIAL",
-            to_label="INTERNAL", granted_by=USER, nonce="dc-a",
+            kind="declass",
+            match_target="*",
+            from_label="CONFIDENTIAL",
+            to_label="INTERNAL",
+            granted_by=USER,
+            nonce="dc-a",
             data_resources=frozenset({"file:///a"}),  # only a
         )
         broker.grant_label_exception(grant, task_id="partial")
@@ -208,8 +238,12 @@ class TestNarrowDeclass:
         task.session.taint_for_send(resource="file:///b", reason="r")
 
         grant = LabelException(
-            kind="declass", match_target="*", from_label="CONFIDENTIAL",
-            to_label="INTERNAL", granted_by=USER, nonce="dc-wc",
+            kind="declass",
+            match_target="*",
+            from_label="CONFIDENTIAL",
+            to_label="INTERNAL",
+            granted_by=USER,
+            nonce="dc-wc",
             data_resources=frozenset({"*"}),
         )
         broker.grant_label_exception(grant, task_id="wc")
@@ -223,8 +257,12 @@ class TestNarrowDeclass:
         self._tainted_task(broker, "narrow-B", "file:///secrets")
 
         grant = LabelException(
-            kind="declass", match_target="*", from_label="CONFIDENTIAL",
-            to_label="INTERNAL", granted_by=USER, nonce="dc-cross",
+            kind="declass",
+            match_target="*",
+            from_label="CONFIDENTIAL",
+            to_label="INTERNAL",
+            granted_by=USER,
+            nonce="dc-cross",
             task_id="narrow-B",  # for task B
             data_resources=frozenset({"*"}),
         )
@@ -243,22 +281,16 @@ class TestSessionTaintMetrics:
         t = _read_confidential_task(broker, "m1")
         broker.store._unsafe_bootstrap_file("file:///secrets", Confidentiality.CONFIDENTIAL)
 
-        for i in range(3):  # 3 reads (all confidential) -> total 3, tainted 3
-            effect = Effect(
-                etype="read", target="file:///secrets", metadata={},
-                provenance=(), capability_nonce=f"read-cap-m1",
-                delegation_chain=(BROKER,), task_id="m1",
-            )
-            # reserve+commit uses fresh nonce; grant one per iteration
-            broker.capabilities[f"read-cap-m1"] = broker.capabilities[f"read-cap-m1"]
-
-        # Only commit once (each commit uses the nonce once); do 3 separate
-        # commits is overkill — just assert the metric SKELETON exists and that
-        # a single confidential read counts.
+        # Only commit once (each commit uses the nonce once); assert the metric
+        # counts a single confidential read.
         effect = Effect(
-            etype="read", target="file:///secrets", metadata={},
-            provenance=(), capability_nonce="read-cap-m1",
-            delegation_chain=(BROKER,), task_id="m1",
+            etype="read",
+            target="file:///secrets",
+            metadata={},
+            provenance=(),
+            capability_nonce="read-cap-m1",
+            delegation_chain=(BROKER,),
+            task_id="m1",
         )
         allow, _ = broker.commit(Commit(effect, t))
         assert allow is True
@@ -281,22 +313,32 @@ class TestSessionTaintMetrics:
         broker.store._unsafe_bootstrap_file("file:///secrets", Confidentiality.CONFIDENTIAL)
 
         # 1) Read confidential -> session tainted
-        read_ok, _ = broker.commit(Commit(
-            Effect("read", "file:///secrets", {}, (),
-                   "read-cap-m2", (BROKER,), task_id="m2"), t
-        ))
+        read_ok, _ = broker.commit(
+            Commit(
+                Effect("read", "file:///secrets", {}, (), "read-cap-m2", (BROKER,), task_id="m2"), t
+            )
+        )
         assert read_ok is True
 
         # 2) Send while tainted -> BLOCKED by session-taint (this is the signal)
         broker.capabilities["send-cap-m2"] = Capability(
-            owner=USER, holder=BROKER, right="send", target="internal@corp.com",
-            scope=frozenset({"*"}), expiry=float("inf"), nonce="send-cap-m2",
+            owner=USER,
+            holder=BROKER,
+            right="send",
+            target="internal@corp.com",
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce="send-cap-m2",
         )
         broker.store._unsafe_bootstrap_email("internal@corp.com", None)
         send_effect = Effect(
-            "send", "internal@corp.com", {},
+            "send",
+            "internal@corp.com",
+            {},
             (Data("body", Confidentiality.INTERNAL, Integrity.USER),),
-            "send-cap-m2", (BROKER,), task_id="m2",
+            "send-cap-m2",
+            (BROKER,),
+            task_id="m2",
         )
         blocked, ev = broker.commit(Commit(send_effect, t))
         assert blocked is False, f"send while tainted must block: {ev}"
@@ -307,9 +349,14 @@ class TestSessionTaintMetrics:
 
         # 3) Declass lands on same task -> proxy increments
         grant = LabelException(
-            kind="declass", match_target="*", from_label="CONFIDENTIAL",
-            to_label="INTERNAL", granted_by=USER, nonce="dc-m2",
-            data_resources=frozenset({"*"}), task_id="m2",
+            kind="declass",
+            match_target="*",
+            from_label="CONFIDENTIAL",
+            to_label="INTERNAL",
+            granted_by=USER,
+            nonce="dc-m2",
+            data_resources=frozenset({"*"}),
+            task_id="m2",
         )
         broker.grant_label_exception(grant, task_id="m2")
 
@@ -326,10 +373,11 @@ class TestSessionTaintMetrics:
         broker = EffectBroker()
         t = _read_confidential_task(broker, "m3")
         broker.store._unsafe_bootstrap_file("file:///secrets", Confidentiality.CONFIDENTIAL)
-        broker.commit(Commit(
-            Effect("read", "file:///secrets", {}, (),
-                   "read-cap-m3", (BROKER,), task_id="m3"), t
-        ))
+        broker.commit(
+            Commit(
+                Effect("read", "file:///secrets", {}, (), "read-cap-m3", (BROKER,), task_id="m3"), t
+            )
+        )
 
         metrics = broker.get_taint_metrics()
         assert metrics["taint_rate"] > 0.0
@@ -404,7 +452,6 @@ class TestIpcSecurityFieldPreservation:
     def test_commit_roundtrip_preserves_authorized_content_hash(self) -> None:
         """commit_to_dict keeps authorized_content_hash for the subprocess gate."""
         from effect_broker.executor_ipc import commit_to_dict
-
         from effect_broker.model import ApprovedRequest, EffectTarget
 
         broker = EffectBroker()
