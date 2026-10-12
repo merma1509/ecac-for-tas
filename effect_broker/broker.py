@@ -1812,7 +1812,7 @@ class EffectBroker:
                     content="",  # content not stored (would be large)
                 )
                 cap = self.capabilities.get(effect.capability_nonce)
-                prov_id = task.session.register_read_provenance(
+                task.session.register_read_provenance(
                     read_output,
                     effect.capability_nonce,
                     capability=cap,
