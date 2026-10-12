@@ -15,10 +15,8 @@ Resolution order (first match wins) mirrors broker.derive_file_provenance():
 from __future__ import annotations
 
 import os
-from enum import IntEnum
 
 from .lattice import Confidentiality, Integrity
-
 
 # Linux kernel constants from <linux/stat.h>, with cross-platform fallback.
 # os.STATX_* exists only on Linux with a recent enough Python; elsewhere we
