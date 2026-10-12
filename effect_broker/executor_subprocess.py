@@ -66,31 +66,52 @@ import sys
 # NOTE: stdlib modules like 'os', 'subprocess', 'threading', 'signal' are ALLOWED.
 # The blocking is ONLY for dangerous third-party packages and specific attack vectors.
 # Filesystem writes are restricted via _restricted_open wrapper on os.open().
-_DANGEROUS_MODULES: frozenset[str] = frozenset({
-    # Code execution — prevents dynamic code generation
-    "exec", "eval", "compile", "code", "codeop",
-    # Object serialization attacks
-    "pickle", "marshal", "shelve",
-    # System information / privilege escalation
-    "platform",  # Can reveal system info
-    "resource",  # Can modify resource limits
-    "grp",  # Group database access
-    "pwd",  # Password database access
-    "spwd",  # Shadow password database access
-    # Signal handlers are managed by the subprocess itself, not needed as module
-})
+_DANGEROUS_MODULES: frozenset[str] = frozenset(
+    {
+        # Code execution — prevents dynamic code generation
+        "exec",
+        "eval",
+        "compile",
+        "code",
+        "codeop",
+        # Object serialization attacks
+        "pickle",
+        "marshal",
+        "shelve",
+        # System information / privilege escalation
+        "platform",  # Can reveal system info
+        "resource",  # Can modify resource limits
+        "grp",  # Group database access
+        "pwd",  # Password database access
+        "spwd",  # Shadow password database access
+        # Signal handlers are managed by the subprocess itself, not needed as module
+    }
+)
 
 # Third-party network packages blocked (never needed in subprocess)
-_BLOCKED_NETWORK_PACKAGES: frozenset[str] = frozenset({
-    "requests", "aiohttp", "httpx", "websockets", "smb", "urllib3",
-})
+_BLOCKED_NETWORK_PACKAGES: frozenset[str] = frozenset(
+    {
+        "requests",
+        "aiohttp",
+        "httpx",
+        "websockets",
+        "smb",
+        "urllib3",
+    }
+)
 
 # stdlib modules blocked (not needed in subprocess, not dangerous as-is)
-_BLOCKED_STDLIB: frozenset[str] = frozenset({
-    # Network client libraries (not needed in isolated subprocess)
-    # Note: smtplib IS needed for real_smtp_send, imaplib IS needed for real_imap_read_inbox
-    "http.client", "ftplib", "telnetlib", "nntplib", "poplib",
-})
+_BLOCKED_STDLIB: frozenset[str] = frozenset(
+    {
+        # Network client libraries (not needed in isolated subprocess)
+        # Note: smtplib IS needed for real_smtp_send, imaplib IS needed for real_imap_read_inbox
+        "http.client",
+        "ftplib",
+        "telnetlib",
+        "nntplib",
+        "poplib",
+    }
+)
 
 # Store list of blocked imports for debugging/audit
 _blocked_imports_log: list[str] = []
@@ -249,10 +270,6 @@ def _verify_content_binding(
 
 from effect_broker.enforcer import (
     _restricted_open as _restricted_open,
-    _real_os_open,
-    set_allowed_paths as _set_allowed_paths,
-    get_allowed_paths,
-    get_blocked_paths,
 )
 
 
@@ -284,8 +301,7 @@ def _apply_landlock_sandbox() -> bool:
         attr = landlock_ruleset_attr(handled_access_fs=handled)
 
         ruleset_fd = libc.syscall(
-            SYS_landlock_create_ruleset, 0,
-            ctypes.byref(attr), ctypes.sizeof(attr)
+            SYS_landlock_create_ruleset, 0, ctypes.byref(attr), ctypes.sizeof(attr)
         )
 
         if ruleset_fd >= 0:
@@ -308,7 +324,6 @@ def _get_confinement_status() -> str:
     if _landlock_active:
         methods.append("landlock")
     return "+".join(methods)
-
 
 
 def _derive_confidentiality_from_mode(mode_int: int) -> str:
