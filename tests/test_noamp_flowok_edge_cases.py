@@ -31,6 +31,7 @@ def _build() -> EffectBroker:
     permissive ceiling so they can test their specific predicate blocks.
     """
     from effect_broker.model import USER
+
     broker = build()
     # Override the restrictive default ceiling with wildcard for these tests.
     # The specific predicates (NoAmp SSRF containment, Auth derivation) are
