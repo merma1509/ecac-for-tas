@@ -379,8 +379,7 @@ class TestRunAllScenarios:
             r = results.get(key)
             assert r is not None, f"Scenario {key} not found"
             assert r.actual_allow is False, (
-                f"{key} should be BLOCKed (got ALLOW). "
-                f"expected_blocker={r.expected_blocker}"
+                f"{key} should be BLOCKed (got ALLOW). expected_blocker={r.expected_blocker}"
             )
 
     def test_eighteen_total_scenarios(self) -> None:
