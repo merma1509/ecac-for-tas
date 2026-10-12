@@ -128,9 +128,7 @@ class TestIndependentOracleSmtp:
         assert "hidden-recipients" in v.detail
 
 
-@pytest.mark.skipif(
-    pytest.importorskip("aiosmtpd") is None, reason="aiosmtpd not installed"
-)
+@pytest.mark.skipif(pytest.importorskip("aiosmtpd") is None, reason="aiosmtpd not installed")
 class TestIndependentOracleRealMta:
     """End-to-end: real aiosmtpd handler log feeds the oracle (no probe patching)."""
 
@@ -224,7 +222,6 @@ class TestIndependentOracleRealMta:
         # The ledger declared only the primary. The oracle sees the BCC.
         v = oracle.verify_hidden_recipients(frozenset({"internal@corp.com"}))
         assert v.matches is False, (
-            "Oracle must detect the hidden BCC from the REAL MTA log "
-            f"(got detail={v.detail})"
+            f"Oracle must detect the hidden BCC from the REAL MTA log (got detail={v.detail})"
         )
         assert "attacker@evil.com" in v.detail
