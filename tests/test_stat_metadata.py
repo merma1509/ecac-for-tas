@@ -52,8 +52,12 @@ class TestStatVsReadTaint:
         broker = EffectBroker(mode="multi-process")
         canon_tmpdir = str(pathlib.Path(tmp_dir).resolve())
         cap = Capability(
-            owner="User", holder="untrusted-tool", right="*", target="*",
-            scope=frozenset({f"file://{canon_tmpdir}"}), expiry=float("inf"),
+            owner="User",
+            holder="untrusted-tool",
+            right="*",
+            target="*",
+            scope=frozenset({f"file://{canon_tmpdir}"}),
+            expiry=float("inf"),
             nonce=f"stat-cap-{task_id}",
         )
         task = Task(task_id=task_id, owner="User", ceiling=cap)
