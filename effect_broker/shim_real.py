@@ -46,15 +46,13 @@ T = TypeVar("T")
 # Local aliases kept for backwards compatibility, but the VALUES now come from
 # the shared module so no process can fork a divergent `1 << 0` / `1 << 1`.
 try:  # package context (normal imports — shim never runs standalone)
-    from .statx import (  # type: ignore[no-redef]
-        STATX_ALL as _STATX_ALL,
+    from .statx import (  # noqa: I001 — ruff would split the combined aliases
         STATX_ALL as _STATX_FLAGS_TO_USE,  # statx() flag mask (all fields)
         STATX_ATTR_ENCRYPTED as _STATX_ATTR_ENCRYPTED_BIT,
         STATX_ATTR_IMMUTABLE as _STATX_ATTR_IMMUTABLE_BIT,
     )
 except ImportError:  # pragma: no cover — unexpected standalone use
-    from statx import (  # type: ignore[no-redef]
-        STATX_ALL as _STATX_ALL,
+    from statx import (  # type: ignore[import-not-found, no-redef]  # noqa: I001
         STATX_ALL as _STATX_FLAGS_TO_USE,
         STATX_ATTR_ENCRYPTED as _STATX_ATTR_ENCRYPTED_BIT,
         STATX_ATTR_IMMUTABLE as _STATX_ATTR_IMMUTABLE_BIT,
@@ -644,7 +642,9 @@ class RealFileShim:
                     # This closes the gate↔execute coupling gap.
                     content_hash = hashlib.sha256(content).hexdigest()
                     result = self.ipc_client.real_file_write(
-                        canon, content, self.task_id,
+                        canon,
+                        content,
+                        self.task_id,
                         approved_content_hash=content_hash,
                     )
                     # session_update may carry taint from CONFIDENTIAL write
