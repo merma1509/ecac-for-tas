@@ -328,7 +328,9 @@ class IndependentEffectLedger:
             # when ALL observations are committed (no BLOCKED entries).
             # When BLOCKED entries exist, they don't count toward the limit
             # because they represent replay prevention, not extra applications.
-            only_committed_count = sum(1 for e in obs_entries if e not in blocked_entries and e not in failed_entries)
+            only_committed_count = sum(
+                1 for e in obs_entries if e not in blocked_entries and e not in failed_entries
+            )
             if only_committed_count > len(auth_entries):
                 return UnknownLedgerResult(
                     reason=f"over-observed(task={task_id},nonce={nonce},"
