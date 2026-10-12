@@ -23,23 +23,49 @@ causal estimate of protection against adaptive/live attackers.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, TypedDict
 
 from effect_broker.lattice import Confidentiality, Integrity
 from effect_broker.model import (
     Capability,
     Commit,
     Data,
+    Domain,
     Effect,
+    EffectTarget,
     Task,
 )
 from effect_broker.traces import build
 
+if TYPE_CHECKING:
+    from effect_broker.broker import EffectBroker
+
 # The trusted core: the code whose correctness the security argument rests on.
 # (Excludes shims, tests, baselines, and the evaluation harness.)
 _TCB_FILES = ("effect_broker/broker.py", "effect_broker/model.py")
+
+
+class EvaluationReport(TypedDict, total=False):
+    """Shape of the §6 metrics report dict (see build_report)."""
+
+    total: int
+    attacks: int
+    legitimate: int
+    attacks_blocked: int
+    false_negatives: int
+    false_positives: int
+    defense_rate: float
+    false_positive_rate: float
+    per_mechanism: dict[str, int]
+    latency_p50_ms: float
+    latency_p95_ms: float
+    latency_p99_ms: float
+    annotations: int
+    tcb_lines: int
+    session_taint: dict[str, object]
 
 
 @dataclass
@@ -50,7 +76,7 @@ class _Scenario:
     name: str
     is_attack: bool
     # Build an Effect on the given (broker, task). Returns the effect to commit.
-    builder: Any  # callable((broker, task) -> Effect)
+    builder: Callable[[EffectBroker, Task], Effect]
     ceiling_scope: frozenset[str] = frozenset({"*"})
 
 
@@ -94,22 +120,22 @@ class EvaluationMetrics:
     def p99(self) -> float:
         return self._percentile(99)
 
-    def as_dict(self) -> dict:
-        return {
-            "total": self.total,
-            "attacks": self.attacks,
-            "legitimate": self.legitimate,
-            "attacks_blocked": self.attacks_blocked,
-            "false_negatives": self.attacks_missed,
-            "false_positives": self.legit_blocked,
-            "defense_rate": self.defense_rate,
-            "false_positive_rate": self.false_positive_rate,
-            "per_mechanism": dict(self.per_mechanism),
-            "latency_p50_ms": self.p50(),
-            "latency_p95_ms": self.p95(),
-            "latency_p99_ms": self.p99(),
-            "annotations": self.annotations,
-        }
+    def as_dict(self) -> EvaluationReport:
+        return EvaluationReport(
+            total=self.total,
+            attacks=self.attacks,
+            legitimate=self.legitimate,
+            attacks_blocked=self.attacks_blocked,
+            false_negatives=self.attacks_missed,
+            false_positives=self.legit_blocked,
+            defense_rate=self.defense_rate,
+            false_positive_rate=self.false_positive_rate,
+            per_mechanism=dict(self.per_mechanism),
+            latency_p50_ms=self.p50(),
+            latency_p95_ms=self.p95(),
+            latency_p99_ms=self.p99(),
+            annotations=self.annotations,
+        )
 
 
 def _task(scope: frozenset[str] = frozenset({"*"})) -> Task:
@@ -125,7 +151,7 @@ def _task(scope: frozenset[str] = frozenset({"*"})) -> Task:
     return Task(task_id="metrics", owner="User", ceiling=ceiling)
 
 
-def _cap(owner, right, target, scope, nonce) -> Capability:
+def _cap(owner: str, right: str, target: str, scope: frozenset[str], nonce: str) -> Capability:
     return Capability(
         owner=owner,
         holder="EffectBroker",
@@ -145,68 +171,73 @@ def _build_scenarios() -> list[_Scenario]:
     "annotation burden" reflects the real number of explicit grants.
     """
 
-    def _install(broker, task):
+    def _install(broker: EffectBroker, task: Task) -> None:
         broker.register_task(task)
 
-    def _read(target, nonce):
+    def _read(target: str, nonce: str) -> Effect:
         return Effect(
-            etype="read", target=target, metadata={}, provenance=(),
-            capability_nonce=nonce, delegation_chain=(),
+            etype="read",
+            target=target,
+            metadata={},
+            provenance=(),
+            capability_nonce=nonce,
+            delegation_chain=(),
         )
 
-    def _send(target, nonce, additional=None):
-        from effect_broker.model import EffectTarget
-
-        known = (
-            EffectTarget(primary=target, additional=additional) if additional else None
-        )
+    def _send(target: str, nonce: str, additional: frozenset[str] | None = None) -> Effect:
+        known = EffectTarget(primary=target, additional=additional) if additional else None
         return Effect(
-            etype="send", target=target, metadata={},
+            etype="send",
+            target=target,
+            metadata={},
             provenance=(Data("msg", Confidentiality.INTERNAL, Integrity.USER),),
-            capability_nonce=nonce, delegation_chain=(), known_targets=known,
+            capability_nonce=nonce,
+            delegation_chain=(),
+            known_targets=known,
         )
 
     scenarios: list[_Scenario] = []
 
     # --- Attacks (should be BLOCKED) ---
-    def a_out_of_ceiling(broker, task):
+    def a_out_of_ceiling(broker: EffectBroker, task: Task) -> Effect:
         broker.capabilities["a-oo"] = _cap(
             "User", "read", "*", frozenset({"file:///reports"}), "a-oo"
         )
         return _read("file:///secrets/x", "a-oo")  # outside ceiling scope -> Auth
 
-    def a_bcc_outside_scope(broker, task):
+    def a_bcc_outside_scope(broker: EffectBroker, task: Task) -> Effect:
         broker.capabilities["a-bcc"] = _cap(
             "User", "send", "internal@corp.com", frozenset({"internal"}), "a-bcc"
         )
-        return _send(
-            "internal@corp.com", "a-bcc", additional=frozenset({"evil@evil.com"})
-        )  # NoAmp
+        return _send("internal@corp.com", "a-bcc", additional=frozenset({"evil@evil.com"}))  # NoAmp
 
-    def a_replay(broker, task):
+    def a_replay(broker: EffectBroker, task: Task) -> Effect:
         broker.capabilities["a-rep"] = _cap(
-            "User", "read", "file:///reports/x",
-            frozenset({"file:///reports"}), "a-rep",
+            "User",
+            "read",
+            "file:///reports/x",
+            frozenset({"file:///reports"}),
+            "a-rep",
         )
         # First use consumes the nonce; the committed effect below is the REPLAY.
         first = _read("file:///reports/x", "a-rep")
         broker.commit(Commit(first, task))
         return _read("file:///reports/x", "a-rep")  # Fresh (replay)
 
-    def a_session_taint(broker, task):
+    def a_session_taint(broker: EffectBroker, task: Task) -> Effect:
         broker.capabilities["a-tread"] = _cap("User", "*", "*", frozenset({"*"}), "a-tread")
         broker.capabilities["a-tsend"] = _cap("User", "send", "*", frozenset({"*"}), "a-tsend")
         broker.commit(Commit(_read("file:///secrets", "a-tread"), task))  # taints session
         return _send("internal@corp.com", "a-tsend")  # FlowOK (session-taint)
 
     # --- Legitimate (should be ALLOWED) ---
-    def l_in_scope(broker, task):
+    def l_in_scope(broker: EffectBroker, task: Task) -> Effect:
         broker.capabilities["l-ok"] = _cap(
             "User", "read", "file:///reports/x", frozenset({"file:///reports"}), "l-ok"
         )
         return _read("file:///reports/x", "l-ok")  # in scope -> allow
 
-    def l_internal_send(broker, task):
+    def l_internal_send(broker: EffectBroker, task: Task) -> Effect:
         broker.capabilities["l-send"] = _cap(
             "User", "send", "internal@corp.com", frozenset({"internal"}), "l-send"
         )
@@ -214,15 +245,20 @@ def _build_scenarios() -> list[_Scenario]:
 
     # (builder, is_attack)
     scenarios.append(
-        _Scenario("attack:out-of-ceiling-read", True, a_out_of_ceiling,
-                 ceiling_scope=frozenset({"file:///reports"}))
+        _Scenario(
+            "attack:out-of-ceiling-read",
+            True,
+            a_out_of_ceiling,
+            ceiling_scope=frozenset({"file:///reports"}),
+        )
     )
     scenarios.append(_Scenario("attack:external-bcc", True, a_bcc_outside_scope))
     scenarios.append(_Scenario("attack:nonce-replay", True, a_replay))
     scenarios.append(_Scenario("attack:session-taint-exfil", True, a_session_taint))
     scenarios.append(
-        _Scenario("legit:in-scope-read", False, l_in_scope,
-                 ceiling_scope=frozenset({"file:///reports"}))
+        _Scenario(
+            "legit:in-scope-read", False, l_in_scope, ceiling_scope=frozenset({"file:///reports"})
+        )
     )
     scenarios.append(_Scenario("legit:internal-send", False, l_internal_send))
     return scenarios
@@ -294,7 +330,6 @@ def session_taint_metrics() -> dict[str, object]:
     conservative session taint; false_denial_proxy is an ANNOTATION-FREE
     PROXY for over-blocking (a block the user later lifted), NOT ground truth.
     """
-    from effect_broker.broker import EffectBroker
     from effect_broker.model import (
         APPROVER,
         BROKER,
@@ -313,8 +348,13 @@ def session_taint_metrics() -> dict[str, object]:
         task_id="taint-metrics",
         owner=USER,
         ceiling=Capability(
-            owner=USER, holder=BROKER, right="*", target="*",
-            scope=frozenset({"*"}), expiry=float("inf"), nonce="ceil-taint-metrics",
+            owner=USER,
+            holder=BROKER,
+            right="*",
+            target="*",
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce="ceil-taint-metrics",
         ),
     )
     broker.register_task(task)
@@ -323,45 +363,76 @@ def session_taint_metrics() -> dict[str, object]:
         ("send-cap-taint", "send", "internal@corp.com"),
     ):
         broker.capabilities[nonce] = Capability(
-            owner=USER, holder=BROKER, right=etype, target=target,
-            scope=frozenset({"*"}), expiry=float("inf"), nonce=nonce,
+            owner=USER,
+            holder=BROKER,
+            right=etype,
+            target=target,
+            scope=frozenset({"*"}),
+            expiry=float("inf"),
+            nonce=nonce,
         )
     broker.store._unsafe_bootstrap_file("file:///secrets", Confidentiality.CONFIDENTIAL)
-    broker.store._unsafe_bootstrap_email("internal@corp.com", None)
+    broker.store._unsafe_bootstrap_email("internal@corp.com", Domain.INTERNAL)
 
     # 1) confidential read -> taints the session (taint-rate: reads_that_tainted += 1)
-    broker.commit(Commit(
-        Effect("read", "file:///secrets", {}, (),
-               "read-cap-taint", (BROKER,), task_id="taint-metrics"), task
-    ))
+    broker.commit(
+        Commit(
+            Effect(
+                "read",
+                "file:///secrets",
+                {},
+                (),
+                "read-cap-taint",
+                (BROKER,),
+                task_id="taint-metrics",
+            ),
+            task,
+        )
+    )
     # 2) send while tainted -> BLOCKED (sends_blocked_by_taint += 1)
-    blocked, ev = broker.commit(Commit(
-        Effect("send", "internal@corp.com", {},
-               (Data("body", Confidentiality.INTERNAL, Integrity.USER),),
-               "send-cap-taint", (BROKER,), task_id="taint-metrics"), task
-    ))
+    blocked, ev = broker.commit(
+        Commit(
+            Effect(
+                "send",
+                "internal@corp.com",
+                {},
+                (Data("body", Confidentiality.INTERNAL, Integrity.USER),),
+                "send-cap-taint",
+                (BROKER,),
+                task_id="taint-metrics",
+            ),
+            task,
+        )
+    )
     assert not blocked, f"send while tainted must block: {ev}"
     # 3) explicit declass on the same task -> proxy += 1
-    broker.grant_label_exception(LabelException(
-        kind="declass", match_target="*", from_label="CONFIDENTIAL",
-        to_label="INTERNAL", granted_by=APPROVER, nonce="declass-taint-metrics",
-        data_resources=frozenset({"*"}), task_id="taint-metrics",
-    ), task_id="taint-metrics")
+    broker.grant_label_exception(
+        LabelException(
+            kind="declass",
+            match_target="*",
+            from_label="CONFIDENTIAL",
+            to_label="INTERNAL",
+            granted_by=APPROVER,
+            nonce="declass-taint-metrics",
+            data_resources=frozenset({"*"}),
+            task_id="taint-metrics",
+        ),
+        task_id="taint-metrics",
+    )
 
     metrics = broker.get_taint_metrics()
     assert metrics is not None, "broker must expose taint metrics"
     return metrics
 
 
-def build_report() -> dict:
+def build_report() -> EvaluationReport:
     """A single dict containing all §6 metrics (pass/fail + the additions)."""
     m = compute_metrics()
-    return {
-        **m.as_dict(),
-        "tcb_lines": tcb_size(),
-        # honest taint accounting (taint rate + false-denial proxy).
-        "session_taint": session_taint_metrics(),
-    }
+    report = m.as_dict()
+    report["tcb_lines"] = tcb_size()
+    # honest taint accounting (taint rate + false-denial proxy).
+    report["session_taint"] = session_taint_metrics()
+    return report
 
 
 def print_report() -> None:
@@ -369,12 +440,11 @@ def print_report() -> None:
     print("=" * 64)
     print("ECAC EVALUATION METRICS (regression scenarios)")
     print("=" * 64)
+    print(f"Scenarios:            {r['total']} (attacks={r['attacks']}, legit={r['legitimate']})")
     print(
-        f"Scenarios:            {r['total']} "
-        f"(attacks={r['attacks']}, legit={r['legitimate']})"
+        f"Defense rate:         {r['defense_rate'] * 100:.1f}% "
+        f"({r['attacks_blocked']}/{r['attacks']} attacks blocked)"
     )
-    print(f"Defense rate:         {r['defense_rate'] * 100:.1f}% "
-          f"({r['attacks_blocked']}/{r['attacks']} attacks blocked)")
     print(f"False negatives:      {r['false_negatives']} (attacks allowed)")
     print(f"False positives:      {r['false_positives']} (legit blocked)")
     print("Per-mechanism contribution (attacks blocked by predicate):")
@@ -389,11 +459,15 @@ def print_report() -> None:
     st = r.get("session_taint", {})
     if st:
         print("Session-taint (honest:")
-        print(f"  taint_rate          {st.get('taint_rate', 0.0):.1%} "
-              f"({st.get('reads_that_tainted', 0)}/{st.get('total_reads', 0)} reads tainted)")
-        print(f"  false_denial_proxy  {st.get('false_denial_proxy', 0.0):.1%} "
-              f"({st.get('blocked_sends_later_declassed', 0)}/"
-              f"{st.get('sends_blocked_by_taint', 0)} blocks later lifted)")
+        print(
+            f"  taint_rate          {st.get('taint_rate', 0.0):.1%} "
+            f"({st.get('reads_that_tainted', 0)}/{st.get('total_reads', 0)} reads tainted)"
+        )
+        print(
+            f"  false_denial_proxy  {st.get('false_denial_proxy', 0.0):.1%} "
+            f"({st.get('blocked_sends_later_declassed', 0)}/"
+            f"{st.get('sends_blocked_by_taint', 0)} blocks later lifted)"
+        )
         print("  (proxy, not ground truth: annotation-free signal of over-blocking)")
     print("=" * 64)
     print("NOTE: regression metrics on supplied scenarios; not a causal")
@@ -402,5 +476,3 @@ def print_report() -> None:
 
 if __name__ == "__main__":
     print_report()
-
-
