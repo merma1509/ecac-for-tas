@@ -237,7 +237,9 @@ class IsolatedExecutor:
                     )
                 # Don't increment send_count on failure (budget preserved)
                 if gate_result.effect.etype == "send":
-                    gate_result.task.session.increment_send_count()  # Only on success
+                    session = gate_result.task.session
+                    assert session is not None  # Task.__post_init__ always creates one
+                    session.increment_send_count()  # Only on success
             else:
                 # Effect could NOT be applied ( resource not found).
                 # Record explicit FAILED observation — NOT a block, but a failure.
