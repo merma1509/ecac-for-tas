@@ -238,12 +238,12 @@ class TestRestrictedOpenEnforcer:
     def test_enforcer_module_exists_and_exports(self):
         """Verify enforcer.py has the required exports."""
         from effect_broker.enforcer import (
-            _restricted_open,
             _real_os_open,
-            set_allowed_paths,
+            _restricted_open,
             get_allowed_paths,
             get_blocked_paths,
             is_restricted_open_active,
+            set_allowed_paths,
         )
 
         # Verify functions exist and have correct signatures
@@ -375,9 +375,9 @@ class TestImportBlocking:
     def test_dangerous_modules_are_blocked_in_executor_subprocess(self):
         """Verify dangerous modules are in the blocklist."""
         from effect_broker.executor_subprocess import (
-            _DANGEROUS_MODULES,
             _BLOCKED_NETWORK_PACKAGES,
             _BLOCKED_STDLIB,
+            _DANGEROUS_MODULES,
         )
 
         # Code execution
@@ -404,9 +404,9 @@ class TestImportBlocking:
     def test_allowed_modules_not_blocked(self):
         """Verify needed modules are NOT in blocklists."""
         from effect_broker.executor_subprocess import (
-            _DANGEROUS_MODULES,
             _BLOCKED_NETWORK_PACKAGES,
             _BLOCKED_STDLIB,
+            _DANGEROUS_MODULES,
         )
 
         # File I/O
@@ -434,17 +434,17 @@ class TestImportBlocking:
 
     def test_secure_import_hook_is_installed_in_subprocess(self):
         """Verify _secure_import hook is set up in executor_subprocess."""
-        from effect_broker.executor_subprocess import _secure_import, _original_import
-
         # Hook should be installed (different from built-in)
         import builtins
+
+        from effect_broker.executor_subprocess import _original_import, _secure_import
 
         assert builtins.__import__ is _secure_import
         assert _secure_import is not _original_import
 
     def test_blocked_import_raises_import_error(self):
         """Verify blocked modules raise ImportError when attempted."""
-        from effect_broker.executor_subprocess import _secure_import, _blocked_imports_log
+        from effect_broker.executor_subprocess import _blocked_imports_log, _secure_import
 
         initial_count = len(_blocked_imports_log)
 
@@ -458,7 +458,7 @@ class TestImportBlocking:
 
     def test_blocked_network_package_raises_import_error(self):
         """Verify network packages like requests are blocked."""
-        from effect_broker.executor_subprocess import _secure_import, _BLOCKED_NETWORK_PACKAGES
+        from effect_broker.executor_subprocess import _BLOCKED_NETWORK_PACKAGES, _secure_import
 
         assert "requests" in _BLOCKED_NETWORK_PACKAGES
 
