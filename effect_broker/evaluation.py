@@ -56,6 +56,7 @@ class SealedTrace:
     expected_blocker: str | None  # which predicate or mechanism should block
     kill_criterion_category: str  # which kill criterion this traces
 
+
 SEALED_TRACES: list[SealedTrace] = [
     # Sophisticated: knows about capability systems
     SealedTrace(
@@ -616,7 +617,9 @@ class HeldOutEvaluation:
                 delegation_chain=(),
             )
             approval_nonce = broker.grant_approval(
-                approved_effect, expiry=1000.0, task_id="sealed-task"  # Task A
+                approved_effect,
+                expiry=1000.0,
+                task_id="sealed-task",  # Task A
             )
 
             # Try to use the approval in task B - should fail (cross-task)
