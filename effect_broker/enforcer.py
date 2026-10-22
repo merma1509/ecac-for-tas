@@ -34,50 +34,56 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import PurePosixPath
+from collections.abc import Callable
 from typing import Any
 
 # Filesystem Confinement (restricted open)
 # Save REAL os.open BEFORE any patching.
 # This is used by _restricted_open() to perform the actual I/O,
 # and by the broker process (which doesn't patch os.open).
-_real_os_open: Any = os.open
+_real_os_open: Callable[..., int] = os.open
 
 # Paths that are ALLOWED for file operations (sandboxed directories).
 # Set by broker via set_allowed_paths() during subprocess bootstrap.
 _ALLOWED_PATHS: frozenset[str] = frozenset()
 
 # Paths that are BLOCKED regardless of any other permission.
-_BLOCKED_PATHS: frozenset[str] = frozenset({
-    "/etc",
-    "/bin",
-    "/usr",
-    "/lib",
-    "/lib64",
-    "/sbin",
-    "/usr/sbin",
-    "/var",
-    "/root",
-    "/.ssh",
-    "/.config",
-})
+_BLOCKED_PATHS: frozenset[str] = frozenset(
+    {
+        "/etc",
+        "/bin",
+        "/usr",
+        "/lib",
+        "/lib64",
+        "/sbin",
+        "/usr/sbin",
+        "/var",
+        "/root",
+        "/.ssh",
+        "/.config",
+    }
+)
 
 # Write intent: flags that indicate a write operation
-_WRITE_MODE_FLAGS = frozenset({
-    os.O_WRONLY,
-    os.O_RDWR,
-    os.O_CREAT,
-    os.O_TRUNC,
-    os.O_EXCL,
-})
+_WRITE_MODE_FLAGS = frozenset(
+    {
+        os.O_WRONLY,
+        os.O_RDWR,
+        os.O_CREAT,
+        os.O_TRUNC,
+        os.O_EXCL,
+    }
+)
 
 # Special device files needed for subprocess.Popen (stdin/stdout/stderr redirection)
-_ALLOWED_DEVICES = frozenset({
-    "/dev/null",
-    "/dev/zero",
-    "/dev/random",
-    "/dev/urandom",
-})
+_ALLOWED_DEVICES = frozenset(
+    {
+        "/dev/null",
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+    }
+)
 
 
 def set_allowed_paths(paths: frozenset[str]) -> None:
@@ -200,8 +206,7 @@ def _restricted_open(path: str, *args: Any, **kwargs: Any) -> int:
 # indicate subprocess mode.
 
 _EXECUTOR_MAIN = (
-    len(sys.argv) > 0
-    and "executor_subprocess" in str(sys.argv[0])
+    len(sys.argv) > 0 and "executor_subprocess" in str(sys.argv[0])
 ) or os.environ.get("ECAC_SUBPROCESS") == "1"
 
 if _EXECUTOR_MAIN:

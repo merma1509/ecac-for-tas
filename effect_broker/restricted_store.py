@@ -468,6 +468,4 @@ class RestrictedResourceStore:
 
         # If we reach here, the effect type doesn't match any known resource type
         # This is an error condition, not a "couldn't apply" condition
-        raise ValueError(
-            f"effect type {effect.etype} not applicable to {type(resource).__name__}"
-        )
+        raise ValueError(f"effect type {effect.etype} not applicable to {type(resource).__name__}")

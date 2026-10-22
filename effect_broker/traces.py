@@ -79,13 +79,15 @@ def build() -> EffectBroker:
     # task=None. Its ceiling scope is the UNION of all bootstrapped resources,
     # NOT a wildcard. This means any effect targeting a resource NOT in the
     # bootstrap list is BLOCKed by Auth (target not in ceiling scope).
-    _all_resource_scopes: frozenset[str] = frozenset({
-        "internal",           # email domain: internal@corp.com
-        "external",           # email domain: external@elsewhere.com
-        "file:///reports",    # file: file:///reports
-        "file:///secrets",    # file: file:///secrets
-        "file:///trusted",    # file: file:///trusted
-    })
+    _all_resource_scopes: frozenset[str] = frozenset(
+        {
+            "internal",  # email domain: internal@corp.com
+            "external",  # email domain: external@elsewhere.com
+            "file:///reports",  # file: file:///reports
+            "file:///secrets",  # file: file:///secrets
+            "file:///trusted",  # file: file:///trusted
+        }
+    )
     default_task = Task(
         task_id="default",
         owner=USER,

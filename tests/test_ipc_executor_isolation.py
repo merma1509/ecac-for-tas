@@ -235,6 +235,74 @@ class TestExecutorSubprocessIPC:
             f"Executor should allow with correct hash: {correct_result}"
         )
 
+    def test_send_content_hash_binding(self, tmp_path: Path) -> None:
+        """REGRESSION (multi-process send content binding, all etypes).
+
+        SubprocessExecutor.execute() computed approved_content_hash
+        with a fallback that only handled WRITE (metadata["content"]). For a
+        SEND effect the fallback produced None, so the subprocess SKIPPED
+        content verification — a gate-authorized email body could be swapped
+        in transit (or by a compromised subprocess) and still apply.
+
+        The fix makes the fallback use effect.compute_content_hash(), which
+        covers BOTH write (content/content_b64) and send (subject|body) and
+        produces the IDENTICAL hash the subprocess recomputes in
+        _compute_effect_content_hash(). This test pins that behavior at the
+        apply_commit protocol level (the same call SubprocessExecutor makes):
+
+          - send + CORRECT body hash  -> status "ok"     (legitimate send)
+          - send + WRONG body hash    -> status "blocked" (tampered body)
+        """
+        from effect_broker.executor_ipc import ProcessExecutorClient, effect_to_dict
+        from effect_broker.model import Effect
+
+        client = ProcessExecutorClient(self._sock)
+
+        # A send effect with a real subject + body (the authorized content).
+        authorized = Effect(
+            etype="send",
+            target="user@internal.corp.com",
+            metadata={"subject": "Hi", "body": "legitimate body"},
+            provenance=(),
+            capability_nonce="send-bind-cap",
+            delegation_chain=(),
+        )
+        effect_dict = effect_to_dict(authorized)
+
+        # (1) Correct hash of the authorized body -> send is allowed.
+        correct_hash = authorized.compute_content_hash()
+        assert correct_hash is not None, "send with subject|body must be hashable"
+        ok_result = client.apply_commit(
+            effect_dict=effect_dict,
+            task_id="send-bind-task",
+            session_snapshot={},
+            reserve_nonce=False,  # isolate content-binding (skip Fresh)
+            approved_content_hash=correct_hash,
+        )
+        assert ok_result.get("status") == "ok", (
+            f"Send with correct body hash should be allowed: {ok_result}"
+        )
+
+        # (2) An attacker swaps the body in transit. The broker sent the hash
+        #     of the AUTHORIZED body; the subprocess recomputes the hash of the
+        #     SWAPPED body. Mismatch -> BLOCKED (this is the fixed behavior).
+        swapped = dict(effect_dict)
+        swapped["metadata"] = {"subject": "Hi", "body": "EXFIL: secrets"}
+        block_result = client.apply_commit(
+            effect_dict=swapped,
+            task_id="send-bind-task",
+            session_snapshot={},
+            reserve_nonce=False,  # isolate content-binding (skip Fresh)
+            approved_content_hash=correct_hash,  # hash of the ORIGINAL body
+        )
+        assert block_result.get("status") == "blocked", (
+            f"Send with tampered body should be BLOCKED: {block_result}"
+        )
+        assert "content" in block_result.get("blocker", "").lower(), (
+            f"Block must be a content-hash mismatch: {block_result}"
+        )
+
+
 class TestLedgerReadsExecutorStore:
     """The ledger reads actual executor state for independent verification.
 
@@ -386,6 +454,3 @@ class TestLedgerReadsExecutorStore:
 
         verdict = ledger_client.verify("default", "send-bob-cap")
         assert verdict == LedgerVerdict.CONFIRMED_COMMITTED
-
-
-

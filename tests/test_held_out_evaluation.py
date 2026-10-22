@@ -35,7 +35,8 @@ class TestHoldOutEvaluation:
             experiment_content = f.read()
 
         leaked = [
-            tid for tid in ho_ids
+            tid
+            for tid in ho_ids
             if f'"{tid}"' in experiment_content or f"'{tid}'" in experiment_content
         ]
         assert len(leaked) == 0, (
@@ -62,8 +63,7 @@ class TestHoldOutEvaluation:
                 with open(full_path) as f:
                     content = f.read()
                 ho_mentions = [
-                    tid for tid in self.HO_IDS
-                    if f'"{tid}"' in content or f"'{tid}'" in content
+                    tid for tid in self.HO_IDS if f'"{tid}"' in content or f"'{tid}'" in content
                 ]
                 assert len(ho_mentions) == 0, (
                     f"Hold-out trace ID {ho_mentions} found in {path} — "
@@ -75,14 +75,17 @@ class TestHoldOutEvaluation:
         from effect_broker.held_out_evaluation import HOLD_OUT_TRACES
 
         required = {
-            "id", "name", "attack_class", "severity",
-            "effect", "expected_blocker", "description",
+            "id",
+            "name",
+            "attack_class",
+            "severity",
+            "effect",
+            "expected_blocker",
+            "description",
         }
         for trace in HOLD_OUT_TRACES:
             missing = required - set(trace.keys())
-            assert len(missing) == 0, (
-                f"Trace {trace.get('id', '?')} missing fields: {missing}"
-            )
+            assert len(missing) == 0, f"Trace {trace.get('id', '?')} missing fields: {missing}"
             # Verify effect is an Effect
             from effect_broker.model import Effect
 
@@ -172,4 +175,3 @@ class TestHoldOutEvaluation:
         broker = build()
         report = evaluate_all_hold_out(broker)
         print_evaluation_report(report)  # Should not raise
-

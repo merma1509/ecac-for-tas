@@ -1,6 +1,12 @@
-"""Tests for the mandatory boundary experiment (M1–M5 + H1–H3 + T9–T20)
+"""REGRESSION tests for the adversarial boundary workload (M1–M5 + H1–H3 + T9–T20)
 
-These tests implement the real adversarial tool workload and hold-out variants.
+These tests are REGRESSIONS, not experiments: they verify that the broker's
+gate logic still blocks each named adversarial trace and still allows the
+paired legitimate case. They demonstrate that the mechanisms EXIST and behave
+on supplied traces — they do NOT demonstrate mechanism effectiveness against
+adaptive or live attackers (see docs/PLAN_3_evaluation_repair.md).
+
+The tests implement the adversarial tool workload and hold-out variants.
 
   M1-M5: 5 mandatory adversarial scenarios
   H1-H3: 3 held-out variants (train/test split)
@@ -316,9 +322,9 @@ class TestH3ForgedCapability:
         )
 
 
-# Integration: run_all_experiments
-class TestRunAllExperiments:
-    """Full experiment suite: all M1-M5 + H1-H3 + T9-T20 scenarios."""
+# Integration: run_all_scenarios
+class TestRunAllScenarios:
+    """Full regression suite: all M1-M5 + H1-H3 + T9-T20 scenarios."""
 
     def test_all_scenarios_complete_mediation(self) -> None:
         """Every scenario with complete mediation should have 0 failures."""
@@ -373,8 +379,7 @@ class TestRunAllExperiments:
             r = results.get(key)
             assert r is not None, f"Scenario {key} not found"
             assert r.actual_allow is False, (
-                f"{key} should be BLOCKed (got ALLOW). "
-                f"expected_blocker={r.expected_blocker}"
+                f"{key} should be BLOCKed (got ALLOW). expected_blocker={r.expected_blocker}"
             )
 
     def test_eighteen_total_scenarios(self) -> None:

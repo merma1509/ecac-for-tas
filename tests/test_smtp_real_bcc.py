@@ -1140,7 +1140,8 @@ class TestBCCIntegration:
             # Ledger: broker-level block recorded as CONFIRMED_BLOCKED
             ledger = broker.ledger
             blocked_keys = [
-                k for k in ledger._observations.keys()
+                k
+                for k in ledger._observations.keys()
                 if any("blocked" in entry.source.lower() for entry in ledger._observations[k])
             ]
             assert len(blocked_keys) >= 1, (
@@ -1188,9 +1189,7 @@ class TestBCCMaliciousMTA:
                 self.data_log: list[tuple[bytes, tuple[str, ...]]] = []
                 self._lock = threading.Lock()
 
-            async def handle_RCPT(
-                self, session: Any, envelope: Any, *args: Any
-            ) -> str:
+            async def handle_RCPT(self, session: Any, envelope: Any, *args: Any) -> str:
                 with self._lock:
                     if len(args) >= 2:
                         address = args[1]
@@ -1199,9 +1198,7 @@ class TestBCCMaliciousMTA:
                             session.envelope.rcpt_tos.append(address)
                 return "250 OK"
 
-            async def handle_DATA(
-                self, session: Any, envelope: Any, *args: Any
-            ) -> str:
+            async def handle_DATA(self, session: Any, envelope: Any, *args: Any) -> str:
                 with self._lock:
                     actual_rcpts = (
                         list(getattr(envelope, "rcpt_tos", []))
@@ -1209,16 +1206,12 @@ class TestBCCMaliciousMTA:
                         else []
                     )
                     content = (
-                        getattr(envelope, "content", b"")
-                        if hasattr(envelope, "content")
-                        else b""
+                        getattr(envelope, "content", b"") if hasattr(envelope, "content") else b""
                     )
                     self.data_log.append((content, tuple(actual_rcpts)))
                 return "250 OK"
 
-            async def handle_RSET(
-                self, session: Any, envelope: Any, *args: Any
-            ) -> str:
+            async def handle_RSET(self, session: Any, envelope: Any, *args: Any) -> str:
                 with self._lock:
                     self.rcpt_log.clear()
                 return "250 OK"
@@ -1270,9 +1263,7 @@ class TestBCCMaliciousMTA:
             handler.rcpt_log.clear()
 
             broker = EffectBroker(mode="same-process")
-            broker.store._unsafe_bootstrap_email(
-                "mailto:internal@corp.com", Domain.INTERNAL
-            )
+            broker.store._unsafe_bootstrap_email("mailto:internal@corp.com", Domain.INTERNAL)
 
             # Restrictive capability: only internal domain scope
             broker.tasks["default"] = Task(

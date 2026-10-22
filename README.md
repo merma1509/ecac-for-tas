@@ -76,9 +76,17 @@ Or via `dev.sh`:
 - **ToolRegistry structural enforcement.** Undeclared tool operations raise `SecurityError`
   before reaching the broker gate — closes T14 (hidden write) that the four-predicate gate
   alone cannot catch
-- **Held-out evaluation:** 8/8 traces blocked, 6/6 high-severity defended (SHA-256 `e0239fbfa49c1cbe`)
-- **Baseline comparison:** ECAC 20/20 vs next baseline 9/20 (+11 advantage, ≥4 kill criterion passes)
-- **Experiment traces:** 17/18 blocked; M4 benign correctly allowed
+- **Held-out evaluation:** 8/8 supplied held-out traces blocked by the gate regression (SHA-256 `e0239fbfa49c1cbe`)
+- **Baseline regression:** ECAC's gate blocks all 20 supplied adversarial traces; each named baseline (CaMeL/PACT/ChainCaps/Cordon/FORGE) misses at least one. This is regression coverage of gate logic on supplied traces — NOT a causal evaluation of mechanism effectiveness (see "Honest limitations")
+- **Adversarial workload regressions:** 17/18 supplied traces blocked; M4 benign correctly allowed
+- **Independent oracle (out-of-band).** `effect_broker/oracle.py` re-derives 'did this effect
+  occur?' from the real filesystem / real SMTP MTA log, never the broker store — it can refute
+  a ledger that claims success the effect did not actually produce.
+- **Conventional sandbox baseline.** `baselines/mode_conventional_sandbox.py` adds a
+  seccomp/landlock-style OS path+syscall confinement baseline so the comparison includes a
+  genuine conventional broker+sandbox, not only named IFC/capability mechanisms.
+- **Mechanism-level attack regressions.** Each named predicate (Auth/FlowOK/NoAmp/Fresh) is
+  exercised by an attack pair (legitimate allowed + attack blocked by that predicate).
 
 ## Honest limitations
 
@@ -88,5 +96,8 @@ Or via `dev.sh`:
   the trust placed in the tool schema
 - **Cross-task data composition not enforced.** Requires language-level taint tracking (deferred)
 - **TCB expansion unquantified.** Formal TCB size argument deferred
-- **No performance or approval-burden metrics.**
+- **Evaluation metrics (regression scope).** `effect_broker/metrics.py` reports defense
+  rate, false positives/negatives, per-predicate contribution, latency percentiles,
+  annotation burden, and TCB line count on a fixed labeled scenario set — regression
+  metrics on supplied scenarios, not a causal estimate vs adaptive/live attackers.
 - **Formal specification** implementation verified in `tests/test_formal_invariants.py`

@@ -84,7 +84,7 @@ class Mediator:
         test author. They demonstrate the *logic* of declared-vs-actual checking
         but do NOT prove malicious tool computation is bounded — a real tool
         can simply not report its actual targets. The mandatory boundary
-        experiment (M1-M5 in tests/test_experiment.py) demonstrates this using a
+        regression suite (M1-M5 in tests/test_regressions.py) demonstrates this using a
         real untrusted tool that is ACTUALLY prevented from reaching external
         state, with complete mediation verified by an independent observer
     """
@@ -118,7 +118,7 @@ class Mediator:
             This uses tool-provided metadata (ToolSpec.declared_targets,
             ToolSpec.actual_targets) set by the test author. A real adversarial
             tool can lie about its actual targets here. The mandatory boundary
-            experiment (test_experiment.py, M1-M5) uses a REAL untrusted tool
+            regression suite (test_regressions.py, M1-M5) uses a REAL untrusted tool
             — not metadata — to demonstrate that computation is bounded.
         """
         if tool_name is None:

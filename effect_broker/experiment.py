@@ -528,9 +528,7 @@ class EndorsementAbuseTool:
             etype="send",
             target="internal@corp.com",
             metadata={},
-            provenance=(
-                Data("web_content", Confidentiality.INTERNAL, Integrity.USER),
-            ),
+            provenance=(Data("web_content", Confidentiality.INTERNAL, Integrity.USER),),
             capability_nonce="no-cap-send",
             delegation_chain=("t15-tool",),
         )
@@ -694,9 +692,7 @@ class DeepDelegationTool:
         allow, evidence = self.broker.commit(commit)
         self.last_evidence = cast(dict[str, Any], evidence)
         if allow:
-            raise AssertionError(
-                "T19: deep delegation chain with no real root should BLOCK Auth"
-            )
+            raise AssertionError("T19: deep delegation chain with no real root should BLOCK Auth")
 
 
 # ---- T18: Send rate limit amplification ----
@@ -715,8 +711,7 @@ class SendRateLimitTool:
         self.send_count = 0
 
     def run(self) -> None:
-        from .lattice import Confidentiality, Integrity
-        from .model import Data, Effect, Capability
+        from .model import Capability, Effect
 
         # Set max sends to 3
         task = self.broker.tasks.get(self.task_id)
@@ -763,7 +758,7 @@ class SendRateLimitTool:
             effect = Effect(
                 etype="send",
                 target="internal@corp.com",
-                metadata={"body": f"chunk {i}: exfil data {i * 100}-{(i+1)*100}"},
+                metadata={"body": f"chunk {i}: exfil data {i * 100}-{(i + 1) * 100}"},
                 provenance=(),
                 # Each send uses its own capability chain (unique nonce per send)
                 capability_nonce=f"r-send-t18-{i}:Agent:EffectBroker",
@@ -775,15 +770,13 @@ class SendRateLimitTool:
                 self.last_evidence = cast(dict[str, Any], evidence)
                 if allow:
                     raise AssertionError(
-                        f"T18: send #{i+1} should BLOCK (rate limit exceeded), "
+                        f"T18: send #{i + 1} should BLOCK (rate limit exceeded), "
                         f"but ALLOWed. evidence={evidence}"
                     )
 
         self.send_count = task.session.send_count
         if self.send_count != 3:
-            raise AssertionError(
-                f"T18: expected 3 sends, got {self.send_count}"
-            )
+            raise AssertionError(f"T18: expected 3 sends, got {self.send_count}")
 
 
 # ---- T20: TOCTOU between gate and apply ----
@@ -1095,8 +1088,7 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         t9_error = str(e)
     actual_allow_t9 = len(broker_t9.store.effects_log) > 1  # 1 = read, 2 = network
     t9_blocker = (
-        tool_t9.last_evidence.get("primary_blocker", "unknown")
-        if not actual_allow_t9 else "ALLOW"
+        tool_t9.last_evidence.get("primary_blocker", "unknown") if not actual_allow_t9 else "ALLOW"
     )
     t9_predicates = tool_t9.last_evidence.get("predicates", {}) if not actual_allow_t9 else {}
     results["T9-hidden-network-side-effect"] = ExperimentResult(
@@ -1126,7 +1118,8 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     actual_allow_t10 = len(broker_t10.store.effects_log) > 0
     t10_blocker = (
         tool_t10.last_evidence.get("primary_blocker", "unknown")
-        if not actual_allow_t10 else "ALLOW"
+        if not actual_allow_t10
+        else "ALLOW"
     )
     t10_predicates = tool_t10.last_evidence.get("predicates", {}) if not actual_allow_t10 else {}
     results["T10-direct-bypass"] = ExperimentResult(
@@ -1156,7 +1149,8 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     actual_allow_t11 = len(broker_t11.store.effects_log) > 0
     t11_blocker = (
         tool_t11.last_evidence.get("primary_blocker", "unknown")
-        if not actual_allow_t11 else "ALLOW"
+        if not actual_allow_t11
+        else "ALLOW"
     )
     t11_predicates = tool_t11.last_evidence.get("predicates", {}) if not actual_allow_t11 else {}
     results["T11-ssrf-url-manipulation"] = ExperimentResult(
@@ -1186,7 +1180,8 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     actual_allow_t12 = len(broker_t12.store.effects_log) > 0
     t12_blocker = (
         tool_t12.last_evidence.get("primary_blocker", "unknown")
-        if not actual_allow_t12 else "ALLOW"
+        if not actual_allow_t12
+        else "ALLOW"
     )
     t12_predicates = tool_t12.last_evidence.get("predicates", {}) if not actual_allow_t12 else {}
     results["T12-capability-widening"] = ExperimentResult(
@@ -1216,7 +1211,8 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     actual_allow_t15 = len(broker_t15.store.effects_log) > 0
     t15_blocker = (
         tool_t15.last_evidence.get("primary_blocker", "unknown")
-        if not actual_allow_t15 else "ALLOW"
+        if not actual_allow_t15
+        else "ALLOW"
     )
     t15_predicates = tool_t15.last_evidence.get("predicates", {}) if not actual_allow_t15 else {}
     results["T15-endorsement-abuse"] = ExperimentResult(
@@ -1246,7 +1242,8 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     actual_allow_t16 = len(broker_t16.store.effects_log) > 0
     t16_blocker = (
         tool_t16.last_evidence.get("primary_blocker", "unknown")
-        if not actual_allow_t16 else "ALLOW"
+        if not actual_allow_t16
+        else "ALLOW"
     )
     t16_predicates = tool_t16.last_evidence.get("predicates", {}) if not actual_allow_t16 else {}
     results["T16-parameter-smuggling"] = ExperimentResult(
@@ -1276,7 +1273,8 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     actual_allow_t17 = len(broker_t17.store.effects_log) > 0
     t17_blocker = (
         tool_t17.last_evidence.get("primary_blocker", "unknown")
-        if not actual_allow_t17 else "ALLOW"
+        if not actual_allow_t17
+        else "ALLOW"
     )
     t17_predicates = tool_t17.last_evidence.get("predicates", {}) if not actual_allow_t17 else {}
     results["T17-cross-task-data-flow"] = ExperimentResult(
@@ -1306,7 +1304,8 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     actual_allow_t19 = len(broker_t19.store.effects_log) > 0
     t19_blocker = (
         tool_t19.last_evidence.get("primary_blocker", "unknown")
-        if not actual_allow_t19 else "ALLOW"
+        if not actual_allow_t19
+        else "ALLOW"
     )
     t19_predicates = tool_t19.last_evidence.get("predicates", {}) if not actual_allow_t19 else {}
     results["T19-deep-delegation-attack"] = ExperimentResult(
@@ -1336,7 +1335,8 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     actual_allow_t20 = len(broker_t20.store.effects_log) > 0
     t20_blocker = (
         tool_t20.last_evidence.get("primary_blocker", "unknown")
-        if not actual_allow_t20 else "ALLOW"
+        if not actual_allow_t20
+        else "ALLOW"
     )
     t20_predicates = tool_t20.last_evidence.get("predicates", {}) if not actual_allow_t20 else {}
     results["T20-toctou-race"] = ExperimentResult(

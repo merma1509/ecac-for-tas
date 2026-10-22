@@ -29,11 +29,24 @@ FOUR-PREDICATE GATE (Auth ∧ FlowOK ∧ NoAmp ∧ Fresh):
 
   Auth    : static authorization — root-anchored + monotonic + bottom-scoped
             + task-bounded + exact (right, target, holder) match
-  FlowOK  : IFC — provenance labels must not exceed task's flow_boundary
+  FlowOK  : IFC — provenance labels must not exceed task's flow_boundary.
+            CLAIM-CLEANUP (PLAN_3 S7): FlowOK is a STATIC label-flow
+            approximation, NOT causal dataflow analysis. It checks that the
+            labels carried into an effect do not exceed the task boundary; it
+            does not track per-byte dataflow through arbitrary program
+            execution. Cross-task data COMPOSITION (e.g. combining two
+            individually-labeled reads into a new high-label datum) is not
+            enforced and requires language-level taint tracking (deferred).
   NoAmp   : composition safety — effect authority within task ceiling scope,
             plus extra-target scope check for BCC/CC recipients
   Fresh   : dynamic authorization — unexpired, unrevoked, not replayed
             (task-scoped logical clock; per-task used-nonce set)
+
+CLAIM-CLEANUP (PLAN_3 S7): The four-predicate gate provides REGRESSION
+evidence, NOT a proof of confinement. Each predicate is a machine-checkable
+check on a fixed model; the invariant holds over the supplied/regression
+traces, but this is not a proof that no bypass exists in a live, adaptive
+deployment. "Complete mediation" is best-effort (see observer.py).
 
 SAME-PROCESS LIMITATION: The broker, executor, store, and ledger all share
 a Python process. Direct store mutation (broker.store._files._data[...] = X)
@@ -67,6 +80,7 @@ from .model import (
     EffectTarget,
     Evidence,
     LabelException,
+    SessionTaintMetrics,
     Task,
     TaskId,
 )
@@ -179,21 +193,25 @@ def derive_file_provenance(target: str) -> tuple[Confidentiality, Integrity]:
     # DO NOT strip leading slash - absolute paths like /etc/passwd must remain /etc/passwd
     # file:///etc/passwd -> /etc/passwd (correct), NOT etc/passwd (wrong)
 
-    # Step 1: Try os.statx() (Linux with kernel >= 4.11)
-    try:
-        stx = os.statx(os_path, flags=os.STATX_ALL)  # type: ignore[attr-defined]
+    # Step 1: Try os.statx() (Linux with kernel >= 4.11).
+    # PLAN_2 S4 — reads the BITS via the single source of truth in statx.py,
+    # so the broker never forks its own `1 << 0` / `1 << 1` constants.
+    from .statx import STATX_ATTR_ENCRYPTED, STATX_ATTR_IMMUTABLE, try_statx_attributes
+
+    stx_attrs = try_statx_attributes(os_path)
+    if stx_attrs is not None:
         # ENCRYPTED flag → CONFIDENTIAL (filesystem-level sensitivity)
-        if stx.stx_attributes & (1 << 0):
+        if stx_attrs & STATX_ATTR_ENCRYPTED:
             return Confidentiality.CONFIDENTIAL, Integrity.USER
         # IMMUTABLE + owner-only → CONFIDENTIAL
-        if stx.stx_attributes & (1 << 1):
-            mode = stx.stx_mode & 0o777
+        if stx_attrs & STATX_ATTR_IMMUTABLE:
+            try:
+                mode = os.stat(os_path).st_mode & 0o777
+            except OSError:
+                mode = 0
             if mode & 0o077 == 0:  # owner-only
                 return Confidentiality.CONFIDENTIAL, Integrity.USER
             return Confidentiality.INTERNAL, Integrity.USER
-    except (OSError, AttributeError):
-        # statx not available (macOS / older kernel) — fall through to stat()
-        pass
 
     # Step 2: Try os.stat() permission bits (portable)
     try:
@@ -352,6 +370,10 @@ class EffectBroker:
         self._registry_strict: bool = False
         # L4: Send rate limiting per session (0 = unlimited)
         self._max_sends_per_session: int = 0
+        # PLAN_2 S3 — session-taint honest metrics (taint-rate + false-denial proxy)
+        self._taint_metrics: SessionTaintMetrics | None = SessionTaintMetrics()
+        # Tracks tasks that have had a taint-blocked send, for the false-denial proxy.
+        self._tasks_with_taint_block: set[str] = set()
         # Execution mode
         self._mode = mode
         self._executor_socket = Path(executor_socket)
@@ -696,7 +718,18 @@ class EffectBroker:
             task = self.tasks.get(target_task_id)
             if task is not None and task.session is not None and task.session.tainted:
                 if exception.from_label == "CONFIDENTIAL" and exception.etype in ("send", None):
-                    task.session.clear_taint()
+                    # PLAN_2 S2 — NARROW declassification: clear taint ONLY for the
+                    # file resources in exception.data_resources (safe default =
+                    # clears nothing; {"*"} = all). Cross-task grants are guarded
+                    # above and never clear another task's taint.
+                    task.session.clear_taint(exception)
+                    # PLAN_2 S3 — false-denial proxy: if this task previously had at
+                    # least one send blocked by taint, a declass on it now is evidence
+                    # the conservative taint over-blocked a legitimate workflow.
+                    m = self._taint_metrics
+                    if m is not None and target_task_id in self._tasks_with_taint_block:
+                        m.blocked_sends_later_declassed += 1
+                        self._tasks_with_taint_block.discard(target_task_id)  # count once
 
     @staticmethod
     def request_label_exception(
@@ -708,6 +741,7 @@ class EffectBroker:
         from_label: str,
         to_label: str,
         task_id: str | None = None,
+        data_resources: frozenset[str] = frozenset(),
     ) -> LabelException:
         """LLM/agent-side REQUEST for a declass/endorse.
 
@@ -730,6 +764,7 @@ class EffectBroker:
             granted_by="?",
             nonce="?",
             task_id=task_id,
+            data_resources=data_resources,
         )
 
     # ---- risk model placement: escalation, NOT in the allow rule ----
@@ -1028,11 +1063,18 @@ class EffectBroker:
                 # Check if there's a declass exception that covers this send
                 if self._has_validated_exception(effect, "declass", "CONFIDENTIAL"):
                     return True, "flow-ok(session-taint-cleared-by-declass)"
+                # PLAN_2 S3 — record that THIS task had a taint-blocked send.
+                # A later declass on the same task is evidence of over-blocking
+                # (false-denial proxy). Idempotent per (task, send-block).
+                m = self._taint_metrics
+                if m is not None and task.task_id not in self._tasks_with_taint_block:
+                    m.sends_blocked_by_taint += 1
+                    self._tasks_with_taint_block.add(task.task_id)
                 return False, (
                     f"session-taint("
                     f"session={task.session.session_id} "
                     f"has-read-confidential, "
-                    f"reason={task.session._taint_reason!r}, "
+                    f"reason={task.session.taint_reason!r}, "
                     f"declass-required)"
                 )
 
@@ -1731,22 +1773,32 @@ class EffectBroker:
             The caller MUST handle False and must NOT record CONFIRMED_COMMITTED
             to the ledger in this case.
         """
-        # ---- Session taint: mark session as tainted on CONFIDENTIAL read ----
+        # ---- Session taint: taint the SPECIFIC read resource on CONFIDENTIAL read ----
+        # PLAN_2 S2 — per-resource taint (keyed by the file URI), not a global flag.
+        # PLAN_2 S4 — only a `read` (content) taints; a `stat` (metadata) does NOT.
+        # PLAN_2 S3 — taint-rate: counts reads that taint vs total reads.
         if effect.etype == "read" and task.session is not None:
+            m = self._taint_metrics
+            if m is not None:
+                m.total_reads += 1
             file_res = self.store.resolve(effect.target)
             if file_res is not None and hasattr(file_res, "sensitivity"):
                 if file_res.sensitivity == Confidentiality.CONFIDENTIAL:
-                    task.session.taint_for_send(reason=f"read-confidential({effect.target})")
+                    task.session.taint_for_send(
+                        resource=effect.target,
+                        reason=f"read-confidential({effect.target})",
+                    )
+                    if m is not None:
+                        m.reads_that_tainted += 1
 
-        # Register read effect output in trusted provenance chain.
-        # When a read effect commits, we create a Data item with a provenance_id
-        # and register it in the session's _read_provenance. Subsequent effects
-        # that use this data must include the provenance_id, and FlowOK will
-        # verify the chain is unbroken (the read was actually committed).
+        # Register read effect output in the trusted provenance chain.
+        # PLAN_2 S1: the entry is bound to the authorizing capability's scope
+        # (scope_hash) so a provenance_id cannot be replayed under a different
+        # capability. content=None because the broker stores content="" (would be
+        # large) — the content binding degrades to "not bound" for read outputs.
         if effect.etype == "read" and task.session is not None:
             file_res = self.store.resolve(effect.target)
             if file_res is not None:
-                # Derive provenance labels from real file metadata
                 conf = (
                     file_res.sensitivity
                     if hasattr(file_res, "sensitivity")
@@ -1759,9 +1811,12 @@ class EffectBroker:
                     integrity=integ,
                     content="",  # content not stored (would be large)
                 )
-                # Register and get the provenance_id to embed in the effect
-                prov_id = task.session.register_read_provenance(
-                    read_output, effect.capability_nonce
+                cap = self.capabilities.get(effect.capability_nonce)
+                task.session.register_read_provenance(
+                    read_output,
+                    effect.capability_nonce,
+                    capability=cap,
+                    content=None,
                 )
                 # Note: we don't need to modify the effect (it's immutable).
                 # The provenance chain is tracked by the session, not the effect.
@@ -1852,6 +1907,18 @@ class EffectBroker:
             authorized_records[(tid, nonce)] = targets
 
         return self._ledger_backend.verify_all(authorized_records)
+
+    def get_taint_metrics(self) -> dict[str, object] | None:
+        """Return session-taint accounting (PLAN_2 S3).
+
+        Two DISTINCT signals are reported (never conflated):
+          - taint_rate          : how often a read taints the session (cost signal)
+          - false_denial_proxy  : how often a taint-block was later lifted by a declass
+                                  (over-blocking signal; annotation-free proxy, not truth)
+        """
+        if self._taint_metrics is None:
+            return None
+        return self._taint_metrics.to_dict()
 
     # ---- Real shim factory (IPC-aware) ----
     # In multi-process mode, shims MUST route real I/O through the subprocess.

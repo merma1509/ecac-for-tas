@@ -85,6 +85,9 @@ def effect_to_dict(effect: Any) -> dict[str, Any]:
                 "confidentiality": d.confidentiality.name,
                 "integrity": d.integrity.name,
                 "content": d.content,
+                # PLAN_1 S4 / PLAN_2 S1: preserve provenance binding across IPC.
+                "provenance_id": d.provenance_id,
+                "scope_hash": d.scope_hash,
             }
             for d in effect.provenance
         ],
@@ -126,6 +129,8 @@ def dict_to_effect(d: dict[str, Any]) -> Any:
             confidentiality=Confidentiality[p["confidentiality"]],
             integrity=Integrity[p["integrity"]],
             content=p.get("content", ""),
+            provenance_id=p.get("provenance_id"),
+            scope_hash=p.get("scope_hash"),
         )
         for p in d["provenance"]
     )
@@ -196,10 +201,14 @@ def commit_to_dict(commit: Any) -> dict[str, Any]:
                 "expiry": commit.approved_request.expiry,
                 "task_id": commit.approved_request.task_id,
                 "granted_by": commit.approved_request.granted_by,
+                # PLAN_1 S4: preserve the immutable content binding for the
+                # subprocess gate (content_hash must survive the IPC trip).
+                "content_hash": commit.approved_request.content_hash,
             }
             if commit.approved_request
             else None
         ),
+        "authorized_content_hash": getattr(commit, "authorized_content_hash", None),
     }
 
 
@@ -329,12 +338,19 @@ def session_state_to_dict(session: Any) -> dict[str, Any]:
 
     Includes: session_id, logical_time, used, revoked, taint, live.
     """
+    tainted_resources: dict[str, dict[str, object]] = {}
+    for resource, record in getattr(session, "_tainted_resources", {}).items():
+        tainted_resources[resource] = {
+            "reason": record.reason,
+            "cleared_by": record.cleared_by,
+        }
     return {
         "session_id": session.session_id,
         "logical_time": session.logical_time,
         "used": list(session.used),
         "revoked": list(session.revoked),
-        "tainted": session.tainted,
+        "tainted": session.tainted,  # legacy flat bool (derived; kept for backcompat)
+        "tainted_resources": tainted_resources,  # PLAN_2 S2 — per-resource taint
         "live": session.live,
     }
 
@@ -348,8 +364,16 @@ def dict_to_session(d: dict[str, Any]) -> Any:
     session.logical_time = d.get("logical_time", 0.0)
     session.used = set(d.get("used", []))
     session.revoked = set(d.get("revoked", []))
-    session._tainted = d.get("tainted", False)
     session.live = d.get("live", True)
+    # PLAN_2 S2 — restore per-resource taint through the public API (never
+    # mutate private `_tainted` directly). Falls back to the legacy flat bool.
+    resources: dict[str, dict[str, object]] = d.get("tainted_resources", {})
+    if resources:
+        for resource, rec in resources.items():
+            reason = str(rec.get("reason", f"read-confidential({resource})"))
+            session.taint_for_send(resource=resource, reason=reason)
+    elif d.get("tainted", False):
+        session.taint_for_send(resource="<session>", reason="restored-from-ipc")
     return session
 
 

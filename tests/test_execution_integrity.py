@@ -7,25 +7,20 @@ These tests verify:
 4. Rejected requests do not consume budgets (send_count not incremented on failure)
 """
 
-import pytest
-
 from effect_broker.broker import EffectBroker
 from effect_broker.executor import IsolatedExecutor
+from effect_broker.lattice import Confidentiality
 from effect_broker.ledger import IndependentEffectLedger, LedgerVerdict
 from effect_broker.model import (
+    AGENT,
+    BROKER,
+    USER,
+    Capability,
+    Commit,
     Effect,
     Session,
     Task,
-    Capability,
-    Commit,
-    USER,
-    AGENT,
-    BROKER,
-    Data,
-    EffectTarget,
 )
-from effect_broker.restricted_store import RestrictedResourceStore
-from effect_broker.lattice import Confidentiality, Integrity
 
 CHAIN = (USER, AGENT, BROKER)
 
@@ -67,9 +62,13 @@ def _make_broker_with_capability(
     broker.store._unsafe_bootstrap_email(target, "internal")
 
     # Create capability with wildcard target and scope
-    broker.grant_root(_capability(USER, USER, right, effective_target, effective_scope, 9999999999.0, nonce))
+    broker.grant_root(
+        _capability(USER, USER, right, effective_target, effective_scope, 9999999999.0, nonce)
+    )
     broker.attenuate(nonce, AGENT, right, effective_target, effective_scope, 9999999999.0)
-    broker.attenuate(f"{nonce}:Agent", BROKER, right, effective_target, effective_scope, 9999999999.0)
+    broker.attenuate(
+        f"{nonce}:Agent", BROKER, right, effective_target, effective_scope, 9999999999.0
+    )
 
     # Create task with wildcard ceiling
     cap = Capability(USER, BROKER, right, "*", frozenset({"*"}), float("inf"), f"ceil-{nonce}")
@@ -100,9 +99,7 @@ def _setup_send_test_with_secondary_email(
     # Only bootstrap the EXISTING email — alice@corp.com is NOT in store
     broker.store._unsafe_bootstrap_email(existing, "internal")
 
-    broker.grant_root(
-        _capability(USER, USER, "send", "*", frozenset({"*"}), 9999999999.0, nonce)
-    )
+    broker.grant_root(_capability(USER, USER, "send", "*", frozenset({"*"}), 9999999999.0, nonce))
     broker.attenuate(nonce, AGENT, "send", "*", frozenset({"*"}), 9999999999.0)
     broker.attenuate(f"{nonce}:Agent", BROKER, "send", "*", frozenset({"*"}), 9999999999.0)
 
@@ -152,6 +149,7 @@ class TestLedgerExecutionBinding:
 
         # The key assertion: UNKNOWN, not CONFIRMED_COMMITTED
         from effect_broker.ledger import UnknownLedgerResult
+
         assert isinstance(verdict, UnknownLedgerResult), (
             f"Ledger should return UNKNOWN for failed execution, got {verdict}. "
             "auth > 0 with FAILED observation should be UNKNOWN, not CONFIRMED."
@@ -220,6 +218,7 @@ class TestNonceReplayPrevention:
         # Ledger should have UNKNOWN for first attempt
         verdict1 = ledger.verify("test-send", "test-cap-replay:Agent:EffectBroker")
         from effect_broker.ledger import UnknownLedgerResult
+
         assert isinstance(verdict1, UnknownLedgerResult)
 
         # Note: In same-process mode, we can't easily restore and re-run.
@@ -273,6 +272,7 @@ class TestBudgetPreservation:
         # Verify ledger has UNKNOWN (not CONFIRMED) for this failed execution
         verdict = ledger.verify("test-send", "send-cap-001:Agent:EffectBroker")
         from effect_broker.ledger import UnknownLedgerResult
+
         assert isinstance(verdict, UnknownLedgerResult)
 
     def test_successful_send_increments_send_count(self):
@@ -342,6 +342,7 @@ class TestUnknownNotSafeInvariant:
 
         # MUST be UNKNOWN, not CONFIRMED
         from effect_broker.ledger import UnknownLedgerResult
+
         assert isinstance(verdict, UnknownLedgerResult), (
             f"UNKNOWN not safe: ledger returned {verdict} instead of UNKNOWN. "
             "The 'unknown, not safe' invariant is violated."

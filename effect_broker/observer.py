@@ -21,9 +21,17 @@ THREE-LEVEL VERIFICATION:
                     Returns CONFIRMED | UNKNOWN | REJECTED.
   Level 2 (Observer): Watches resource state, independent of broker path.
                      Returns OBSERVED | NOT_OBSERVED | UNKNOWN.
-  Level 3 (Complete Mediation): Ledger + Observer together provide the full
-    guarantee: every broker-authorized effect is observer-confirmed, and
+  Level 3 (Complete Mediation): Ledger + Observer together provide best-effort
+    verification: every broker-authorized effect is observer-confirmed, and
     every observer-confirmed effect is broker-authorized.
+
+CLAIM-CLEANUP CAVEAT: "complete mediation" here is BEST-EFFORT
+verification, NOT a proof of total mediation. An UNKNOWN verdict may indicate a
+bypass OR merely an observer/ledger limitation (e.g. same-process direct store
+mutation, or an effect the observer cannot see). Absence of a CONFIRMED verdict
+is treated as "unknown, not safe" (fail-closed), but it is not evidence that the
+effect is safe or that no bypass occurred. This is regression/audit evidence,
+not a confinement proof.
 
 "UNKNOWN, NOT SAFE" INVARIANT:
   If the observer cannot verify an effect occurred, it returns UNKNOWN —

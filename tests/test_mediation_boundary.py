@@ -18,7 +18,7 @@ CRITICAL LIMITATION (documented in mediation.py):
   by the test author. They demonstrate the *logic* of declared-vs-actual checking
   but do NOT prove malicious tool computation is bounded. A real adversarial
   tool can simply not report its actual targets. The mandatory boundary
-  experiment (M1-M5 in tests/test_experiment.py) demonstrates this using a
+  regression suite (M1-M5 in tests/test_regressions.py) demonstrates this using a
   REAL untrusted tool that is ACTUALLY prevented from reaching external state,
   with complete mediation verified by the independent ledger.
 """

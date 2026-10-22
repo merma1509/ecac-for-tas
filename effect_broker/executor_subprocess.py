@@ -66,31 +66,52 @@ import sys
 # NOTE: stdlib modules like 'os', 'subprocess', 'threading', 'signal' are ALLOWED.
 # The blocking is ONLY for dangerous third-party packages and specific attack vectors.
 # Filesystem writes are restricted via _restricted_open wrapper on os.open().
-_DANGEROUS_MODULES: frozenset[str] = frozenset({
-    # Code execution — prevents dynamic code generation
-    "exec", "eval", "compile", "code", "codeop",
-    # Object serialization attacks
-    "pickle", "marshal", "shelve",
-    # System information / privilege escalation
-    "platform",  # Can reveal system info
-    "resource",  # Can modify resource limits
-    "grp",  # Group database access
-    "pwd",  # Password database access
-    "spwd",  # Shadow password database access
-    # Signal handlers are managed by the subprocess itself, not needed as module
-})
+_DANGEROUS_MODULES: frozenset[str] = frozenset(
+    {
+        # Code execution — prevents dynamic code generation
+        "exec",
+        "eval",
+        "compile",
+        "code",
+        "codeop",
+        # Object serialization attacks
+        "pickle",
+        "marshal",
+        "shelve",
+        # System information / privilege escalation
+        "platform",  # Can reveal system info
+        "resource",  # Can modify resource limits
+        "grp",  # Group database access
+        "pwd",  # Password database access
+        "spwd",  # Shadow password database access
+        # Signal handlers are managed by the subprocess itself, not needed as module
+    }
+)
 
 # Third-party network packages blocked (never needed in subprocess)
-_BLOCKED_NETWORK_PACKAGES: frozenset[str] = frozenset({
-    "requests", "aiohttp", "httpx", "websockets", "smb", "urllib3",
-})
+_BLOCKED_NETWORK_PACKAGES: frozenset[str] = frozenset(
+    {
+        "requests",
+        "aiohttp",
+        "httpx",
+        "websockets",
+        "smb",
+        "urllib3",
+    }
+)
 
 # stdlib modules blocked (not needed in subprocess, not dangerous as-is)
-_BLOCKED_STDLIB: frozenset[str] = frozenset({
-    # Network client libraries (not needed in isolated subprocess)
-    # Note: smtplib IS needed for real_smtp_send, imaplib IS needed for real_imap_read_inbox
-    "http.client", "ftplib", "telnetlib", "nntplib", "poplib",
-})
+_BLOCKED_STDLIB: frozenset[str] = frozenset(
+    {
+        # Network client libraries (not needed in isolated subprocess)
+        # Note: smtplib IS needed for real_smtp_send, imaplib IS needed for real_imap_read_inbox
+        "http.client",
+        "ftplib",
+        "telnetlib",
+        "nntplib",
+        "poplib",
+    }
+)
 
 # Store list of blocked imports for debugging/audit
 _blocked_imports_log: list[str] = []
@@ -249,10 +270,6 @@ def _verify_content_binding(
 
 from effect_broker.enforcer import (
     _restricted_open as _restricted_open,
-    _real_os_open,
-    set_allowed_paths as _set_allowed_paths,
-    get_allowed_paths,
-    get_blocked_paths,
 )
 
 
@@ -284,8 +301,7 @@ def _apply_landlock_sandbox() -> bool:
         attr = landlock_ruleset_attr(handled_access_fs=handled)
 
         ruleset_fd = libc.syscall(
-            SYS_landlock_create_ruleset, 0,
-            ctypes.byref(attr), ctypes.sizeof(attr)
+            SYS_landlock_create_ruleset, 0, ctypes.byref(attr), ctypes.sizeof(attr)
         )
 
         if ruleset_fd >= 0:
@@ -310,21 +326,19 @@ def _get_confinement_status() -> str:
     return "+".join(methods)
 
 
-
 def _derive_confidentiality_from_mode(mode_int: int) -> str:
-    """Derive confidentiality from Unix permission bits (mirrors shim_real.py).
+    """Derive confidentiality from Unix permission bits.
 
-    Runs in subprocess so taint detection uses real OS state:
-      Owner-only  (mode & 0o007 == 0)   -> CONFIDENTIAL
-      Group-readable (mode & 0o070 != 0) -> INTERNAL
-      World-readable (mode & 0o004 != 0) -> PUBLIC
-      Other                                -> PUBLIC
+    PLAN_2 S4 — delegates to the single source of truth in statx.py instead of
+    a forked hard-coded copy, so the subprocess can never drift from the broker
+    or shim. Runs in subprocess so taint detection uses real OS state.
     """
-    if mode_int & 0o007 == 0:
-        return "CONFIDENTIAL"
-    if mode_int & 0o070 != 0:
-        return "INTERNAL"
-    return "PUBLIC"
+    # Absolute import: the subprocess runs as a top-level script
+    # (python effect_broker/executor_subprocess.py) with PYTHONPATH=ecac_root,
+    # so relative imports do NOT resolve here — use the package path.
+    from effect_broker.statx import derive_confidentiality_mode_str
+
+    return derive_confidentiality_mode_str(mode_int)
 
 
 # ---- Store: only mutable state in THIS process ----
@@ -725,7 +739,8 @@ class ExecutorServer:
         try:
             obs_targets = self._store.apply_effect(effect)
 
-            # Track taint: if read CONFIDENTIAL file, mark session as tainted
+            # Track taint: if read CONFIDENTIAL file, taint THIS resource
+            # (PLAN_2 S2 — per-resource, keyed by the file URI).
             if effect.get("etype") == "read":
                 target = effect.get("target", "")
                 file_entry = self._store._files.get(target)
@@ -734,9 +749,14 @@ class ExecutorServer:
                     and hasattr(file_entry.sensitivity, "name")
                     and file_entry.sensitivity.name == "CONFIDENTIAL"
                 ):
-                    if not session.get("tainted"):
-                        session["tainted"] = True
-                        session["_taint_reason"] = f"read-confidential({target})"
+                    if target not in session.get("_tainted_resources", {}):
+                        # session is the preferred dict here; mutate in place.
+                        tainted_resources = dict(session.get("_tainted_resources", {}))
+                        tainted_resources[target] = {
+                            "reason": f"read-confidential({target})",
+                            "cleared_by": None,
+                        }
+                        session["_tainted_resources"] = tainted_resources
                         self._session_states[task_id] = session
 
             # Reserve nonce if requested (B's local reservation)
@@ -745,11 +765,13 @@ class ExecutorServer:
                     session["used"] = list(snapshot.get("used", []))
                 session["used"] = list(session.get("used", [])) + [nonce]
 
-            # Build session update for A (B→A sync)
+            # Build session update for A (B→A sync) — PLAN_2 S2: carry the
+            # per-resource taint records so A can do narrow declassification.
             session_update_applied = {
                 "used": session.get("used", list(snapshot.get("used", []))),
                 "logical_time": session.get("logical_time", snapshot.get("logical_time", 0.0)),
-                "tainted": session.get("tainted", snapshot.get("tainted", False)),
+                "tainted": bool(session.get("_tainted_resources")),
+                "tainted_resources": session.get("_tainted_resources", {}),
                 "_taint_reason": session.get("_taint_reason", ""),
                 "content_binding_verified": True,  # Audit trail
             }
@@ -799,13 +821,17 @@ class ExecutorServer:
                 confidentiality = _derive_confidentiality_from_mode(st.st_mode)
                 session_update = {}
                 if confidentiality == "CONFIDENTIAL":
+                    # PLAN_2 S2 — per-resource taint keyed by the file URI.
                     task_id = payload.get("task_id", "default")
                     session = self._session_states.get(task_id, {})
-                    # Set taint in subprocess mirror (B) so sync_session returns it to A
-                    if not session.get("tainted"):
+                    if path not in session.get("_tainted_resources", {}):
                         session = dict(session)  # copy
-                        session["tainted"] = True
-                        session["_taint_reason"] = f"real-read-confidential({path})"
+                        tainted_resources = dict(session.get("_tainted_resources", {}))
+                        tainted_resources[path] = {
+                            "reason": f"real-read-confidential({path})",
+                            "cleared_by": None,
+                        }
+                        session["_tainted_resources"] = tainted_resources
                         self._session_states[task_id] = session
                     session_update = session
                 return {
@@ -851,12 +877,17 @@ class ExecutorServer:
                     confidentiality = "INTERNAL"
                 session_update = {}
                 if confidentiality == "CONFIDENTIAL":
+                    # PLAN_2 S2 — per-resource taint keyed by the file URI.
                     task_id = payload.get("task_id", "default")
                     session = self._session_states.get(task_id, {})
-                    if not session.get("tainted"):
+                    if path not in session.get("_tainted_resources", {}):
                         session = dict(session)
-                        session["tainted"] = True
-                        session["_taint_reason"] = f"real-write-confidential({path})"
+                        tainted_resources = dict(session.get("_tainted_resources", {}))
+                        tainted_resources[path] = {
+                            "reason": f"real-write-confidential({path})",
+                            "cleared_by": None,
+                        }
+                        session["_tainted_resources"] = tainted_resources
                         self._session_states[task_id] = session
                     session_update = session
                 return {
@@ -875,16 +906,10 @@ class ExecutorServer:
                 path = payload["path"]
                 st = os.stat(path)
                 confidentiality = _derive_confidentiality_from_mode(st.st_mode)
+                # PLAN_2 S4 — metadata (statx fields: mode/size/mtime) is NOT
+                # semantically confidential. Only file CONTENT is. A pure stat
+                # must NOT taint the session (it observes metadata, not content).
                 session_update = {}
-                if confidentiality == "CONFIDENTIAL":
-                    task_id = payload.get("task_id", "default")
-                    session = self._session_states.get(task_id, {})
-                    if not session.get("tainted"):
-                        session = dict(session)
-                        session["tainted"] = True
-                        session["_taint_reason"] = f"real-stat-confidential({path})"
-                        self._session_states[task_id] = session
-                    session_update = session
                 return {
                     "ok": True,
                     "stat": {

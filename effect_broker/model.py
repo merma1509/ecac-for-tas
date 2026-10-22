@@ -1,8 +1,29 @@
-"""Core data types: principals, resources, data values, capabilities, effects"""
+"""Core data types: principals, resources, data values, capabilities, effects
+
+THREE ORTHOGONAL TRUST CONCEPTS (do not conflate):
+
+  1. PROVENANCE (source): WHERE the data came from.
+     - Broker-monitored read: Data.provenance_id (+ scope_hash) points to a
+       committed read effect.
+     - External input: provenance_id=None → UNTRUSTED source.
+     - Forged provenance: invalid ID/scope/content mismatch → rejected.
+
+  2. integrity (trustworthiness): how much the label can be trusted.
+     - UNTRUSTED: default, minimum (no upgrade possible)
+     - USER:      broker's own output (trusted by construction)
+     - HIGH/ADMIN: requires a valid broker-monitored provenance chain
+     Verified by FlowOK via Session.verify_effect_provenance().
+
+  3. CAPABILITY SCOPE (authorization): what operations the capability
+     allows. Stored on Capability.scope, checked by NoAmp/Auth. Unrelated
+     to provenance — the scope hash only BINDS a provenance entry to the
+     capability that produced it (prevents cross-capability reuse).
+"""
 
 from __future__ import annotations
 
 import hashlib
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypedDict
@@ -19,6 +40,106 @@ def compute_content_hash(content: str | bytes) -> str:
     if isinstance(content, str):
         content = content.encode("utf-8")
     return hashlib.sha256(content).hexdigest()
+
+
+def compute_scope_hash(capability: Capability) -> str:
+    """Derive the capability-scope hash embedded in a provenance ID.
+
+    The scope hash binds a provenance entry to the EXACT capability that
+    authorized the read: a provenance_id issued under capability X cannot be
+    replayed against data read under capability Y (even if both nonces leaked).
+
+    Deterministic over the capability's authorization-relevant fields:
+    right, target and the sorted scope set. (owner/holder/expiry are excluded
+    — they do not define the authorization scope and would make the hash
+    unstable under re-issue.)
+    """
+    material = "|".join([capability.right, capability.target, *sorted(capability.scope)])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass
+class TaintRecord:
+    """Per-resource taint record: one resource (file) that was read.
+
+    A session becomes tainted per-RESOURCE (the file that was read), not as a
+    single global flag. A narrow declass clears taint only for the resources
+    it explicitly covers; the session is "tainted" while ANY resource remains
+    uncleared (see Session.tainted / Session.effective_taint).
+    """
+
+    reason: str
+    timestamp: float = field(default_factory=time.monotonic, repr=False)
+    # Nonce of the LabelException that cleared this resource (None = active)
+    cleared_by: str | None = None
+
+
+@dataclass
+class ProvenanceEntry:
+    """A committed read output, with its scope + content binding.
+
+    The entry carries
+    everything needed to verify a Data item is the unmodified output of the
+    exact read that issued its provenance_id:
+      - scope_hash:  the capability scope the read was authorized under
+      - content_hash: SHA256 of the read content, when content is available
+                      (None when the broker stores content="")
+    """
+
+    data: Data  # the read output as committed
+    scope_hash: str  # capability scope this entry was issued under
+    content_hash: str | None = None  # None when content not stored
+
+
+@dataclass
+class SessionTaintMetrics:
+    """Per-broker session-taint accounting (honest measurement).
+
+    Two DISTINCT quantities are measured and reported separately so the
+    taint-rate is never mistaken for a false-denial rate:
+
+      - taint_rate          : how OFTEN reading taints the session (cost signal).
+                              Fraction of reads whose content is CONFIDENTIAL.
+      - false_denial_proxy  : how OFTEN a taint block was later lifted by an
+                              explicit declass (over-blocking signal).
+
+    These are NOT the same thing. A false denial is a LEGITIMATE send that was
+    blocked. Without human annotation we cannot label blocks, so we measure a
+    PROXY: a send blocked by taint that the user then explicitly declassifies is
+    evidence the conservative taint over-blocked. This is the highest-signal
+    annotation-free signal available. It is a proxy, NOT ground truth.
+    """
+
+    total_reads: int = 0
+    reads_that_tainted: int = 0  # read effects that set session taint
+    sends_blocked_by_taint: int = 0  # send effects blocked via "session-taint"
+    blocked_sends_later_declassed: int = 0  # a taint-blocked send, then a declass
+    # was granted covering the same task
+
+    @property
+    def taint_rate(self) -> float:
+        """How often a read taints the session. Cost signal, NOT a denial rate."""
+        return self.reads_that_tainted / max(self.total_reads, 1)
+
+    @property
+    def false_denial_proxy(self) -> float:
+        """Fraction of taint-blocked sends later unblocked by an explicit declass.
+
+        High value => the conservative taint frequently over-blocks legitimate
+        workflows. Annotation-free proxy, not ground truth.
+        """
+        return self.blocked_sends_later_declassed / max(self.sends_blocked_by_taint, 1)
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize for reporting (experiment output)."""
+        return {
+            "total_reads": self.total_reads,
+            "reads_that_tainted": self.reads_that_tainted,
+            "sends_blocked_by_taint": self.sends_blocked_by_taint,
+            "blocked_sends_later_declassed": self.blocked_sends_later_declassed,
+            "taint_rate": self.taint_rate,
+            "false_denial_proxy": self.false_denial_proxy,
+        }
 
 
 class Evidence(TypedDict, total=False):
@@ -127,11 +248,13 @@ class Session:
     _live: bool = True
     _ever_closed: bool = field(default=False, repr=False)
 
-    # Taint tracking: session-level taint from reading CONFIDENTIAL data.
-    # Set when a read effect reads a CONFIDENTIAL file. Cleared only when
-    # an explicit declass exception is recorded by the broker (not by LLM).
-    _tainted: bool = field(default=False, repr=False)
-    _taint_reason: str = field(default="", repr=False)  # human-readable reason
+    # Taint tracking (Per-resource, derived bool for backcompat).
+    # A session becomes tainted PER RESOURCE (the file that was read), not as a
+    # single global flag. A narrow declass clears taint only for the resources
+    # its `data_resources` covers; `tainted` stays True while ANY resource is
+    # still uncleared. The derived `tainted` property preserves the old API.
+    _tainted_resources: dict[str, TaintRecord] = field(default_factory=dict, repr=False)
+    _taint_reason: str = field(default="", repr=False)  # legacy first-reason (derived view)
 
     # Send rate limiting to prevent amplification via composition.
     # Tracks number of send effects committed in this session. When the
@@ -141,10 +264,11 @@ class Session:
     _max_sends_per_session: int = field(default=0, repr=False)  # 0 = unlimited
 
     # Trusted provenance chain for integrity verification.
-    # Maps read_effect_id → output Data from that read.
-    # Only Data with a valid provenance_id (pointing to a committed read)
-    # is considered TRUSTED. Data from untrusted sources is UNTRUSTED.
-    _read_provenance: dict[str, Data] = field(default_factory=dict, repr=False)
+    # Maps provenance_id → ProvenanceEntry (data + scope_hash + content_hash).
+    # Only Data whose provenance_id AND scope_hash AND name (and content hash
+    # where stored) all match a committed read entry is considered TRUSTED.
+    # Data from untrusted sources is UNTRUSTED.
+    _read_provenance: dict[str, ProvenanceEntry] = field(default_factory=dict, repr=False)
     _provenance_counter: int = field(default=0, repr=False)  # sequence counter
 
     @property
@@ -169,23 +293,66 @@ class Session:
 
     @property
     def tainted(self) -> bool:
-        """True if this session has read CONFIDENTIAL data without declass."""
-        return self._tainted
+        """BACKCOMPAT: True if ANY resource is still (uncleared) tainted.
 
-    def taint_for_send(self, reason: str = "") -> None:
-        """Mark the session as tainted (confidential data was read).
-
-        After taint, any send effect is blocked by FlowOK unless a broker-recorded
-        declass exception exists. The reason describes what was read.
+        Derived from the per-resource records. Kept as a property so the
+        existing `session.tainted` API (FlowOK, executor sync, tests) is
+        unchanged. A narrow declass leaves this True until every read
+        resource is covered by its `data_resources`.
         """
-        self._tainted = True
-        if reason:
-            self._taint_reason = reason
+        return any(r.cleared_by is None for r in self._tainted_resources.values())
 
-    def clear_taint(self) -> None:
-        """Clear taint (only after broker records a declass exception)."""
-        self._tainted = False
+    def taint_for_send(self, resource: str = "", reason: str = "") -> None:
+        """Taint a SPECIFIC resource (idempotent: first reason wins).
+
+        Per-resource taint. `resource` is the read target (file
+        URI); when empty, a synthetic key is used so the call still records a
+        taint (backcompat with callers that only pass a reason). After taint,
+        any send is blocked by FlowOK unless a broker-recorded declass exists.
+        """
+        key = resource if resource else "<session>"
+        if key not in self._tainted_resources:
+            self._tainted_resources[key] = TaintRecord(
+                reason=reason or f"read-confidential({key})",
+            )
+        # Keep a legacy derived reason for evidence messages.
+        if not self._taint_reason:
+            self._taint_reason = self._tainted_resources[key].reason
+
+    def clear_taint(self, exception: LabelException | None = None) -> None:
+        """Clear taint ONLY for resources covered by `exception`.
+
+        Narrow declassification. `exception.data_resources` names
+        the file resources whose read-taint this grant clears:
+          - frozenset()  -> clears NOTHING (safe default; old whole-clear gone)
+          - {"*"}        -> clears ALL taint (explicit wildcard)
+          - {path, ...}  -> clears exactly those resources
+        When `exception` is None, all taint is cleared (legacy behavior kept
+        for internal full-clear callers).
+        """
+        if exception is None:
+            self._tainted_resources.clear()
+            self._taint_reason = ""
+            return
+        # Clear ONLY the resources this exception's data_resources covers.
+        # Safe default (empty set) clears nothing; {"*"} clears all.
+        for resource, record in self._tainted_resources.items():
+            if record.cleared_by is None and exception.covers_taint_resource(resource):
+                record.cleared_by = exception.nonce
         self._taint_reason = ""
+
+    def clear_taint_all(self) -> None:
+        """LEGACY whole-clear (explicit). New code should use clear_taint(exc)."""
+        self._tainted_resources.clear()
+        self._taint_reason = ""
+
+    @property
+    def taint_reason(self) -> str:
+        """First active (uncleared) taint reason, or "" if none. For evidence."""
+        for record in self._tainted_resources.values():
+            if record.cleared_by is None:
+                return record.reason
+        return self._taint_reason
 
     def set_max_sends(self, max_sends: int) -> None:
         """Set the maximum number of sends allowed per session.
@@ -223,74 +390,106 @@ class Session:
         """Maximum sends allowed per session (read-only). 0 = unlimited."""
         return self._max_sends_per_session
 
-    # ---- Trusted provenance chain ----
-    def register_read_provenance(self, data: Data, cap_nonce: str) -> str:
+    # ---- Trusted provenance chain (capability-scoped) ----
+    def register_read_provenance(
+        self,
+        data: Data,
+        cap_nonce: str,
+        capability: Capability | None = None,
+        content: str | bytes | None = None,
+    ) -> str:
         """Register a read effect's output in the provenance chain.
 
-        Returns the provenance_id (e.g. "read:default:cap:001") that
-        must be included in subsequent effects using this data.
-        The broker calls this when a read effect commits.
+        The entry is bound to the authorizing capability's scope.
+          - scope_hash   = sha256(right|target|sorted(scope))[:16]  (or "<none>")
+          - content_hash = sha256(content) when content is provided, else None
+                          (the broker stores read content="" and passes content=None,
+                          so the content check degrades to None — a legacy
+                          read_output is not content-bound).
+
+        Returns the provenance_id (e.g. "read:default:cap:001") that must be
+        included in subsequent effects using this data. The broker calls this
+        when a read effect commits.
         """
         self._provenance_counter += 1
         prov_id = f"read:{self.session_id}:{cap_nonce}:{self._provenance_counter}"
-        # Store the data with its provenance_id
+        scope_hash = compute_scope_hash(capability) if capability is not None else "<none>"
+        content_hash = compute_content_hash(content) if content is not None else None
+        # Store the committed read output with its provenance_id.
         labeled = Data(
             name=data.name,
             confidentiality=data.confidentiality,
             integrity=data.integrity,
             content=data.content,
             provenance_id=prov_id,
+            scope_hash=scope_hash,
         )
-        self._read_provenance[prov_id] = labeled
+        self._read_provenance[prov_id] = ProvenanceEntry(
+            data=labeled, scope_hash=scope_hash, content_hash=content_hash
+        )
         return prov_id
 
     def get_provenance(self, prov_id: str) -> Data | None:
-        """Look up a provenanced data item by ID.
+        """Look up the committed read output by provenance_id (None if unknown)."""
+        entry = self._read_provenance.get(prov_id)
+        return entry.data if entry is not None else None
 
-        Returns None if the provenance_id is unknown (data forged or stale).
-        """
+    def get_provenance_entry(self, prov_id: str) -> ProvenanceEntry | None:
+        """Look up the full ProvenanceEntry (data + scope_hash + content_hash)."""
         return self._read_provenance.get(prov_id)
 
-    def is_trusted_provenance(self, prov_id: str | None) -> bool:
-        """True if prov_id is a valid, broker-committed provenance.
+    def is_trusted_provenance(self, datum: Data) -> bool:
+        """True if `datum` is the unmodified output of a committed read.
 
-        Data with a valid provenance_id is TRUSTED.
-        Data without provenance_id (or with unknown ID) is UNTRUSTED.
+        verifies ID AND scope AND (content hash where stored).
+        A datum is trusted only if:
+          - its provenance_id exists in the registry, AND
+          - its scope_hash matches the capability scope that issued it
+            (prevents cross-capability reuse of a leaked provenance_id), AND
+          - its name matches the committed read output, AND
+          - if the entry recorded a content hash, the datum content matches it.
+        Data without a provenance_id, or with a wrong scope/name/content, is
+        UNTRUSTED (a forge cannot mint a valid scope_hash).
         """
-        if prov_id is None:
-            return False  # untrusted: no broker-mediated origin
-        return prov_id in self._read_provenance
+        if datum.provenance_id is None or datum.scope_hash is None:
+            return False
+        entry = self._read_provenance.get(datum.provenance_id)
+        if entry is None:
+            return False
+        if entry.scope_hash != datum.scope_hash:
+            return False
+        if entry.data.name != datum.name:
+            return False
+        if entry.content_hash is not None:
+            return compute_content_hash(datum.content) == entry.content_hash
+        return True
 
     def verify_effect_provenance(self, effect: Effect) -> tuple[bool, str]:
-        """Verify high-integrity data comes from trusted broker reads.
+        """Verify high-integrity data comes from trusted, in-scope broker reads.
 
-        Data claiming HIGH or ADMIN integrity MUST have
-        a valid provenance_id pointing to a broker-committed read. This prevents
-        the integrity upgrade attack:
-          - LLM claims data is HIGH integrity (forge) → BLOCK (no provenance)
-          - Trusted read output from broker has provenance_id → ALLOW
+        Data claiming HIGH or ADMIN integrity MUST have a valid provenance_id
+        AND scope_hash (and matching content where bound) pointing to a
+        broker-committed read. This prevents the integrity-upgrade and
+        cross-capability-reuse attacks:
+          - LLM claims HIGH integrity with no/bad provenance  -> BLOCK
+          - Forge reuses a leaked prov_id under a wrong scope -> BLOCK
+          - Committed read output with matching scope         -> ALLOW
 
-        USER and UNTRUSTED integrity are ALWAYS ALLOWED:
-          - USER: the broker's own default for read output (trusted by construction)
-          - UNTRUSTED: already at minimum integrity (no upgrade possible)
-
-        The integrity threshold is HIGH: only the most sensitive integrity levels
-        require broker-monitored origin to be trusted.
+        USER and UNTRUSTED integrity are ALWAYS ALLOWED (minimum trust, no
+        upgrade possible; USER = the broker's own read output).
         """
         for datum in effect.provenance:
-            # Only check HIGH+ integrity (ADMIN, SYSTEM).
-            # USER: broker's own default for read output (always trusted).
-            # UNTRUSTED: already minimum integrity (no upgrade possible).
             if datum.integrity < Integrity.HIGH:
                 continue  # always allowed: USER/UNTRUSTED
-            if not self.is_trusted_provenance(datum.provenance_id):
+            if not self.is_trusted_provenance(datum):
                 return False, (
                     f"untrusted-provenance("
                     f"datum={datum.name}, "
                     f"integrity={datum.integrity.name}, "
-                    f"prov_id={datum.provenance_id!r}): "
-                    f"HIGH+ integrity requires broker-monitored origin. "
-                    f"Only data from committed read effects has valid provenance_id."
+                    f"prov_id={datum.provenance_id!r}, "
+                    f"scope={datum.scope_hash!r}): "
+                    f"HIGH+ integrity requires broker-monitored origin whose "
+                    f"provenance_id, scope_hash and name all match a committed read."
                 )
         return True, "trusted"
 
@@ -494,6 +693,17 @@ class Data:
     # None = untrusted source (LLM claim without broker-mediated origin).
     # When set, the broker verifies this ID exists in _read_provenance.
     provenance_id: str | None = None
+    # Capability-scope hash.
+    # Three orthogonal concepts (do not conflate):
+    #   SOURCE    (provenance_id): where this data came from — a committed read.
+    #   INTEGRITY (integrity):     how much the label can be trusted.
+    #   SCOPE     (scope_hash):    which capability authorized the read.
+    # scope_hash binds the datum to the EXACT capability scope that issued its
+    # provenance_id, so a provenance_id issued under capability X cannot be
+    # replayed against data "read" under capability Y (even if the ID leaked).
+    # None = legacy datum without scope binding (rejected by FlowOK provenance
+    # check for HIGH+ integrity — a forge cannot mint a valid scope_hash).
+    scope_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -529,6 +739,21 @@ class LabelException:
     additional_targets: frozenset[str] = frozenset()  # extra targets (BCC, etc.)
     etype: str | None = None  # operation type, or None for any
     task_id: TaskId | None = None  # task scope; None = any task
+    # File resources whose READ TAINT this declass clears.
+    # This is DISTINCT from match_target/additional_targets (the SEND targets
+    # checked by matches_effect). Taint resources are the READ targets (file
+    # URIs). The safe default (empty set) clears NO taint; {"*"} clears all.
+    data_resources: frozenset[str] = frozenset()
+
+    def covers_taint_resource(self, resource: str) -> bool:
+        """True if this declass clears the read-taint of `resource` (a file URI).
+
+        `resource` is the READ target that tainted the session.
+        `*` is an explicit wildcard clearing all; otherwise the resource must
+        be named in data_resources. The safe default (empty data_resources)
+        clears nothing — the old implicit "clear everything" is removed.
+        """
+        return "*" in self.data_resources or resource in self.data_resources
 
     def matches_effect(self, effect: Effect) -> bool:
         """True if this exception applies to the given effect.
@@ -661,6 +886,7 @@ class Effect:
         if self.etype == "write":
             # Handle both direct content (bytes/str) and base64-encoded content
             import base64
+
             content_raw = self.metadata.get("content", "")
             if content_raw is None or content_raw == "":
                 # Also check for base64 encoded content (from IPC-safe shim)
@@ -711,7 +937,3 @@ class Commit:
     # the SAME hash. This closes the gate↔execute coupling gap in same-process
     # mode (IPC mode already had this via executor_subprocess._verify_content_binding).
     authorized_content_hash: str | None = None
-
-
-
-

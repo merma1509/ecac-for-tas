@@ -5,6 +5,7 @@ Compares ECAC against external systems:
 - PACT: Property attestation + capabilities
 - ChainCaps: Capability transformations
 - Cordon: Commit-time revalidation
+- ConventionalSandbox: seccomp/landlock-style OS path+syscall confinement
 - FORGE: Policy DSL
 - Allowlist: Tool pattern matching
 - ArgProv: Argument provenance
@@ -18,6 +19,7 @@ from .mode_allowlist import AllowlistBroker
 from .mode_argument_provenance import ArgumentProvenanceBroker
 from .mode_camel import CaMeLBroker
 from .mode_chaincaps import ChainCapsBroker
+from .mode_conventional_sandbox import ConventionalSandboxBroker
 from .mode_cordon import CordonBroker
 from .mode_ecac import ECACBaselineBroker
 from .mode_forge import ForgeBroker
@@ -30,6 +32,7 @@ __all__ = [
     "PACTBroker",
     "ChainCapsBroker",
     "CordonBroker",
+    "ConventionalSandboxBroker",
     "ForgeBroker",
     "AllowlistBroker",
     "ArgumentProvenanceBroker",
@@ -48,6 +51,7 @@ def run_comparison() -> dict[str, list[dict]]:
         "PACT": PACTBroker(),
         "ChainCaps": ChainCapsBroker(),
         "Cordon": CordonBroker(),
+        "ConvSandbox": ConventionalSandboxBroker(),
         "FORGE": ForgeBroker(),
         "Allowlist": AllowlistBroker(),
         "ArgProv": ArgumentProvenanceBroker(),

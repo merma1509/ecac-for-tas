@@ -37,7 +37,6 @@ ARCHITECTURE (single-path refactor):
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -238,7 +237,9 @@ class IsolatedExecutor:
                     )
                 # Don't increment send_count on failure (budget preserved)
                 if gate_result.effect.etype == "send":
-                    gate_result.task.session.increment_send_count()  # Only on success
+                    session = gate_result.task.session
+                    assert session is not None  # Task.__post_init__ always creates one
+                    session.increment_send_count()  # Only on success
             else:
                 # Effect could NOT be applied ( resource not found).
                 # Record explicit FAILED observation — NOT a block, but a failure.
@@ -459,24 +460,16 @@ class SubprocessExecutor:
             # Fall back to re-computing from metadata for compatibility.
             approved_content_hash: str | None = commit.authorized_content_hash
             if approved_content_hash is None:
-                # Fallback: re-compute from effect metadata
-                metadata = effect.metadata or {}
-                content_raw = metadata.get("content", "")
-                if isinstance(content_raw, bytes) and content_raw:
-                    approved_content_hash = hashlib.sha256(content_raw).hexdigest()
-                elif isinstance(content_raw, str) and content_raw:
-                    approved_content_hash = hashlib.sha256(
-                        content_raw.encode("utf-8")
-                    ).hexdigest()
-                elif "content_b64" in metadata:
-                    import base64
-
-                    try:
-                        b64_str = metadata["content_b64"]
-                        decoded = base64.b64decode(b64_str)  # type: ignore[arg-type]
-                        approved_content_hash = hashlib.sha256(decoded).hexdigest()
-                    except Exception:
-                        pass  # Invalid base64 — skip hash binding
+                # (multi-process content binding, all etypes): use
+                # effect.compute_content_hash(), which covers BOTH write
+                # (content / content_b64) and send (subject|body) and produces
+                # the IDENTICAL hash the subprocess recomputes in
+                # executor_subprocess._compute_effect_content_hash(). The old
+                # fallback only hashed write's metadata["content"], so SEND
+                # effects got approved_content_hash=None and the subprocess
+                # SKIPPED content verification (a gate-authorized body could be
+                # swapped). Returns None for read/delete (no content to bind).
+                approved_content_hash = effect.compute_content_hash()
 
             # APPLY_COMMIT: Fresh check + content_hash verify + apply_effect in B
             # B returns session_update with updated state (taint, used, logical_time)
@@ -549,9 +542,25 @@ class SubprocessExecutor:
         if "logical_time" in update:
             task.session.logical_time = update["logical_time"]
 
-        # Sync taint state (critical for FlowOK in subsequent commits)
-        if update.get("tainted"):
-            task.session.taint_for_send(update.get("_taint_reason", "read-confidential"))
+        # Sync taint state (critical for FlowOK in subsequent commits).
+        # PLAN_2 S2 — per-resource taint, mirrored from the subprocess (B). We
+        # absorb the subprocess's _tainted_resources so A's per-resource records
+        # stay in sync (a flat `tainted` bool would lose the resource granularity
+        # that narrow declassification needs).
+        b_resources: dict[str, dict[str, Any]] = update.get("_tainted_resources", {})
+        if b_resources:
+            for resource, rec in b_resources.items():
+                task.session.taint_for_send(
+                    resource=resource,
+                    reason=rec.get("reason", f"read-confidential({resource})"),
+                )
+        elif update.get("tainted"):
+            # Legacy flat bool from older subprocess payloads — fall back to a
+            # session-level taint keyed by "<session>".
+            task.session.taint_for_send(
+                resource="<session>",
+                reason=update.get("_taint_reason", "read-confidential"),
+            )
             # Note: taint doesn't get cleared — once tainted, always tainted
             # until broker records explicit declass exception
 
