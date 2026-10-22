@@ -17,6 +17,17 @@ whose current `pyproject.toml` version is `0.1.0`.
 - `CONTRIBUTING.md`: documented the three-branch workflow
   (`develop` → `staging` → `main`), quality gates, release/tagging process.
 - `CHANGELOG.md`: this file.
+- `.github/PULL_REQUEST_TEMPLATE.md`: PR template aligned with the workflow and
+  security-gate review.
+- `SECURITY.md`: vulnerability reporting policy for this research kernel.
+
+### Security
+
+- **Evaluation results (real runs):**
+  - Held-out: **8/8 (100%)** sealed traces blocked (SHA-256 `6e1d14c872d495bd`).
+  - Baseline comparison: **ECAC 20/20 (100%)**, next-best baseline 9/20 (45%);
+    kill criterion (ECAC ≥4 beyond PACT) passes.
+  - Adversarial experiment: **17/18** traces blocked; M4 (benign) correctly allowed.
 
 ---
 
