@@ -12,28 +12,14 @@ whose current `pyproject.toml` version is `0.1.0`.
 
 ## [Unreleased]
 
-### Added
-
-- `CONTRIBUTING.md`: documented the three-branch workflow
-  (`develop` → `staging` → `main`), quality gates, release/tagging process.
-- `CHANGELOG.md`: this file.
-- `.github/PULL_REQUEST_TEMPLATE.md`: PR template aligned with the workflow and
-  security-gate review.
-- `SECURITY.md`: vulnerability reporting policy for this research kernel.
-
-### Security
-
-- **Evaluation results (real runs):**
-  - Held-out: **8/8 (100%)** sealed traces blocked (SHA-256 `6e1d14c872d495bd`).
-  - Baseline comparison: **ECAC 20/20 (100%)**, next-best baseline 9/20 (45%);
-    kill criterion (ECAC ≥4 beyond PACT) passes.
-  - Adversarial experiment: **17/18** traces blocked; M4 (benign) correctly allowed.
+No changes since `v0.1.0`.
 
 ---
 
-## [0.1.0] - 2026-10-12
+## [0.1.0] - 2026-10-22
 
-Initial baseline of the Effect-Complete Authority Confinement (ECAC) broker.
+Initial baseline of the Effect-Complete Authority Confinement (ECAC) broker,
+including project docs and the first real evaluation results.
 
 ### Added
 
@@ -59,6 +45,13 @@ Initial baseline of the Effect-Complete Authority Confinement (ECAC) broker.
     latency percentiles, annotation burden, TCB size, session-taint honesty).
   - Held-out evaluator (8 sealed traces) and adversarial experiment runner
     (`bin/eval-*`, `experiment.py`).
+- **Project docs & workflow:**
+  - `CONTRIBUTING.md`: three-branch workflow
+    (`develop` → `staging` → `main`), quality gates, release/tagging process.
+  - `CHANGELOG.md`: this file.
+  - `.github/PULL_REQUEST_TEMPLATE.md`: PR template aligned with the workflow and
+    security-gate review.
+  - `SECURITY.md`: vulnerability reporting policy for this research kernel.
 - **Project tooling:**
   - `uv`-locked reproducible environment (`uv.lock`, `--frozen`).
   - `Makefile` targets: `lint`, `format`, `format-check`, `typecheck`, `test`,
@@ -72,12 +65,21 @@ Initial baseline of the Effect-Complete Authority Confinement (ECAC) broker.
 - Type-annotated and reformatted the codebase; `mypy` strict passes with
   zero errors across the package.
 - `mode_cordon.py`, traces, and tests reformatted to a consistent style.
+- `T4'` (SSRF-widening) now blocks via **NoAmp** (SSRF containment) instead of
+  Auth: the trace gets a permissive task ceiling via `setup_hook`, so Auth
+  passes and NoAmp's containment on the widened external target is the genuine
+  primary blocker (matches `test_noamp_flowok_edge_cases.py`).
 
 ### Security
 
 - Gate binds the check to the **primitive effect at commit time**, not the
   tool-call argument: no externally committed effect without a machine-checkable
   authority and information-flow derivation.
+- **Evaluation results (real runs):**
+  - Held-out: **8/8 (100%)** sealed traces blocked (SHA-256 `6e1d14c872d495bd`).
+  - Baseline comparison: **ECAC 20/20 (100%)**, next-best baseline 9/20 (45%);
+    kill criterion (ECAC ≥4 beyond PACT) passes.
+  - Adversarial experiment: **17/18** traces blocked; M4 (benign) correctly allowed.
 
 ---
 
