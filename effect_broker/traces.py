@@ -326,6 +326,32 @@ def _clean_effect() -> Effect:
     )
 
 
+def _permissive_ceiling(broker: EffectBroker) -> None:
+    """Override the restrictive default task ceiling with a wildcard scope.
+
+    The default ceiling in build() only admits bootstrapped resources, so a
+    network target (http://external-attacker.com) would be blocked by Auth's
+    task-bounded check before NoAmp's SSRF containment is ever reached.
+
+    T4' is meant to demonstrate SSRF *containment* (NoAmp), so Auth must pass:
+    we widen the ceiling for this trace only, mirroring the established pattern
+    in tests/test_noamp_flowok_edge_cases.py::_build(). The capability-level
+    scope restriction still drives the genuine NoAmp block.
+    """
+    task = broker.tasks.get("default")
+    if task is None:
+        raise RuntimeError("default task missing; build() must register it")
+    task.ceiling = Capability(
+        owner=USER,
+        holder=BROKER,
+        right="*",
+        target="*",
+        scope=frozenset({"*"}),
+        expiry=float("inf"),
+        nonce="t4p-permissive-ceiling",
+    )
+
+
 # Tool-boundary mediation model (T13 / T14 / T15)
 # The predicate gate decides effects proposed to the broker. It cannot see
 # the actual remote-tool behavior that the MCP/tool layer will perform from
@@ -594,6 +620,9 @@ def run_all() -> EffectBroker:
                 CHAIN,
             ),
             False,
+            # Permissive ceiling so Auth passes; NoAmp SSRF containment is the
+            # genuine primary blocker (see _permissive_ceiling docstring).
+            lambda broker: _permissive_ceiling(broker),
         ),
         # T5: capability laundering: untrusted content copied into a trusted file,
         #   then used to authorize a send. Copy does not remove taint -> FlowOK
