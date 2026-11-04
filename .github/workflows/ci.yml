@@ -5,33 +5,36 @@ on:
     branches: [main, develop]
   pull_request:
 
+# A newer commit on the same ref makes older runs obsolete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   gate:
     name: Lint + Typecheck + Test
     runs-on: ubuntu-latest
     strategy:
+      # One failing Python version must not cancel the other: both are
+      # required checks on `main`, and a cancelled job reports as skipped.
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # ---- install uv ----
+      # Pinned exactly: setup-uv does not publish a floating `v10` tag, so a
+      # major-only reference does not resolve. It also manages the uv cache
+      # itself (built-in, keyed on uv.lock via cache-dependency-glob), which is
+      # why no separate actions/cache step is needed here.
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           version: "0.11.x"
 
-      # ---- cache the uv-managed environment ----
-      - name: Cache uv environment
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/uv
-          key: uv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
-          restore-keys: |
-            uv-${{ runner.os }}-${{ matrix.python-version }}-
-
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -54,31 +57,24 @@ jobs:
       - name: Verify trace outcomes
         run: ./scripts/verify_traces.sh
 
-  # ---- Release gate: runs only on pull requests targeted at main ----
-  # The eval scripts print a report and exit 0 regardless of outcome,
-  # so we grep for the exact expected assertions and fail the job on any regression.
+  # ---- Sealed evaluation: held-out + baseline + experiment ----
+  # Runs on every event, so the sealed eval cannot silently rot between
+  # releases. On `main` it is the required "Release eval gate" check.
+  # The eval scripts print a report and exit 0 regardless of outcome, so we
+  # grep for the exact expected assertions and fail on any regression.
   eval:
     name: Release eval gate
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && github.base_ref == 'main'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           version: "0.11.x"
 
-      - name: Cache uv environment
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/uv
-          key: uv-${{ runner.os }}-3.12-${{ hashFiles('uv.lock') }}
-          restore-keys: |
-            uv-${{ runner.os }}-3.12-
-
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
