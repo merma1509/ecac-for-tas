@@ -6,11 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Versioning reflects the **EffectBroker / ECAC** package (`effect-broker`),
-whose current `pyproject.toml` version is `0.1.0`.
+whose current `pyproject.toml` version is `0.1.1`.
 
 ---
 
 ## [Unreleased]
+
+No changes since `v0.1.1`.
+
+---
+
+## [0.1.1] - 2026-11-04
 
 ### Changed
 
@@ -19,7 +25,8 @@ whose current `pyproject.toml` version is `0.1.0`.
   tags. The QA gate that `staging` used to provide is enforced by the new `eval`
   CI job, which runs on pull requests targeted at `main` (held-out, baseline
   comparison, and experiment assertions).
-- `develop` is now a protected branch (PR + green CI required), matching `main`.
+- `develop` and `main` are both protected: PR + green CI required, and `main`
+  additionally requires the `Release eval gate`.
 
 ### Added
 
@@ -36,6 +43,7 @@ whose current `pyproject.toml` version is `0.1.0`.
 - `scripts/verify_traces.sh`, `scripts/verify_eval.sh` — gate assertions shared
   by `ci.yml` and `cd.yml`, so expectations cannot drift between the two.
 - `scripts/pr_checks.sh` — PR title / changelog / size checks used by `pr.yml`.
+- `make verify` and `make eval` targets for the shared gate scripts.
 
 No deploy target and no PyPI publishing yet; both require an explicit decision.
 
@@ -108,4 +116,5 @@ including project docs and the first real evaluation results.
 
 ---
 
+[0.1.1]: https://github.com/merma1509/ecac-for-tas/releases/tag/v0.1.1
 [0.1.0]: https://github.com/merma1509/ecac-for-tas/releases/tag/v0.1.0
