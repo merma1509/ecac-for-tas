@@ -119,6 +119,8 @@ make lint          # ruff check effect_broker/ tests/
 make typecheck     # mypy (strict) effect_broker/
 make test          # pytest tests/
 make format-check  # ruff format --check (files must be formatted)
+make verify        # assert every trace's expected primary_blocker
+make eval          # release eval gate (held-out + baseline + experiment)
 ```
 
 To auto-fix formatting issues:
@@ -218,6 +220,7 @@ arbitrary modules.
 A contribution is done when **all** of these hold:
 
 - [ ] `make lint`, `make typecheck`, `make test`, `make format-check` pass.
+- [ ] `make verify` passes (trace outcomes unchanged).
 - [ ] New behavior covered by tests in `tests/`.
 - [ ] If gate/predicate semantics changed, the 22 trace outcomes still hold.
 - [ ] No secrets, absolute personal paths, or generated artifacts committed
