@@ -13,26 +13,35 @@ to production.
 
 ## 1. Branch model
 
-Three long-lived branches. Nothing else should be created or pushed directly
-without going through the workflow below.
+Two long-lived branches plus short-lived feature branches. Releases are
+identified by **tags**, not by long-lived milestone branches.
 
-| Branch    | Purpose                                   | Push policy                   | Merge policy           |
-| --------- | ----------------------------------------- | ----------------------------- | ---------------------- |
-| `main`    | **Production** — stable, deployable       | Protected (via PR only)       | PR required + CI green |
-| `staging` | **QA / testing** milestone before release | Protected (via PR only)       | PR required + CI green |
-| `develop` | **Development / draft** — day-to-day work | Direct pushes allowed (or PR) | Direct or PR           |
+| Branch      | Purpose                             | Push policy             | Merge policy           |
+| ----------- | ----------------------------------- | ----------------------- | ---------------------- |
+| `main`      | **Production** — stable, deployable | Protected (via PR only) | PR required + CI green |
+| `develop`   | **Integration** — day-to-day work   | Protected (via PR only) | PR required + CI green |
+| `feature/*` | Short-lived topic branches          | Free                    | PR into `develop`      |
 
-> `main` is the default branch and the only branch that should ever be
-> deployed or tagged for release.
+> `main` is the default branch and the only branch that is ever tagged for
+> release. Feature branches are deleted after merge.
+
+**Why no `staging` branch.** A long-lived QA branch diverges from `main` the
+moment either side advances, and keeping it in sync costs a PR per change
+(observed repeatedly in this repo's own history). The QA gate it used to
+provide is now enforced by CI instead: the `eval` job in
+`.github/workflows/ci.yml` runs only on pull requests targeted at `main`
+(held-out + baseline comparison + experiment assertions). For a frozen
+pre-release snapshot, use a release candidate tag on `develop`
+(e.g. `v0.2.0-rc.1`) rather than a branch.
 
 ---
 
 ## 2. Release flow
 
 ```bash
-feature/xyz ──PR──▶ develop ──PR──▶ staging ──PR/merge──▶ main
-                        ▲                    tests / QA
-        day-to-day work        gated evaluation before release
+feature/xyz ──PR──> develop ──PR (release)──> main ──> tag vX.Y.Z
+        ▲                │
+   day-to-day work       └── eval gate runs in CI on the release PR
 ```
 
 Detailed rules:
@@ -50,10 +59,12 @@ Detailed rules:
    - Local quality checks must pass before opening: `make lint`,
      `make typecheck`, `make test`.
 4. **Merge into `develop`** after review + green CI.
-5. **Promote to `staging`** with a PR from `develop` → `staging`.
-   - Run the evaluation suite here: `make held-out`, `make comparative`.
-6. **QA on `staging`.** If QA passes, promote `staging` → `main` via PR
-   (or merge after review).
+5. **Open a release PR** from `develop` --> `main`.
+   - This PR additionally runs the **eval gate** (`held-out`, `comparative`,
+     `experiment` assertions) — the QA step that used to happen on `staging`.
+   - Review the eval output in the CI log; it must show the sealed traces
+     blocked, the baseline advantage, and the benign case allowed.
+6. **Merge the release PR** once CI (including eval) is green.
 7. **Tag the release** on `main`:
    ```bash
    git checkout main
@@ -129,6 +140,18 @@ Runs on every PR and on push to `main`:
   gate semantics, this step must still produce the expected `primary_blocker`
   values.
 
+A second job, **`eval`**, runs **only on pull requests targeted at `main`** —
+this is the release gate that replaces the old `staging` QA step:
+
+- `bin/eval-held-out` — asserts **8/8** sealed traces are blocked.
+- `bin/eval-baseline` — asserts ECAC blocks **20/20** and the kill criterion
+  (`ECAC >= 4 beyond PACT`) passes.
+- `bin/eval-experiment` — asserts **17/18** traces blocked and the benign case
+  (M4) is allowed.
+
+Because these scripts print a report but exit `0` regardless of outcome, the CI
+job greps the output for the expected assertions; a regression fails the job.
+
 > If you change security-relevant code (predicates, gate, models), add or
 > update tests in `tests/` that demonstrate the behavior, and run the trace
 > assertion step locally: `make run | grep -E "T[0-9]+"`.
@@ -180,13 +203,12 @@ A contribution is done when **all** of these hold:
 
 ---
 
-## 9. Protected branches & admin
-
-- `main` and `staging` are **protected**: direct pushes are disabled; changes
-  arrive via PR with required checks.
+- `main` and `develop` are **protected**: direct pushes are disabled; changes
+  arrive via PR with required checks (lint + typecheck + test + trace outcomes).
 - Repository admins configure branch protection via
-  **GitHub → Settings → Branches → Branch protection rules**.
-- Release tags are created only on `main`, after QA on `staging`.
+  **Settings -> Branches -> Branch protection rules**.
+- Release tags are created only on `main`, after the eval gate on the release PR
+  has passed.
 
 ---
 

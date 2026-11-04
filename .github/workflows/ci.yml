@@ -75,3 +75,59 @@ jobs:
           grep -q "T19 memory-poisoned.*primary_blocker=FlowOK" /tmp/traces.txt
           grep -q "T20 amplification-composition.*primary_blocker=Auth" /tmp/traces.txt
           echo "trace outcomes OK (22 traces)"
+
+  # ---- Release gate: runs only on pull requests targeted at main ----
+  # The eval scripts print a report and exit 0 regardless of outcome,
+  # so we grep for the exact expected assertions and fail the job on any regression.
+  eval:
+    name: Release eval gate
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.x"
+
+      - name: Cache uv environment
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-3.12-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-3.12-
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (frozen lock)
+        run: uv sync --frozen --all-extras --dev
+
+      # ---- held-out: 8 sealed traces must all be blocked ----
+      - name: Held-out evaluation (8 sealed traces)
+        run: |
+          uv run python bin/eval-held-out | tee /tmp/held-out.txt
+          grep -q "Blocked (safe): 8/8 (100%)" /tmp/held-out.txt
+          grep -q "High-severity: 6/6 defended" /tmp/held-out.txt
+          grep -q "Traces SHA-256: 6e1d14c872d495bd" /tmp/held-out.txt
+          echo "held-out OK (8/8 blocked, sealed hash intact)"
+
+      # ---- baseline comparison: ECAC 20/20, kill criterion passes ----
+      - name: Baseline comparison (ECAC vs 7 baselines)
+        run: |
+          uv run python bin/eval-baseline | tee /tmp/baseline.txt
+          grep -q "ECAC blocks 20/20 traces" /tmp/baseline.txt
+          grep -q "Kill criterion (ECAC ≥4 beyond PACT): PASS" /tmp/baseline.txt
+          echo "baseline OK (ECAC 20/20, kill criterion PASS)"
+
+      # ---- adversarial experiment: 17/18 blocked, benign M4 allowed ----
+      - name: Adversarial experiment
+        run: |
+          uv run python bin/eval-experiment | tee /tmp/experiment.txt
+          grep -q "17/18 traces blocked" /tmp/experiment.txt
+          grep -q "M4 (benign tool): PASS" /tmp/experiment.txt
+          echo "experiment OK (17/18 blocked, benign M4 allowed)"
