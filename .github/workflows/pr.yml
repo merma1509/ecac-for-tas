@@ -16,7 +16,7 @@ jobs:
     name: PR title (conventional)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check title format
         env:
           TITLE: ${{ github.event.pull_request.title }}
@@ -28,7 +28,10 @@ jobs:
     name: Changelog entry
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Safe under pull_request_target@v7: checkout@v7 refuses to check out
+      # *fork* code in this context, but `base.sha` always resolves to the base
+      # repository's own commit, never to the PR head.
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
@@ -45,7 +48,7 @@ jobs:
     name: PR size (advisory)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Report size
