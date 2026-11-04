@@ -127,49 +127,83 @@ To auto-fix formatting issues:
 make format        # ruff format + ruff check --fix
 ```
 
-### CI pipeline (`.github/workflows/ci.yml`)
+### Workflows (`.github/workflows/`)
 
-Runs on every PR and on push to `main`:
+Three workflow files with non-overlapping responsibilities:
+
+| File     | Trigger                                | Purpose                                     |
+| -------- | -------------------------------------- | ------------------------------------------- |
+| `ci.yml` | every PR, push to `main` and `develop` | quality gate + eval gate on `main` PRs      |
+| `pr.yml` | PR metadata events                     | PR hygiene: title, changelog, size advisory |
+| `cd.yml` | push of a `v*` tag                     | validate tag, re-run gates, publish release |
+
+**`ci.yml`** — the quality gate. Runs on every PR and on push to `main` /
+`develop`:
 
 - `uv sync --frozen --all-extras --dev` (reproducible install)
 - `ruff check .` (lint)
 - `mypy effect_broker` (strict typecheck)
 - `pytest` (full suite)
-- **Trace outcome verification** — runs `run_traces.py` and asserts the exact
-  expected blocker per trace (T1–T20, 22 traces). If your change touches the
+- **Trace outcome verification** via `scripts/verify_traces.sh` — asserts the
+  exact expected blocker per trace (T1–T20, 22 traces). If your change touches
   gate semantics, this step must still produce the expected `primary_blocker`
   values.
 
 A second job, **`eval`**, runs **only on pull requests targeted at `main`** —
-this is the release gate that replaces the old `staging` QA step:
+this is the release gate that replaces the old `staging` QA step, executed by
+`scripts/verify_eval.sh`:
 
-- `bin/eval-held-out` — asserts **8/8** sealed traces are blocked.
-- `bin/eval-baseline` — asserts ECAC blocks **20/20** and the kill criterion
+- held-out — asserts **8/8** sealed traces are blocked.
+- baseline — asserts ECAC blocks **20/20** and the kill criterion
   (`ECAC >= 4 beyond PACT`) passes.
-- `bin/eval-experiment` — asserts **17/18** traces blocked and the benign case
-  (M4) is allowed.
+- experiment — asserts **17/18** traces blocked and the benign case (M4) is
+  allowed.
 
-Because these scripts print a report but exit `0` regardless of outcome, the CI
-job greps the output for the expected assertions; a regression fails the job.
+The eval scripts print a report but exit `0` regardless of outcome, so the
+script greps for the expected assertions; a regression fails the job.
+
+**`pr.yml`** — PR hygiene, on `pull_request_target` (metadata only, no PR code
+is executed):
+
+- **title** — must follow `<type>(<scope>): <summary>` (blocking).
+- **changelog** — a PR touching `effect_broker/`, `tests/`, `bin/` or `scripts/`
+  must add a line under `## [Unreleased]` in `CHANGELOG.md`. Opt out with the
+  `skip-changelog` label for genuinely internal changes (blocking).
+- **size** — posts a one-time advisory comment above 20 files / 400 changed
+  lines. Never blocking.
+
+**`cd.yml`** — release pipeline, triggered by pushing a `v*` tag:
+
+1. **validate** — the tag must be an ancestor of `main`, must match the
+   `pyproject.toml` version (release candidates map to the version they
+   precede), and `CHANGELOG.md` must have a `## [<version>]` section.
+2. **gate** — lint, typecheck, pytest, `verify_traces.sh`, `verify_eval.sh`.
+3. **release** — `uv build`, then attach wheel + sdist to a GitHub Release whose
+   notes are the changelog section for that version. `-rc.` tags are marked as
+   prereleases.
+
+There is **no deploy step and no PyPI publishing**: both need an explicit
+decision and credentials. Adding one is a deliberate change to `cd.yml`.
 
 > If you change security-relevant code (predicates, gate, models), add or
 > update tests in `tests/` that demonstrate the behavior, and run the trace
-> assertion step locally: `make run | grep -E "T[0-9]+"`.
+> assertion step locally: `./scripts/verify_traces.sh`.
 
 ---
 
 ## 6. What to touch where
 
-| Area                                 | Location                                     |
-| ------------------------------------ | -------------------------------------------- |
-| Broker / gate / commit semantics     | `effect_broker/broker.py`, `model.py`        |
-| Filesystem / process confinement     | `effect_broker/enforcer.py`, `executor*.py`  |
-| Resource store & bootstrap           | `effect_broker/restricted_store.py`          |
-| Baselines (CaMeL, PACT, Cordon, ...) | `effect_broker/baselines/`                   |
-| Trace suite & evaluators             | `bin/`, `run_traces.py`                      |
-| Metrics / evaluation report          | `effect_broker/metrics.py`                   |
-| Tests                                | `tests/` (mirror `effect_broker/`)           |
-| Docs / proposal                      | `README.md`, `docs/`, `research_proposal.md` |
+| Area                                 | Location                                      |
+| ------------------------------------ | --------------------------------------------- |
+| Broker / gate / commit semantics     | `effect_broker/broker.py`, `model.py`         |
+| Filesystem / process confinement     | `effect_broker/enforcer.py`, `executor*.py`   |
+| Resource store & bootstrap           | `effect_broker/restricted_store.py`           |
+| Baselines (CaMeL, PACT, Cordon, ...) | `effect_broker/baselines/`                    |
+| Trace suite & evaluators             | `bin/`, `run_traces.py`                       |
+| Gate assertions used by CI/CD        | `scripts/verify_*.sh`, `scripts/pr_checks.sh` |
+| Metrics / evaluation report          | `effect_broker/metrics.py`                    |
+| Tests                                | `tests/` (mirror `effect_broker/`)            |
+| Docs / proposal                      | `README.md`, `docs/`, `research_proposal.md`  |
 
 **Traces** live in `effect_broker/traces.py` and
 `effect_broker/baselines/traces.py` and are structured data (scenarios with

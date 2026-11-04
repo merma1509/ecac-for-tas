@@ -21,6 +21,24 @@ whose current `pyproject.toml` version is `0.1.0`.
   comparison, and experiment assertions).
 - `develop` is now a protected branch (PR + green CI required), matching `main`.
 
+### Added
+
+- **Workflow suite:** split CI/CD into three non-overlapping files:
+  - `ci.yml` — quality gate on all PRs and pushes to `main`/`develop`, plus the
+    `eval` release gate on `main`-targeted PRs.
+  - `pr.yml` — PR hygiene on `pull_request_target`: conventional title check,
+    changelog gate (opt out with the `skip-changelog` label), and a non-blocking
+    size advisory.
+  - `cd.yml` — release pipeline on `v*` tags: validates that the tag is on
+    `main`, matches the `pyproject.toml` version, and is documented in the
+    changelog; re-runs all gates; builds sdist + wheel and attaches them to a
+    GitHub Release with notes taken from the changelog.
+- `scripts/verify_traces.sh`, `scripts/verify_eval.sh` — gate assertions shared
+  by `ci.yml` and `cd.yml`, so expectations cannot drift between the two.
+- `scripts/pr_checks.sh` — PR title / changelog / size checks used by `pr.yml`.
+
+No deploy target and no PyPI publishing yet; both require an explicit decision.
+
 ---
 
 ## [0.1.0] - 2026-10-22
