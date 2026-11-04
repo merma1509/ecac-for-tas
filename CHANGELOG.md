@@ -69,13 +69,14 @@ including project docs and the first real evaluation results.
   - `metrics.py`: §6 evaluation metrics (defense rate, per-mechanism breakdown,
     latency percentiles, annotation burden, TCB size, session-taint honesty).
   - Held-out evaluator (8 sealed traces) and adversarial experiment runner
+    (`bin/eval-*`, `experiment.py`).
+- **Project docs & workflow:**
   - `CONTRIBUTING.md`: branch workflow (`develop` -> `main`, short-lived
     `feature/*`, releases via tags), quality gates, release/tagging process.
   - `CHANGELOG.md`: this file.
   - `.github/PULL_REQUEST_TEMPLATE.md`: PR template aligned with the workflow and
     security-gate review.
   - `SECURITY.md`: vulnerability reporting policy for this research kernel.
-
 - **Project tooling:**
   - `uv`-locked reproducible environment (`uv.lock`, `--frozen`).
   - `Makefile` targets: `lint`, `format`, `format-check`, `typecheck`, `test`,
