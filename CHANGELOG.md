@@ -12,7 +12,32 @@ whose current `pyproject.toml` version is `0.1.0`.
 
 ## [Unreleased]
 
-No changes since `v0.1.0`.
+### Changed
+
+- **Branch model simplified:** dropped the long-lived `staging` branch. The
+  workflow is now `feature/*` -> `develop` -> `main`, with releases identified by
+  tags. The QA gate that `staging` used to provide is enforced by the new `eval`
+  CI job, which runs on pull requests targeted at `main` (held-out, baseline
+  comparison, and experiment assertions).
+- `develop` is now a protected branch (PR + green CI required), matching `main`.
+
+### Added
+
+- **Workflow suite:** split CI/CD into three non-overlapping files:
+  - `ci.yml` — quality gate on all PRs and pushes to `main`/`develop`, plus the
+    `eval` release gate on `main`-targeted PRs.
+  - `pr.yml` — PR hygiene on `pull_request_target`: conventional title check,
+    changelog gate (opt out with the `skip-changelog` label), and a non-blocking
+    size advisory.
+  - `cd.yml` — release pipeline on `v*` tags: validates that the tag is on
+    `main`, matches the `pyproject.toml` version, and is documented in the
+    changelog; re-runs all gates; builds sdist + wheel and attaches them to a
+    GitHub Release with notes taken from the changelog.
+- `scripts/verify_traces.sh`, `scripts/verify_eval.sh` — gate assertions shared
+  by `ci.yml` and `cd.yml`, so expectations cannot drift between the two.
+- `scripts/pr_checks.sh` — PR title / changelog / size checks used by `pr.yml`.
+
+No deploy target and no PyPI publishing yet; both require an explicit decision.
 
 ---
 
@@ -44,14 +69,13 @@ including project docs and the first real evaluation results.
   - `metrics.py`: §6 evaluation metrics (defense rate, per-mechanism breakdown,
     latency percentiles, annotation burden, TCB size, session-taint honesty).
   - Held-out evaluator (8 sealed traces) and adversarial experiment runner
-    (`bin/eval-*`, `experiment.py`).
-- **Project docs & workflow:**
-  - `CONTRIBUTING.md`: three-branch workflow
-    (`develop` → `staging` → `main`), quality gates, release/tagging process.
+  - `CONTRIBUTING.md`: branch workflow (`develop` -> `main`, short-lived
+    `feature/*`, releases via tags), quality gates, release/tagging process.
   - `CHANGELOG.md`: this file.
   - `.github/PULL_REQUEST_TEMPLATE.md`: PR template aligned with the workflow and
     security-gate review.
   - `SECURITY.md`: vulnerability reporting policy for this research kernel.
+
 - **Project tooling:**
   - `uv`-locked reproducible environment (`uv.lock`, `--frozen`).
   - `Makefile` targets: `lint`, `format`, `format-check`, `typecheck`, `test`,

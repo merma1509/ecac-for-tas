@@ -1,0 +1,58 @@
+name: PR
+
+# Pull-request hygiene. Deliberately limited to metadata and repository files:
+# no PR-authored code is executed here, so `pull_request_target` is safe.
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ---- conventional commit title: type(scope): summary ----
+  title:
+    name: PR title (conventional)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check title format
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: ./scripts/pr_checks.sh title "$TITLE" "$PR_NUMBER"
+
+  # ---- changelog gate: package changes must be recorded ----
+  changelog:
+    name: Changelog entry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+      - name: Fetch PR head
+        run: git fetch --no-tags origin "pull/${{ github.event.pull_request.number }}/head:pr-head"
+      - name: Check changelog
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: ./scripts/pr_checks.sh changelog "$BASE_SHA" pr-head
+
+  # ---- size advisory: never blocking, just a heads-up ----
+  size:
+    name: PR size (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Report size
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          git fetch --no-tags origin "pull/$PR_NUMBER/head:pr-head"
+          ./scripts/pr_checks.sh size "$BASE_SHA" pr-head "$PR_NUMBER"

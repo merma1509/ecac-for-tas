@@ -13,9 +13,8 @@
 
 <!-- Which branch should this land in? Default: develop. (REQUIRED) -->
 
-- [ ] `develop` (development / draft)
-- [ ] `staging` (QA / testing milestone)
-- [ ] `main` (production release)
+- [ ] `develop` (integration / day-to-day work)
+- [ ] `main` (production release — runs the eval gate)
 
 ## Type of change
 

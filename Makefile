@@ -4,7 +4,7 @@
 SHELL := /bin/sh
 export PYTHONUNBUFFERED := 1
 
-.PHONY: help all setup install sync lint format format-check typecheck test held-out comparative experiment run doctor clean
+.PHONY: help all setup install sync lint format format-check typecheck test held-out comparative experiment run doctor clean verify eval
 
 help:
 	@echo "EffectBroker — available targets:"
@@ -56,6 +56,12 @@ experiment: ## Run real adversarial tool experiment (M1-M5, H1-H3, T9-T20)
 run: ## Run the trace suite (T1-T20 + R1)
 	@echo "=== TRACES (T1-T20 + R1) ==="
 	@uv run python -m effect_broker
+
+verify: ## Assert every trace's expected primary_blocker (same check CI runs)
+	@./scripts/verify_traces.sh
+
+eval: ## Run the release eval gate (held-out + baseline + experiment assertions)
+	@./scripts/verify_eval.sh
 
 doctor: ## Show reproducible env status
 	@echo "uv:        $$(uv --version 2>/dev/null || echo MISSING)"

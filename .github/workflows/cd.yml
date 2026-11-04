@@ -1,0 +1,174 @@
+name: CD
+
+# Release pipeline. Triggered only by an annotated tag pushed to the repository,
+# which is the sole way a release is created (see CONTRIBUTING.md).
+#
+# Guards, in order:
+#   1. the tag must point at a commit contained in `main`
+#   2. the tag must match the version in pyproject.toml
+#   3. the full quality gate and the sealed eval gate must pass
+#   4. only then is the artifact built and attached to a GitHub Release
+#
+# There is no deployment target yet (research kernel), and no PyPI publishing:
+# both would need an explicit decision and credentials.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  # ---- refuse tags that do not belong to main or disagree with the version ----
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A release must describe code that actually lives on main. This blocks
+      # tagging an arbitrary feature branch commit and calling it a release.
+      - name: Tag must be an ancestor of main
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag $GITHUB_REF_NAME ($GITHUB_SHA) is not contained in main"
+            exit 1
+          fi
+          echo "tag commit is on main"
+
+      # The tag is the release identity; it must agree with the package version.
+      - name: Tag must match pyproject version
+        id: version
+        run: |
+          pkg="$(grep -E '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)"
+          tag="${GITHUB_REF_NAME#v}"
+          echo "package version: $pkg"
+          echo "tag version:     $tag"
+
+          # Release candidates map to the release version they precede.
+          case "$tag" in
+          *-rc.*)
+              if [ "${tag%%-rc.*}" != "$pkg" ]; then
+                  echo "::error::tag ${GITHUB_REF_NAME} does not match version $pkg"
+                  exit 1
+              fi
+              ;;
+          *)
+              if [ "$tag" != "$pkg" ]; then
+                  echo "::error::tag ${GITHUB_REF_NAME} does not match version $pkg"
+                  exit 1
+              fi
+              ;;
+          esac
+
+          echo "version=$pkg" >>"$GITHUB_OUTPUT"
+
+      - name: Changelog must document this version
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+              echo "::error::CHANGELOG.md has no '## [$version]' section"
+              exit 1
+          fi
+          echo "changelog documents $version"
+
+  # ---- full quality gate on the released commit ----
+  gate:
+    name: Release gate
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.x"
+
+      - name: Cache uv environment
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-3.12-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-3.12-
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (frozen lock)
+        run: uv sync --frozen --all-extras --dev
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Type-check (mypy, strict)
+        run: uv run mypy effect_broker
+
+      - name: Test (pytest)
+        run: uv run pytest
+
+      - name: Verify trace outcomes
+        run: ./scripts/verify_traces.sh
+
+      - name: Sealed evaluation gates
+        run: ./scripts/verify_eval.sh
+
+  # ---- build and publish the GitHub Release with attached artifacts ----
+  release:
+    name: Build & publish release
+    needs: [validate, gate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.x"
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Verify artifacts
+        run: |
+          ls -l dist/
+          # A wheel and an sdist, named after the package version.
+          ls dist/*.whl dist/*.tar.gz
+          echo "artifacts built for ${{ needs.validate.outputs.version }}"
+
+      # Release notes come from the changelog section for this version.
+      - name: Extract changelog section
+        run: |
+          version="${{ needs.validate.outputs.version }}"
+          awk -v v="$version" '
+              $0 ~ "^## \\[" v "\\]" {flag=1; next}
+              flag && /^## \[/ {exit}
+              flag {print}
+          ' CHANGELOG.md > release-notes.md
+
+          if [ ! -s release-notes.md ]; then
+              echo "::warning::empty changelog section for $version"
+          fi
+          cat release-notes.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc.') }}
+          fail_on_unmatched_files: true
