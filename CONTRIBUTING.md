@@ -29,7 +29,7 @@ identified by **tags**, not by long-lived milestone branches.
 moment either side advances, and keeping it in sync costs a PR per change
 (observed repeatedly in this repo's own history). The QA gate it used to
 provide is now enforced by CI instead: the `eval` job in
-`.github/workflows/ci.yml` runs only on pull requests targeted at `main`
+`.github/workflows/ci.yml` runs on every push and every pull request
 (held-out + baseline comparison + experiment assertions). For a frozen
 pre-release snapshot, use a release candidate tag on `develop`
 (e.g. `v0.2.0-rc.1`) rather than a branch.
@@ -41,7 +41,7 @@ pre-release snapshot, use a release candidate tag on `develop`
 ```bash
 feature/xyz ──PR──> develop ──PR (release)──> main ──> tag vX.Y.Z
         ▲                │
-   day-to-day work       └── eval gate runs in CI on the release PR
+   day-to-day work       └── eval gate runs on every PR and push
 ```
 
 Detailed rules:
@@ -60,8 +60,9 @@ Detailed rules:
      `make typecheck`, `make test`.
 4. **Merge into `develop`** after review + green CI.
 5. **Open a release PR** from `develop` --> `main`.
-   - This PR additionally runs the **eval gate** (`held-out`, `comparative`,
-     `experiment` assertions) — the QA step that used to happen on `staging`.
+   - The **eval gate** (`held-out`, `comparative`, `experiment` assertions) has
+     already run on this branch, but it is additionally a required status check
+     on `main`, so it will run again on the release PR.
    - Review the eval output in the CI log; it must show the sealed traces
      blocked, the baseline advantage, and the benign case allowed.
 6. **Merge the release PR** once CI (including eval) is green.
@@ -135,7 +136,7 @@ Three workflow files with non-overlapping responsibilities:
 
 | File     | Trigger                                | Purpose                                     |
 | -------- | -------------------------------------- | ------------------------------------------- |
-| `ci.yml` | every PR, push to `main` and `develop` | quality gate + eval gate on `main` PRs      |
+| `ci.yml` | every PR, push to `main` and `develop` | quality gate + sealed eval gate             |
 | `pr.yml` | PR metadata events                     | PR hygiene: title, changelog, size advisory |
 | `cd.yml` | push of a `v*` tag                     | validate tag, re-run gates, publish release |
 
@@ -151,9 +152,11 @@ Three workflow files with non-overlapping responsibilities:
   gate semantics, this step must still produce the expected `primary_blocker`
   values.
 
-A second job, **`eval`**, runs **only on pull requests targeted at `main`** —
-this is the release gate that replaces the old `staging` QA step, executed by
-`scripts/verify_eval.sh`:
+A second job, **`eval`**, runs on **every push and every pull request** and is
+the release gate that replaced the old `staging` QA step, executed by
+`scripts/verify_eval.sh`. Running it everywhere means the sealed evaluation
+cannot silently rot between releases; on `main` it is the required
+`Release eval gate` status check:
 
 - held-out — asserts **8/8** sealed traces are blocked.
 - baseline — asserts ECAC blocks **20/20** and the kill criterion

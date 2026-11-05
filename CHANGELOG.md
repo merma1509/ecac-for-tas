@@ -12,7 +12,31 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ## [Unreleased]
 
-No changes since `v0.1.1`.
+### Changed
+
+- **CI no longer skips the sealed eval.** The `Release eval gate` job used to
+  carry `if: github.event_name == 'pull_request' && github.base_ref == 'main'`,
+  so it reported as _skipped_ on every push to `develop`/`main` and on every PR
+  targeting `develop`. It now runs on every push and every pull request, so the
+  sealed evaluation is exercised continuously instead of only at release time.
+  On `main` it remains the required `Release eval gate` status check.
+- `gate` matrix sets `fail-fast: false`: a failing Python version no longer
+  cancels its sibling, which previously surfaced as a _skipped_ required check.
+- Added a `concurrency` group to `ci.yml`: a newer commit on the same ref
+  cancels superseded runs.
+
+### Removed
+
+- The explicit `actions/cache` step for `~/.cache/uv` in all jobs. It duplicated
+  the cache that `astral-sh/setup-uv` already manages internally (same path,
+  same `uv.lock`-based key), so it only added a second, redundant cache entry.
+
+### Fixed
+
+- Action runtime warnings from the Node.js 20 deprecation. All actions moved to
+  Node 24 lines: `actions/checkout@v7`, `actions/cache` (dropped),
+  `actions/setup-python@v7`, `astral-sh/setup-uv@v10.3.3` (pinned exactly — no
+  floating `v10` tag exists), `softprops/action-gh-release@v3`.
 
 ---
 
