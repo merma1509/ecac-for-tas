@@ -15,7 +15,11 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .experiment import print_results, run_all_experiments
+from .experiment import (
+    collect_outcome_counts,
+    print_outcome_counts,
+    print_results,
+)
 
 
 def main() -> None:
@@ -48,8 +52,9 @@ def main() -> None:
     if not args.warn_same_process:
         warnings.filterwarnings("ignore", message="SAME-PROCESS", category=UserWarning)
 
-    results = run_all_experiments()
+    results, counts = collect_outcome_counts()
     print_results(results)
+    print_outcome_counts(counts)
     sys.stdout.flush()
 
     if args.verbose:
@@ -62,8 +67,31 @@ def main() -> None:
             if result.replay_blocked:
                 print(f"    replay_blocked={result.replay_blocked}")
 
-    # Exit code: 0 if all passed, 1 if any failed
-    all_passed = all(r.mediation_complete for r in results.values())
+    # Exit code: 0 only if every result was EVALUATED and passed.
+    #
+    # The old form was `all(r.mediation_complete ...)`, which treated an
+    # unevaluated result as a pass the moment the field was defaulted to True,
+    # and would treat None as failure-by-accident otherwise. "Did not check" is
+    # neither pass nor fail; making it a separate condition forces the missing
+    # check to be visible instead of silently green.
+    unevaluated = [n for n, r in results.items() if not r.mediation_evaluated]
+    failed = [
+        n
+        for n, r in results.items()
+        if r.mediation_evaluated and r.mediation_complete is False
+    ]
+    all_passed = not unevaluated and not failed
+    if unevaluated:
+        print(f"NOT EVALUATED ({len(unevaluated)}): mediation was never checked")
+        for n in unevaluated:
+            print(f"  - {n}")
+    if failed:
+        print(f"MEDIATION INCOMPLETE ({len(failed)}):")
+        for n in failed:
+            result = results[n]
+            print(f"  - {n}")
+            for failure in result.mediation_failures:
+                print(f"      {failure}")
     sys.exit(0 if all_passed else 1)
 
 
