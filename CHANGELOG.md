@@ -22,6 +22,19 @@ whose current `pyproject.toml` version is `0.1.1`.
   for deriving output labels from inputs, with the transform identities pinned
   by tests.
 
+- **Effect states and evidence** (`model.py`). `EffectState`,
+  `ALLOWED_TRANSITIONS`, `can_transition()`, and `EffectEvidence` — the last
+  makes an unbacked `committed` state unconstructible, so a commit claim must
+  carry what backs it. `PostAuthorizationFailure` replaces the "security event"
+  mislabel for failures that happen after an effect was authorized.
+
+- **In-flight marker** (`ledger.py`). `record_dispatched()` / `was_dispatched()`
+  record that an effect was handed to the OS or the network before it is
+  observed, and `verify()` distinguishes "dispatched, never observed" from
+  "never dispatched". Without it a crash mid-operation is indistinguishable from
+  an effect that was never attempted. Written before the I/O at all three shim
+  call sites.
+
 ### Changed
 
 - **TCB size counts code, not comments.** `_count_code_lines` strips comments
