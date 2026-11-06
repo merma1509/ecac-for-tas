@@ -55,7 +55,15 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ## [0.1.1] - 2026-11-04
 
-### Changed
+### Fixed
+
+- **IPC payload fields are required.** `_require_field` makes a missing field
+  fail loudly instead of deserializing to `None` and continuing with a value
+  that looks legitimate.
+
+- **Label exceptions survive the IPC boundary.** `label_exception_to_dict` /
+  `dict_to_label_exception` carry the structured reason across instead of
+  degrading it to a string.
 
 - **Branch model simplified:** dropped the long-lived `staging` branch. The
   workflow is now `feature/*` -> `develop` -> `main`, with releases identified by
