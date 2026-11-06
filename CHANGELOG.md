@@ -65,6 +65,21 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ### Fixed
 
+- **A commit claim for a file effect is now backed by the syscall.** In
+  same-process mode `executor.apply` was recorded inside `broker.commit()`,
+  which runs _before_ the shim opens the file — so the ledger read "applied"
+  for a write that had not happened yet, and reported `CONFIRMED_COMMITTED` for
+  a read whose `open()` had raised. `RealFileShim` now records `EffectEvidence`
+  after the syscall: the size is read back with `stat()` rather than taken from
+  the request, a delete is only committed if the target is actually gone, and
+  every failure path leaves `unknown` evidence before raising. `ledger.verify()`
+  lets evidence veto a bare observation, so the executor can no longer satisfy
+  a commit with its own assertion.
+
+  Scope: the same-process path only. The IPC path still relies on the
+  subprocess response, which is a real observation but is not yet converted
+  into `EffectEvidence`.
+
 - **Mediation verdicts are checked, not inferred.** Eighteen sites wrote
   `mediation_complete=not actual_allow` — "the effect was blocked, so mediation
   must be complete". That is inverted in its effect: the more successfully the
