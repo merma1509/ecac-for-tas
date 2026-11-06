@@ -12,7 +12,17 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ## [Unreleased]
 
+### Added
+
+- **Metrics tripwire** (`scripts/metrics_snapshot.py`). Compares two metric
+  snapshots and exits non-zero on regression, so a change that slows the gate
+  path gets caught by CI instead of being noticed later.
+
 ### Changed
+
+- **TCB size counts code, not comments.** `_count_code_lines` strips comments
+  and blank lines, so the reported TCB figure reflects logic rather than
+  documentation volume.
 
 - **CI no longer skips the sealed eval.** The `Release eval gate` job used to
   carry `if: github.event_name == 'pull_request' && github.base_ref == 'main'`,
