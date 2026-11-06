@@ -40,7 +40,7 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    pass
+    from .model import EffectEvidence
 
 
 #: Reason prefix for an effect that was dispatched but never observed.
@@ -111,6 +111,9 @@ class IndependentEffectLedger:
     _observations: dict[tuple[str, str], list[LedgerEntry]] = field(default_factory=dict)
     # IN_FLIGHT markers: written before the real I/O, never an outcome claim.
     _dispatched: dict[tuple[str, str], list[LedgerEntry]] = field(default_factory=dict)
+    # Executor-produced evidence that the real I/O happened. Separate from
+    # _observations because an observation is a claim and this is a measurement.
+    _evidences: dict[tuple[str, str], list[EffectEvidence]] = field(default_factory=dict)
     _counter: int = field(default=0)
     _logical_time: float = 0.0
 
@@ -271,6 +274,44 @@ class IndependentEffectLedger:
             self._observations[key] = []
         self._observations[key].append(entry)
 
+    def record_evidence(self, task_id: str, nonce: str, evidence: EffectEvidence) -> None:
+        """Record executor-produced evidence that the real I/O happened.
+
+        Distinct from record_observation() on purpose. An observation is the
+        executor saying "I applied it"; evidence is a measurement taken at the
+        transport boundary (bytes written, fsync result, observed targets). The
+        ledger keeps them apart so that a verdict can require the second and not
+        be satisfied by the first.
+
+        Evidence never changes the effect count. verify() counts observations
+        against authorizations, so adding a second observation for the same
+        nonce would trip the over-observed check; evidence is attached to the
+        existing occurrence instead.
+
+        Only terminal evidence is accepted. A dispatch marker already covers
+        "in flight", and accepting a non-terminal claim here would give two
+        competing ways to say the same thing.
+        """
+        if evidence.outcome not in ("committed", "failed", "unknown", "denied"):
+            raise ValueError(f"not a terminal outcome: {evidence.outcome!r}")
+        key = (task_id, nonce)
+        if key not in self._evidences:
+            self._evidences[key] = []
+        self._evidences[key].append(evidence)
+
+    def evidence_for(self, task_id: str, nonce: str) -> EffectEvidence | None:
+        """The evidence backing this effect, if any was recorded.
+
+        Returns the first COMMITTED piece of evidence in preference to others:
+        if any observation proved the effect landed, that is the outcome, and
+        later ambiguity must not erase it.
+        """
+        entries = self._evidences.get((task_id, nonce), [])
+        for ev in entries:
+            if ev.outcome == "committed":
+                return ev
+        return entries[0] if entries else None
+
     # ---- Verification API (the ONLY way to get verdicts) ----
     def verify(self, task_id: str, nonce: str) -> LedgerVerdict | UnknownLedgerResult:
         """Verify mediation for a single (task_id, nonce).
@@ -383,6 +424,16 @@ class IndependentEffectLedger:
                         reason=f"extra_observed(task={task_id},nonce={nonce},"
                         f"extra={extra},authorized={authorized_targets})"
                     )
+            # Evidence, when the executor supplies it, outranks the claim.
+            # a commit must be backed by something measured
+            # at the boundary, not by the executor asserting its own success.
+            # When evidence exists and does NOT say committed, the claim loses.
+            backing = self.evidence_for(task_id, nonce)
+            if backing is not None and backing.outcome != "committed":
+                return UnknownLedgerResult(
+                    reason=f"evidence_contradicts_observation(task={task_id},"
+                    f"nonce={nonce},evidence_outcome={backing.outcome})"
+                )
             # Check occurrence count: obs_count > auth_count is only a problem
             # when ALL observations are committed (no BLOCKED entries).
             # When BLOCKED entries exist, they don't count toward the limit
@@ -532,6 +583,16 @@ class IndependentEffectLedger:
             e.source in _DENYING_SOURCES or e.source.startswith("shim.") for e in obs_entries
         ):
             return OUTCOME_DENIED
+        # No observation source decided it. Fall back to the evidence, which is
+        # a measurement rather than a claim -- and which, unlike a source string,
+        # cannot be produced by the executor guessing about its own success.
+        evidence = self.evidence_for(task_id, nonce)
+        if evidence is not None:
+            return {
+                "committed": OUTCOME_COMMITTED,
+                "failed": OUTCOME_FAILED,
+                "denied": OUTCOME_DENIED,
+            }.get(evidence.outcome, OUTCOME_UNKNOWN)
         return OUTCOME_UNKNOWN
 
     def outcome_counts(self) -> OutcomeCounts:
@@ -565,6 +626,8 @@ class IndependentEffectLedger:
         """Clear all entries. Use with caution (testing only in same-process model)."""
         self._authorizations.clear()
         self._observations.clear()
+        self._dispatched.clear()
+        self._evidences.clear()
         self._logical_time = 0.0
 
 
@@ -816,3 +879,5 @@ class PeriodicAuditor:
 EffectObserver = IndependentEffectLedger
 UnknownObserverResult = UnknownLedgerResult
 EffectObserverVerdict = LedgerVerdict
+
+
