@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from .lattice import Confidentiality, Integrity
 from .model import Commit, Data, Effect, EffectTarget
+from .shim_email import PostAuthorizationFailure
 
 if TYPE_CHECKING:
     from .broker import EffectBroker
@@ -633,6 +634,12 @@ class RealFileShim:
         if self.ipc_client is not None:
             # IPC mode: real I/O happens in the isolated subprocess
             post_exists, post_content = self._stat_post(path, canon)
+            # IN_FLIGHT marker, before the IPC call. Written before the
+            # operation so a crash mid-write leaves "dispatched, unobserved"
+            # rather than a silent gap. See ledger.record_dispatched().
+            self.broker.ledger.record_dispatched(
+                self.task_id, nonce, source="shim_real.dispatch"
+            )
             try:
                 if op_type == "write":
                     assert content is not None
@@ -706,9 +713,13 @@ class RealFileShim:
             except PermissionError as ex:
                 raise OSError(f"Permission denied: {canon}") from ex
             except OSError as ex:
-                raise OSError(
+                raise PostAuthorizationFailure(
                     f"[{self.tool_name}] {op_type} on {canon} OS ERROR after ALLOW: {ex}. "
-                    f"Broker said ALLOW but subprocess rejected. Treat as security event."
+                    f"Outcome is UNKNOWN: the write may have partially landed and "
+                    f"the delete may already have happened. This is a transport "
+                    f"fault, not a policy denial.",
+                    effect_id=nonce,
+                    cause=ex,
                 ) from ex
             except Exception as ex:
                 raise RuntimeError(
@@ -716,6 +727,10 @@ class RealFileShim:
                 ) from ex
 
         # Same-process / single-threaded mode: local direct OS calls
+        # IN_FLIGHT marker, before either IPC or direct OS I/O. Written before
+        # the operation so a crash mid-write leaves "dispatched, unobserved"
+        # rather than a silent gap. See ledger.record_dispatched().
+        self.broker.ledger.record_dispatched(self.task_id, nonce, source="shim_real.dispatch")
         try:
             if op_type == "write":
                 assert content is not None, "write called with None content"
@@ -758,9 +773,13 @@ class RealFileShim:
         except PermissionError as ex:
             raise OSError(f"Permission denied: {canon}") from ex
         except OSError as ex:
-            raise OSError(
+            raise PostAuthorizationFailure(
                 f"[{self.tool_name}] {op_type} on {canon} OS ERROR after ALLOW: {ex}. "
-                f"Broker said ALLOW but OS rejected. Treat as security event."
+                f"Outcome is UNKNOWN: the write may have partially landed and the "
+                f"delete may already have happened. This is a transport fault, "
+                f"not a policy denial.",
+                effect_id=nonce,
+                cause=ex,
             ) from ex
         except Exception as ex:
             raise RuntimeError(
