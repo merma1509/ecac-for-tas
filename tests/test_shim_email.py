@@ -429,3 +429,54 @@ class TestShimEmailBrokerIntegration:
         # Nothing committed
         log = broker.store.effects_log
         assert len(log) == 0
+
+
+class TestDispatchMarker:
+    """P4-2: the IN_FLIGHT marker is written before the SMTP call.
+
+    Tested at the shim, not the ledger, because the property is ORDERING:
+    the marker must exist by the time the network call starts. If it were
+    written after delivery, a crash mid-send would leave no trace at all.
+    """
+
+    def test_marker_written_before_smtp_call(self, smtp_server) -> None:
+        broker = _make_broker()
+        shim = RealEmailShim(
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            smtp_host="127.0.0.1",
+            smtp_port=9025,
+        )
+        smtp_server.reset()
+
+        shim._smtp_probe = lambda sender, decl: (decl, decl, frozenset())  # type: ignore[method-assign]
+
+        # Capture the ledger state AT THE MOMENT delivery is attempted: this is
+        # the ordering claim. After the call it would be trivially true.
+        original_send = shim._smtp_send
+        dispatched_when_send_started: list[bool] = []
+
+        def spy_send(sender, recipients, raw_message):
+            dispatched_when_send_started.append(
+                broker.ledger.was_dispatched("email-test", nonce_holder[0])
+            )
+            return original_send(sender, recipients, raw_message)
+
+        # The shim computes the nonce internally; capture it via record_dispatched.
+        nonce_holder: list[str] = [""]
+        original_record = broker.ledger.record_dispatched
+
+        def spy_record(task_id, nonce, source="shim.dispatch"):
+            nonce_holder[0] = nonce
+            return original_record(task_id, nonce, source)
+
+        object.__setattr__(broker.ledger, "record_dispatched", spy_record)
+        shim._smtp_send = spy_send  # type: ignore[method-assign]
+
+        shim.send("user@corp.com", "internal@corp.com", "hello")
+
+        assert dispatched_when_send_started == [True], (
+            "IN_FLIGHT marker must exist before the SMTP call; "
+            "found it written after (a crash mid-send would leave no trace)"
+        )
