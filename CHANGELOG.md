@@ -78,6 +78,14 @@ whose current `pyproject.toml` version is `0.1.1`.
   the same defect as the one in `__main__.py`; both now require an explicit
   evaluation and report unevaluated results by name.
 
+- **IPC payload fields are required.** `_require_field` makes a missing field
+  fail loudly instead of deserializing to `None` and continuing with a value
+  that looks legitimate.
+
+- **Label exceptions survive the IPC boundary.** `label_exception_to_dict` /
+  `dict_to_label_exception` carry the structured reason across instead of
+  degrading it to a string.
+
 - Action runtime warnings from the Node.js 20 deprecation. All actions moved to
   Node 24 lines: `actions/checkout@v7`, `actions/cache` (dropped),
   `actions/setup-python@v7`, `astral-sh/setup-uv@v10.3.3` (pinned exactly — no
