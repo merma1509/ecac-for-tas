@@ -200,10 +200,10 @@ class TestTransportFailureClassification:
 class TestCrashBetweenDispatchAndRecord:
     """The window this closes: process dies mid-operation.
 
-    Simulated rather than SIGKILLed in-process: a real kill would take the
-    pytest process with it and prove nothing about the ledger. The state the
-    ledger sees after a crash is exactly "authorization + dispatch, no
-    observation", which is what these tests construct.
+    These construct the post-crash state directly, which pins how `verify()`
+    reads it. Whether that state is REACHABLE after a real kill is a separate
+    question, answered by tests/test_crash_harness.py, which SIGKILLs a child
+    process and rebuilds the ledger from the journal it left on disk.
     """
 
     def _ledger(self):
