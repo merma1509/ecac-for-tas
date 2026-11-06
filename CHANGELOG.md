@@ -63,6 +63,29 @@ whose current `pyproject.toml` version is `0.1.1`.
   the cache that `astral-sh/setup-uv` already manages internally (same path,
   same `uv.lock`-based key), so it only added a second, redundant cache entry.
 
+### Added
+
+- **The IN_FLIGHT marker now survives a real crash.** `record_dispatched()`
+  fsyncs a one-line JSON record to a journal before the caller reaches the
+  syscall, and `IndependentEffectLedger.from_journal()` rebuilds the ledger
+  from what is left on disk. Until now the marker existed only in memory, so
+  "the process died between the I/O and the bookkeeping" was a state the tests
+  constructed by hand and nothing could actually reach — the docstring claimed
+  the marker was persisted, and it was not.
+
+  After a kill the verdict is `dispatched_outcome_unknown`, not
+  `no_record`: the recovery knows an operation was mid-flight. A torn final
+  line is dropped, since a process killed mid-write is the case being
+  reconstructed, and replaying does not write back to the journal.
+
+  Persistence is opt-in via `journal_path`; the default stays in-memory, so
+  existing behaviour is unchanged.
+
+- **A crash harness that actually kills.** `tests/test_crash_harness.py`
+  SIGKILLs a child parked between the marker and the outcome, then asserts what
+  the parent recovers. Five of its tests fail if journaling is switched off,
+  which was checked by doing exactly that.
+
 ### Fixed
 
 - **A commit claim for a file effect is now backed by the syscall.** In
