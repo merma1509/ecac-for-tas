@@ -55,7 +55,29 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ## [0.1.1] - 2026-11-04
 
-### Changed
+### Fixed
+
+- **Mediation verdicts are checked, not inferred.** Eighteen sites wrote
+  `mediation_complete=not actual_allow` — "the effect was blocked, so mediation
+  must be complete". That is inverted in its effect: the more successfully the
+  suite blocked, the more confidently it declared mediation complete, and the
+  scenario that would expose a hole (one effect escaping while another is
+  blocked) was the one nobody checked. `mediation_complete` is now `None` until
+  something asks the ledger, alongside `mediation_evaluated`, and
+  `__post_init__` rejects either field without the other.
+
+- **A second `all(mediation_complete)` aggregate** in `experiment._main()` had
+  the same defect as the one in `__main__.py`; both now require an explicit
+  evaluation and report unevaluated results by name.
+
+### Added
+
+- **Five-outcome accounting** (`committed`, `failed`, `unknown`, `denied`,
+  `abandoned`), printed by both entry points. Classification uses closed
+  allow-lists rather than exclusion, so an unrecognised observation source is
+  reported as unexplained instead of being promoted to a commit.
+
+- Hypothesis-style properties for the dispatch/observation ordering.
 
 - **Branch model simplified:** dropped the long-lived `staging` branch. The
   workflow is now `feature/*` -> `develop` -> `main`, with releases identified by
