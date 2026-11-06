@@ -35,9 +35,11 @@ SAME-PROCESS NOTE:
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from .model import EffectEvidence
@@ -116,6 +118,11 @@ class IndependentEffectLedger:
     _evidences: dict[tuple[str, str], list[EffectEvidence]] = field(default_factory=dict)
     _counter: int = field(default=0)
     _logical_time: float = 0.0
+    # Optional append-only journal on disk. When set, every IN_FLIGHT marker is
+    # fsynced before the caller reaches the syscall, so a SIGKILL leaves the
+    # marker behind. Without it "a crash mid-operation" is only ever a story the
+    # tests tell themselves: the state they construct is unreachable in reality.
+    _journal_path: str | None = None
 
     # ---- Recording API (called by broker.gate and executor/store) ----
     def record_authorization(
@@ -151,6 +158,18 @@ class IndependentEffectLedger:
         if key not in self._authorizations:
             self._authorizations[key] = []
         self._authorizations[key].append(entry)
+        # Journaled too: recovery needs the authorization present, otherwise the
+        # post-crash verdict degrades to "no_record" and looks like an effect
+        # nobody ever authorized rather than one that was in flight.
+        self._append_journal(
+            {
+                "kind": "authorized",
+                "task_id": task_id,
+                "nonce": nonce,
+                "targets": sorted(authorized_targets),
+                "source": source,
+            }
+        )
 
     def record_observation(
         self,
@@ -229,6 +248,18 @@ class IndependentEffectLedger:
         if key not in self._dispatched:
             self._dispatched[key] = []
         self._dispatched[key].append(entry)
+        # Durable BEFORE the syscall the caller is about to make. os.fsync is
+        # what makes the marker survive a SIGKILL between here and the outcome
+        # record; a buffered write would be lost exactly in that window, which
+        # is the only window this marker exists for.
+        self._append_journal(
+            {
+                "kind": "dispatched",
+                "task_id": task_id,
+                "nonce": nonce,
+                "source": source,
+            }
+        )
 
     def was_dispatched(self, task_id: str, nonce: str) -> bool:
         """True if an IN_FLIGHT marker exists for this effect."""
@@ -298,6 +329,20 @@ class IndependentEffectLedger:
         if key not in self._evidences:
             self._evidences[key] = []
         self._evidences[key].append(evidence)
+        self._append_journal(
+            {
+                "kind": "evidence",
+                "task_id": task_id,
+                "nonce": nonce,
+                "outcome": evidence.outcome,
+                "source": evidence.source,
+                "t0": evidence.window[0],
+                "t1": evidence.window[1],
+                "observed_bytes": evidence.observed_bytes,
+                "observed_targets": sorted(evidence.observed_targets or ()),
+                "transport_response": evidence.transport_response,
+            }
+        )
 
     def evidence_for(self, task_id: str, nonce: str) -> EffectEvidence | None:
         """The evidence backing this effect, if any was recorded.
@@ -311,6 +356,91 @@ class IndependentEffectLedger:
             if ev.outcome == "committed":
                 return ev
         return entries[0] if entries else None
+
+    def _append_journal(self, record: dict[str, object]) -> None:
+        """Append one line to the on-disk journal and fsync it.
+
+        One JSON object per line: a torn tail is a normal, recoverable state for
+        a crashed process, and a line-oriented format lets the reader drop the
+        partial last line instead of failing to parse the whole file.
+
+        A journal failure is fatal to the caller. Silently continuing would
+        reintroduce the very gap this exists to close: the operation would run
+        with no durable record that it was dispatched.
+        """
+        if self._journal_path is None:
+            return
+        line = json.dumps(record, sort_keys=True) + "\n"
+        with open(self._journal_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    @classmethod
+    def from_journal(cls, path: str) -> IndependentEffectLedger:
+        """Rebuild a ledger from a journal left behind by a crashed process.
+
+        Only what was durable is restored: authorizations, dispatch markers and
+        evidence. There are deliberately no observations to recover -- an
+        observation is written after the I/O completes, so by definition it is
+        not in the journal of a process that died mid-operation. That absence is
+        the finding, not a gap in the recovery.
+
+        A truncated final line is dropped rather than raising: the process was
+        killed mid-write, which is precisely the case being reconstructed.
+        """
+        ledger = cls()
+        # Journaling is enabled only AFTER the replay. Constructing the ledger
+        # with the path already set would make every recovery append a second
+        # copy of every record, doubling the file on each open.
+        if not os.path.exists(path):
+            ledger._journal_path = path
+            return ledger
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                # Interrupted write; everything after it is suspect too.
+                break
+            ledger._replay(rec)
+        ledger._journal_path = path
+        return ledger
+
+    def _replay(self, rec: dict[str, object]) -> None:
+        """Apply one journal record. Mirrors the recording API, without re-logging."""
+        kind = rec.get("kind")
+        task_id = str(rec.get("task_id", ""))
+        nonce = str(rec.get("nonce", ""))
+        if not task_id or not nonce:
+            return
+        if kind == "authorized":
+            targets = frozenset(str(t) for t in cast(list[str], rec.get("targets", [])))
+            self.record_authorization(task_id, nonce, targets, source=str(rec.get("source", "")))
+        elif kind == "dispatched":
+            self.record_dispatched(task_id, nonce, source=str(rec.get("source", "")))
+        elif kind == "evidence":
+            self.record_evidence(
+                task_id,
+                nonce,
+                EffectEvidence(
+                    effect_id=nonce,
+                    outcome=cast(Any, rec.get("outcome")),
+                    source=str(rec.get("source", "")),
+                    window=(float(cast(float, rec.get("t0", 0.0))),
+                            float(cast(float, rec.get("t1", 0.0)))),
+                    observed_bytes=cast(int | None, rec.get("observed_bytes")),
+                    observed_targets=frozenset(
+                        str(t) for t in cast(list[str], rec.get("observed_targets", []))
+                    )
+                    or None,
+                    transport_response=cast(str | None, rec.get("transport_response")),
+                ),
+            )
 
     # ---- Verification API (the ONLY way to get verdicts) ----
     def verify(self, task_id: str, nonce: str) -> LedgerVerdict | UnknownLedgerResult:
