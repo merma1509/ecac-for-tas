@@ -459,7 +459,14 @@ class RealEmailShim:
                 f"BLOCKed by {blocker}. No email sent."
             )
 
-        # Phase 3 (ALLOW): real SMTP delivery via DATA
+        # Phase 3 (ALLOW): real SMTP delivery via DATA.
+        #
+        # IN_FLIGHT marker, written BEFORE the network call. If the process dies
+        # between here and the outcome record, the ledger sees "dispatched, never
+        # observed" and reports OUTCOME_UNKNOWN instead of an ambiguous gap. The
+        # marker asserts only that we were about to try -- anyone can assert that
+        # -- so it can never on its own produce CONFIRMED_COMMITTED.
+        self.broker.ledger.record_dispatched(self.task_id, nonce, source="shim_email.dispatch")
         try:
             delivered = self._smtp_send(sender, actual_accepted, raw_msg)
             op = EmailOp(
@@ -477,9 +484,17 @@ class RealEmailShim:
             )
             self.ops.append(op)
         except SMTPError as ex:
-            raise EmailSecurityError(
+            # The gate authorized; the transport then failed. That is not a
+            # security event -- it is an unknown outcome. Raising
+            # EmailSecurityError here conflated "policy blocked you" with
+            # "the network was down", which is exactly the mislabelling that
+            # made auth>0/obs=0 unreadable in the ledger.
+            raise PostAuthorizationFailure(
                 f"[{self.tool_name}] SMTP delivery failed after ALLOW: {ex}. "
-                f"Broker said ALLOW but MTA rejected. Treat as security event."
+                f"Outcome is UNKNOWN (the message may or may not have been "
+                f"delivered); this is a transport fault, not a policy denial.",
+                effect_id=nonce,
+                cause=ex,
             ) from ex
 
     def read_inbox(self, user: str) -> list[str]:
@@ -600,3 +615,28 @@ class SMTPError(Exception):
     """SMTP-level error during email delivery."""
 
     pass
+
+
+class PostAuthorizationFailure(Exception):
+    """The gate said ALLOW, then the real operation failed.
+
+    This is deliberately NOT an EmailSecurityError. The distinction matters:
+    a security event means the boundary was attacked or bypassed; this means
+    the boundary worked (it authorized) and the transport then failed. An MTA
+    timeout is not evidence of a policy violation, and reporting it as one
+    trained operators to ignore the category that should never be ignored.
+
+    The effect's true state is UNKNOWN, not DENIED and not COMMITTED: an SMTP
+    timeout may still have delivered the message. Callers that need a ledger
+    verdict must record `unknown` and let the observer settle it.
+    """
+
+    def __init__(self, message: str, *, effect_id: str, cause: BaseException | None = None) -> None:
+        super().__init__(message)
+        self.effect_id = effect_id
+        self.cause = cause
+
+    @property
+    def outcome(self) -> str:
+        """The evidential outcome this failure establishes."""
+        return "failed"

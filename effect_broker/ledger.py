@@ -35,12 +35,22 @@ SAME-PROCESS NOTE:
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    pass
+    from .model import EffectEvidence
+
+
+#: Reason prefix for an effect that was dispatched but never observed.
+#: Distinguished from a plain "authorized_not_observed" because the two mean
+#: different things operationally: the first is a crash between the I/O and the
+#: bookkeeping (the effect may well have landed), the second is an ordinary
+#: bypass-shaped gap. Splitting them is what makes P4-2 checkable.
+DISPOSITION_UNKNOWN = "dispatched_outcome_unknown"
 
 
 class LedgerVerdict(Enum):
@@ -101,8 +111,18 @@ class IndependentEffectLedger:
 
     _authorizations: dict[tuple[str, str], list[LedgerEntry]] = field(default_factory=dict)
     _observations: dict[tuple[str, str], list[LedgerEntry]] = field(default_factory=dict)
+    # IN_FLIGHT markers: written before the real I/O, never an outcome claim.
+    _dispatched: dict[tuple[str, str], list[LedgerEntry]] = field(default_factory=dict)
+    # Executor-produced evidence that the real I/O happened. Separate from
+    # _observations because an observation is a claim and this is a measurement.
+    _evidences: dict[tuple[str, str], list[EffectEvidence]] = field(default_factory=dict)
     _counter: int = field(default=0)
     _logical_time: float = 0.0
+    # Optional append-only journal on disk. When set, every IN_FLIGHT marker is
+    # fsynced before the caller reaches the syscall, so a SIGKILL leaves the
+    # marker behind. Without it "a crash mid-operation" is only ever a story the
+    # tests tell themselves: the state they construct is unreachable in reality.
+    _journal_path: str | None = None
 
     # ---- Recording API (called by broker.gate and executor/store) ----
     def record_authorization(
@@ -138,6 +158,18 @@ class IndependentEffectLedger:
         if key not in self._authorizations:
             self._authorizations[key] = []
         self._authorizations[key].append(entry)
+        # Journaled too: recovery needs the authorization present, otherwise the
+        # post-crash verdict degrades to "no_record" and looks like an effect
+        # nobody ever authorized rather than one that was in flight.
+        self._append_journal(
+            {
+                "kind": "authorized",
+                "task_id": task_id,
+                "nonce": nonce,
+                "targets": sorted(authorized_targets),
+                "source": source,
+            }
+        )
 
     def record_observation(
         self,
@@ -182,6 +214,57 @@ class IndependentEffectLedger:
             self._observations[key] = []
         self._observations[key].append(entry)
 
+    def record_dispatched(
+        self,
+        task_id: str,
+        nonce: str,
+        source: str = "shim.dispatch",
+    ) -> None:
+        """Record that the real protected operation is ABOUT TO BE performed.
+
+        This is the IN_FLIGHT marker. It is written before the syscall/network
+        call, so that a crash between the I/O and the outcome record leaves an
+        auditable trace: 'we dispatched, we never learned the result'.
+
+        Why it must be persisted BEFORE the call and not after: the interesting
+        failure is the one where the process dies mid-operation. If the marker
+        were written afterwards, that window would be indistinguishable from
+        'never attempted', and a partially-applied effect would read as safe.
+
+        The marker is a DISPATCH claim, not an outcome claim. It records intent,
+        which anyone can assert, so it is never sufficient for CONFIRMED_COMMITTED.
+        It only upgrades an otherwise silent gap into an explicit OUTCOME_UNKNOWN.
+        """
+        self._logical_time += 1.0
+        entry = LedgerEntry(
+            task_id=task_id,
+            nonce=nonce,
+            authorized_targets=frozenset(),
+            observed_targets=None,
+            timestamp=self._logical_time,
+            source=source,
+        )
+        key = (task_id, nonce)
+        if key not in self._dispatched:
+            self._dispatched[key] = []
+        self._dispatched[key].append(entry)
+        # Durable BEFORE the syscall the caller is about to make. os.fsync is
+        # what makes the marker survive a SIGKILL between here and the outcome
+        # record; a buffered write would be lost exactly in that window, which
+        # is the only window this marker exists for.
+        self._append_journal(
+            {
+                "kind": "dispatched",
+                "task_id": task_id,
+                "nonce": nonce,
+                "source": source,
+            }
+        )
+
+    def was_dispatched(self, task_id: str, nonce: str) -> bool:
+        """True if an IN_FLIGHT marker exists for this effect."""
+        return bool(self._dispatched.get((task_id, nonce)))
+
     def record_shim_block(
         self,
         task_id: str,
@@ -221,6 +304,143 @@ class IndependentEffectLedger:
         if key not in self._observations:
             self._observations[key] = []
         self._observations[key].append(entry)
+
+    def record_evidence(self, task_id: str, nonce: str, evidence: EffectEvidence) -> None:
+        """Record executor-produced evidence that the real I/O happened.
+
+        Distinct from record_observation() on purpose. An observation is the
+        executor saying "I applied it"; evidence is a measurement taken at the
+        transport boundary (bytes written, fsync result, observed targets). The
+        ledger keeps them apart so that a verdict can require the second and not
+        be satisfied by the first.
+
+        Evidence never changes the effect count. verify() counts observations
+        against authorizations, so adding a second observation for the same
+        nonce would trip the over-observed check; evidence is attached to the
+        existing occurrence instead.
+
+        Only terminal evidence is accepted. A dispatch marker already covers
+        "in flight", and accepting a non-terminal claim here would give two
+        competing ways to say the same thing.
+        """
+        if evidence.outcome not in ("committed", "failed", "unknown", "denied"):
+            raise ValueError(f"not a terminal outcome: {evidence.outcome!r}")
+        key = (task_id, nonce)
+        if key not in self._evidences:
+            self._evidences[key] = []
+        self._evidences[key].append(evidence)
+        self._append_journal(
+            {
+                "kind": "evidence",
+                "task_id": task_id,
+                "nonce": nonce,
+                "outcome": evidence.outcome,
+                "source": evidence.source,
+                "t0": evidence.window[0],
+                "t1": evidence.window[1],
+                "observed_bytes": evidence.observed_bytes,
+                "observed_targets": sorted(evidence.observed_targets or ()),
+                "transport_response": evidence.transport_response,
+            }
+        )
+
+    def evidence_for(self, task_id: str, nonce: str) -> EffectEvidence | None:
+        """The evidence backing this effect, if any was recorded.
+
+        Returns the first COMMITTED piece of evidence in preference to others:
+        if any observation proved the effect landed, that is the outcome, and
+        later ambiguity must not erase it.
+        """
+        entries = self._evidences.get((task_id, nonce), [])
+        for ev in entries:
+            if ev.outcome == "committed":
+                return ev
+        return entries[0] if entries else None
+
+    def _append_journal(self, record: dict[str, object]) -> None:
+        """Append one line to the on-disk journal and fsync it.
+
+        One JSON object per line: a torn tail is a normal, recoverable state for
+        a crashed process, and a line-oriented format lets the reader drop the
+        partial last line instead of failing to parse the whole file.
+
+        A journal failure is fatal to the caller. Silently continuing would
+        reintroduce the very gap this exists to close: the operation would run
+        with no durable record that it was dispatched.
+        """
+        if self._journal_path is None:
+            return
+        line = json.dumps(record, sort_keys=True) + "\n"
+        with open(self._journal_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    @classmethod
+    def from_journal(cls, path: str) -> IndependentEffectLedger:
+        """Rebuild a ledger from a journal left behind by a crashed process.
+
+        Only what was durable is restored: authorizations, dispatch markers and
+        evidence. There are deliberately no observations to recover -- an
+        observation is written after the I/O completes, so by definition it is
+        not in the journal of a process that died mid-operation. That absence is
+        the finding, not a gap in the recovery.
+
+        A truncated final line is dropped rather than raising: the process was
+        killed mid-write, which is precisely the case being reconstructed.
+        """
+        ledger = cls()
+        # Journaling is enabled only AFTER the replay. Constructing the ledger
+        # with the path already set would make every recovery append a second
+        # copy of every record, doubling the file on each open.
+        if not os.path.exists(path):
+            ledger._journal_path = path
+            return ledger
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                # Interrupted write; everything after it is suspect too.
+                break
+            ledger._replay(rec)
+        ledger._journal_path = path
+        return ledger
+
+    def _replay(self, rec: dict[str, object]) -> None:
+        """Apply one journal record. Mirrors the recording API, without re-logging."""
+        kind = rec.get("kind")
+        task_id = str(rec.get("task_id", ""))
+        nonce = str(rec.get("nonce", ""))
+        if not task_id or not nonce:
+            return
+        if kind == "authorized":
+            targets = frozenset(str(t) for t in cast(list[str], rec.get("targets", [])))
+            self.record_authorization(task_id, nonce, targets, source=str(rec.get("source", "")))
+        elif kind == "dispatched":
+            self.record_dispatched(task_id, nonce, source=str(rec.get("source", "")))
+        elif kind == "evidence":
+            self.record_evidence(
+                task_id,
+                nonce,
+                EffectEvidence(
+                    effect_id=nonce,
+                    outcome=cast(Any, rec.get("outcome")),
+                    source=str(rec.get("source", "")),
+                    window=(float(cast(float, rec.get("t0", 0.0))),
+                            float(cast(float, rec.get("t1", 0.0)))),
+                    observed_bytes=cast(int | None, rec.get("observed_bytes")),
+                    observed_targets=frozenset(
+                        str(t) for t in cast(list[str], rec.get("observed_targets", []))
+                    )
+                    or None,
+                    transport_response=cast(str | None, rec.get("transport_response")),
+                ),
+            )
 
     # ---- Verification API (the ONLY way to get verdicts) ----
     def verify(self, task_id: str, nonce: str) -> LedgerVerdict | UnknownLedgerResult:
@@ -287,7 +507,17 @@ class IndependentEffectLedger:
             authorized_targets |= entry.authorized_targets
 
         if not obs_entries:
-            # Authorized but no observation -> possible direct bypass
+            # Authorized but no observation. Two very different situations:
+            #   - nothing was dispatched: an ordinary gap (possible bypass);
+            #   - we dispatched and never learned the result: a crash or a
+            #     transport fault mid-operation. The effect may well have landed.
+            # Reporting both as one string hid the second, which is the one that
+            # matters. Both are still UNKNOWN -- never COMMITTED, never safe.
+            if self.was_dispatched(task_id, nonce):
+                return UnknownLedgerResult(
+                    reason=f"{DISPOSITION_UNKNOWN}(task={task_id},nonce={nonce},"
+                    f"dispatched_no_observation)"
+                )
             return UnknownLedgerResult(
                 reason=f"authorized_not_observed(task={task_id},nonce={nonce},possible_bypass)"
             )
@@ -324,6 +554,16 @@ class IndependentEffectLedger:
                         reason=f"extra_observed(task={task_id},nonce={nonce},"
                         f"extra={extra},authorized={authorized_targets})"
                     )
+            # Evidence, when the executor supplies it, outranks the claim.
+            # a commit must be backed by something measured
+            # at the boundary, not by the executor asserting its own success.
+            # When evidence exists and does NOT say committed, the claim loses.
+            backing = self.evidence_for(task_id, nonce)
+            if backing is not None and backing.outcome != "committed":
+                return UnknownLedgerResult(
+                    reason=f"evidence_contradicts_observation(task={task_id},"
+                    f"nonce={nonce},evidence_outcome={backing.outcome})"
+                )
             # Check occurrence count: obs_count > auth_count is only a problem
             # when ALL observations are committed (no BLOCKED entries).
             # When BLOCKED entries exist, they don't count toward the limit
@@ -432,6 +672,72 @@ class IndependentEffectLedger:
             result.extend(obs_list)
         return sorted(result, key=lambda e: e.timestamp)
 
+    def outcome_of(self, task_id: str, nonce: str) -> str:
+        """Classify one effect into exactly one of the five outcomes.
+
+        Reads the same entries verify() reads, but answers a different question
+        and -- importantly -- any unrecognised shape lands in `unknown` rather
+        than being optimistically promoted. When in doubt, say we do not know.
+        """
+        key = (task_id, nonce)
+        auth_entries = self._authorizations.get(key, [])
+        obs_entries = self._observations.get(key, [])
+
+        if not auth_entries:
+            # No authorization: either a shim-level block (legitimate, observable)
+            # or an effect nobody authorized. The latter must never read as
+            # denied-by-policy, so it stays `unknown`.
+            if obs_entries and all(e.source.startswith("shim.") for e in obs_entries):
+                return OUTCOME_DENIED
+            return OUTCOME_UNKNOWN
+
+        if not obs_entries:
+            # Dispatched-but-unobserved and never-started both leave us unable to
+            # state the outcome. They differ in DIAGNOSIS (a crash vs a silent
+            # gap), not in outcome, so both are `unknown` here; verify() is where
+            # the two are told apart.
+            return OUTCOME_UNKNOWN
+
+        # An ALLOW-list, not a deny-list. Classifying by "anything that is not
+        # obviously a block" makes every unrecognised source a commit by default,
+        # which is the optimistic direction -- exactly wrong for this metric. A
+        # new source string added elsewhere must fall into `unknown` until
+        # somebody decides what it means.
+        if any(e.source in _COMMITTING_SOURCES for e in obs_entries):
+            return OUTCOME_COMMITTED
+        if any(e.source in _FAILED_SOURCES for e in obs_entries):
+            # Attempted, did not complete. May still have landed -> also unknown,
+            # but reported separately so the two causes stay distinguishable.
+            return OUTCOME_FAILED
+        if any(
+            e.source in _DENYING_SOURCES or e.source.startswith("shim.") for e in obs_entries
+        ):
+            return OUTCOME_DENIED
+        # No observation source decided it. Fall back to the evidence, which is
+        # a measurement rather than a claim -- and which, unlike a source string,
+        # cannot be produced by the executor guessing about its own success.
+        evidence = self.evidence_for(task_id, nonce)
+        if evidence is not None:
+            return {
+                "committed": OUTCOME_COMMITTED,
+                "failed": OUTCOME_FAILED,
+                "denied": OUTCOME_DENIED,
+            }.get(evidence.outcome, OUTCOME_UNKNOWN)
+        return OUTCOME_UNKNOWN
+
+    def outcome_counts(self) -> OutcomeCounts:
+        """Tally every effect the ledger has heard of, by outcome.
+
+        The universe is the union of authorized and observed nonces: an effect
+        that was observed but never authorized still exists and must be counted
+        (as unknown), otherwise it would vanish from the accounting entirely.
+        """
+        keys = set(self._authorizations) | set(self._observations)
+        counts = dict.fromkeys(ALL_OUTCOMES, 0)
+        for task_id, nonce in keys:
+            counts[self.outcome_of(task_id, nonce)] += 1
+        return OutcomeCounts(**counts)
+
     @property
     def authorization_count(self) -> int:
         return sum(len(v) for v in self._authorizations.values())
@@ -450,7 +756,90 @@ class IndependentEffectLedger:
         """Clear all entries. Use with caution (testing only in same-process model)."""
         self._authorizations.clear()
         self._observations.clear()
+        self._dispatched.clear()
+        self._evidences.clear()
         self._logical_time = 0.0
+
+
+#: Observation sources that PROVE the effect reached external state.
+#: Kept explicit and closed: an unlisted source yields `unknown`, never a commit.
+_COMMITTING_SOURCES = frozenset({"executor.apply", "subprocess.apply"})
+
+#: Sources that prove the effect was attempted and did not complete.
+_FAILED_SOURCES = frozenset({"executor.apply:FAILED", "subprocess.apply:FAILED"})
+
+#: Sources that prove a predicate or shim check rejected the effect.
+_DENYING_SOURCES = frozenset(
+    {
+        "executor.execute:BLOCKED",
+        "subprocess.gate:BLOCKED",
+        "subprocess.apply:BLOCKED",
+        "broker.commit:BLOCKED",
+    }
+)
+
+
+# Outcome accounting
+# The five reportable outcomes. These are NOT the same as LedgerVerdict: a
+# verdict answers "was mediation complete for this nonce?", an outcome answers
+# "what actually happened to this effect?". Both are needed, and conflating them
+# was part of why auth>0/obs=0 was unreadable.
+
+#: The effect reached external state, authorized and observed.
+OUTCOME_COMMITTED = "committed"
+#: The operation was attempted after authorization and failed. The effect may or
+#: may not have landed (an SMTP timeout is the canonical case) -> also UNKNOWN.
+OUTCOME_FAILED = "failed"
+#: Dispatched, but no observation ever arrived. A crash or a lost record.
+OUTCOME_UNKNOWN = "unknown"
+#: A predicate rejected it. Nothing was dispatched.
+OUTCOME_DENIED = "denied"
+#: Authorized but given up before dispatch (capability expired, aborted).
+OUTCOME_ABANDONED = "abandoned"
+
+ALL_OUTCOMES: tuple[str, ...] = (
+    OUTCOME_COMMITTED,
+    OUTCOME_FAILED,
+    OUTCOME_UNKNOWN,
+    OUTCOME_DENIED,
+    OUTCOME_ABANDONED,
+)
+
+
+@dataclass(frozen=True)
+class OutcomeCounts:
+    """How many effects landed in each of the five outcomes.
+
+    `abandoned` counts a transition for which there is currently NO producer in
+    the codebase: capability expiry is caught by the gate as a denial before
+    dispatch, so nothing reaches AUTHORIZED-then-given-up. The counter is real
+    and will move as soon as such a path exists, but reporting it as 0 without
+    saying so would read as "we checked and there were none" when it actually
+    means "this state cannot currently be reached".
+    """
+
+    committed: int = 0
+    failed: int = 0
+    unknown: int = 0
+    denied: int = 0
+    abandoned: int = 0
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            OUTCOME_COMMITTED: self.committed,
+            OUTCOME_FAILED: self.failed,
+            OUTCOME_UNKNOWN: self.unknown,
+            OUTCOME_DENIED: self.denied,
+            OUTCOME_ABANDONED: self.abandoned,
+        }
+
+    @property
+    def total(self) -> int:
+        return self.committed + self.failed + self.unknown + self.denied + self.abandoned
+
+    def unexplained(self) -> int:
+        """Effects whose fate we cannot state. Anything above zero is a finding."""
+        return self.unknown + self.abandoned
 
 
 @dataclass(frozen=True)
@@ -471,7 +860,6 @@ class UnknownLedgerResult:
 # Mechanism for regular ledger verification (on-demand AND scheduled).
 # A PeriodicAuditor can be registered with broker or an external orchestrator
 # to periodically verify that all authorized effects have been observed.
-
 
 @dataclass
 class AuditSnapshot:
@@ -621,3 +1009,5 @@ class PeriodicAuditor:
 EffectObserver = IndependentEffectLedger
 UnknownObserverResult = UnknownLedgerResult
 EffectObserverVerdict = LedgerVerdict
+
+
