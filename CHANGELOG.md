@@ -18,6 +18,10 @@ whose current `pyproject.toml` version is `0.1.1`.
   snapshots and exits non-zero on regression, so a change that slows the gate
   path gets caught by CI instead of being noticed later.
 
+- **Provenance transforms** (`provenance_transforms.py`). Label-algebra helpers
+  for deriving output labels from inputs, with the transform identities pinned
+  by tests.
+
 ### Changed
 
 - **TCB size counts code, not comments.** `_count_code_lines` strips comments
