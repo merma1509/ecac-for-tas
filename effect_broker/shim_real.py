@@ -29,12 +29,13 @@ import os
 import pathlib
 import re
 import stat
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from .lattice import Confidentiality, Integrity
-from .model import Commit, Data, Effect, EffectTarget
+from .model import Commit, Data, Effect, EffectEvidence, EffectTarget
 from .shim_email import PostAuthorizationFailure
 
 if TYPE_CHECKING:
@@ -43,7 +44,7 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
-# Explicit statx constants — PLAN_2 S4: single source of truth in statx.py.
+# Explicit statx constants — single source of truth in statx.py.
 # Local aliases kept for backwards compatibility, but the VALUES now come from
 # the shared module so no process can fork a divergent `1 << 0` / `1 << 1`.
 try:  # package context (normal imports — shim never runs standalone)
@@ -475,6 +476,86 @@ class RealFileShim:
         extras_key = ",".join(sorted(extras)) if extras else ""
         return f"{base}:{primary}:{extras_key}" if extras_key else base
 
+    def _evidence_after_io(
+        self,
+        nonce: str,
+        op_type: str,
+        canon: str,
+        started: float,
+        *,
+        observed: frozenset[str],
+        transport_response: str,
+        observed_bytes: int | None = None,
+    ) -> EffectEvidence:
+        """Build evidence of a completed real operation.
+
+        Called only AFTER the syscall returned, and only with what the syscall
+        actually established -- the observation is of the boundary, not a
+        restatement of the request. The caller passes `observed` as the targets
+        the OS confirmed, so an effect that was authorized for one target and
+        wrote another cannot produce a clean commit claim here.
+        """
+        return EffectEvidence(
+            effect_id=nonce,
+            outcome="committed",
+            source=f"shim_real.{op_type}.syscall",
+            window=(started, time.monotonic()),
+            observed_bytes=observed_bytes,
+            observed_targets=observed,
+            transport_response=transport_response,
+        )
+
+    def _record_failure_evidence(
+        self,
+        nonce: str,
+        op_type: str,
+        started: float,
+        error: BaseException,
+    ) -> None:
+        """Record UNKNOWN evidence when the syscall raised.
+
+        Every failure path calls this before raising, including the ones that
+        re-raise as a plain OSError. Without it the ledger would keep whatever
+        the executor claimed before the I/O and the failure would be invisible.
+
+        The observed targets are empty: the syscall did not establish anything,
+        and claiming the target was touched is exactly the unfounded assertion
+        this evidence type exists to prevent.
+        """
+        self.broker.ledger.record_evidence(
+            self.task_id,
+            nonce,
+            self._evidence_failed(nonce, op_type, started, error, observed=frozenset()),
+        )
+
+    def _evidence_failed(
+        self,
+        nonce: str,
+        op_type: str,
+        started: float,
+        error: BaseException,
+        *,
+        observed: frozenset[str],
+    ) -> EffectEvidence:
+        """Evidence for an operation whose syscall returned an error.
+
+        `unknown`, not `failed`: an errno tells us the call did not complete as
+        asked, but for a partial write or a delete already issued it does not
+        tell us the filesystem is as it was. The distinction the type enforces
+        is that this carries no transport_response -- so the errno goes into the
+        source string, where it stays legible without pretending to be a reply
+        from the transport.
+        """
+        errname = type(error).__name__
+        return EffectEvidence(
+            effect_id=nonce,
+            outcome="unknown",
+            source=f"shim_real.{op_type}.syscall_error:{errname}",
+            window=(started, time.monotonic()),
+            observed_targets=observed,
+            transport_response=None,
+        )
+
     def _op(
         self,
         op_type: str,
@@ -731,11 +812,42 @@ class RealFileShim:
         # the operation so a crash mid-write leaves "dispatched, unobserved"
         # rather than a silent gap. See ledger.record_dispatched().
         self.broker.ledger.record_dispatched(self.task_id, nonce, source="shim_real.dispatch")
+        # The window opens at the dispatch marker, so evidence reports how long
+        # the operation was actually in flight rather than how long the
+        # bookkeeping took.
+        io_started = time.monotonic()
         try:
             if op_type == "write":
                 assert content is not None, "write called with None content"
                 with open(canon, "wb") as f:
                     f.write(content)
+                # Evidence, taken from the filesystem rather than from `content`:
+                # the size is what landed, and a short write shows up here even
+                # though f.write() may have returned without raising.
+                landed = os.stat(canon).st_size
+                self.broker.ledger.record_evidence(
+                    self.task_id,
+                    nonce,
+                    self._evidence_after_io(
+                        nonce,
+                        op_type,
+                        canon,
+                        io_started,
+                        observed=frozenset({uri}),
+                        transport_response=f"fsize={landed}",
+                        observed_bytes=landed,
+                    ),
+                )
+                if landed != len(content):
+                    # The file exists but is not what was authorized. Reporting
+                    # this as a clean commit would hide a torn write.
+                    self.ops.append(op)
+                    raise PostAuthorizationFailure(
+                        f"[{self.tool_name}] write on {canon} landed {landed} of "
+                        f"{len(content)} bytes. Outcome is UNKNOWN: the file was "
+                        f"created or truncated, so this is not a benign no-op.",
+                        effect_id=nonce,
+                    )
                 self.ops.append(op)
                 return cast(T, None)  # write returns None
 
@@ -762,6 +874,28 @@ class RealFileShim:
 
             elif op_type == "delete":
                 os.remove(canon)
+                # os.remove() returning is not proof the target is gone; check.
+                still_there = os.path.exists(canon)
+                self.broker.ledger.record_evidence(
+                    self.task_id,
+                    nonce,
+                    self._evidence_after_io(
+                        nonce,
+                        op_type,
+                        canon,
+                        io_started,
+                        observed=frozenset({uri}),
+                        transport_response="gone" if not still_there else "still-present",
+                    )
+                    if not still_there
+                    else self._evidence_failed(
+                        nonce,
+                        op_type,
+                        io_started,
+                        OSError("target still present after remove"),
+                        observed=frozenset(),
+                    ),
+                )
                 self.ops.append(op)
                 return cast(T, None)
 
@@ -769,10 +903,13 @@ class RealFileShim:
                 raise ValueError(f"Unknown op type: {op_type}")
 
         except FileNotFoundError as ex:
+            self._record_failure_evidence(nonce, op_type, io_started, ex)
             raise OSError(f"File not found: {canon}") from ex
         except PermissionError as ex:
+            self._record_failure_evidence(nonce, op_type, io_started, ex)
             raise OSError(f"Permission denied: {canon}") from ex
         except OSError as ex:
+            self._record_failure_evidence(nonce, op_type, io_started, ex)
             raise PostAuthorizationFailure(
                 f"[{self.tool_name}] {op_type} on {canon} OS ERROR after ALLOW: {ex}. "
                 f"Outcome is UNKNOWN: the write may have partially landed and the "
