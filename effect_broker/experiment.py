@@ -106,12 +106,17 @@ class ExperimentResult:
 #: and the list is cleared in a finally block. Nothing outside a run reads it.
 _RUN_BROKERS: list[EffectBroker] | None = None
 
+#: Journal path applied to every broker built during a run. Set by
+#: collect_outcome_counts(); None means in-memory, which is the default and the
+#: behaviour every existing caller gets.
+_JOURNAL_PATH: str | None = None
+
 
 def _build_broker() -> EffectBroker:
     """Standard broker setup for all experiments."""
     from .traces import build
 
-    broker = build()
+    broker = build(journal_path=_JOURNAL_PATH)
     if _RUN_BROKERS is not None:
         _RUN_BROKERS.append(broker)
     return broker
@@ -1483,16 +1488,22 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
     return results
 
 
-def collect_outcome_counts() -> tuple[dict[str, ExperimentResult], OutcomeCounts]:
+def collect_outcome_counts(
+    journal_path: str | None = None,
+) -> tuple[dict[str, ExperimentResult], OutcomeCounts]:
     """Run the suite and tally every effect by outcome (P4-4).
 
     Runs the experiments ONCE and returns both the per-scenario results and the
     aggregate outcome counts. Callers that need both must use this rather than
     run_all_experiments() plus a second run, otherwise the numbers describe two
     different executions.
+
+    When journal_path is given, every broker built during the run persists its
+    in-flight markers there.
     """
-    global _RUN_BROKERS
+    global _RUN_BROKERS, _JOURNAL_PATH
     _RUN_BROKERS = []
+    _JOURNAL_PATH = journal_path
     try:
         results = run_all_experiments()
         totals = OutcomeCounts()
@@ -1508,8 +1519,10 @@ def collect_outcome_counts() -> tuple[dict[str, ExperimentResult], OutcomeCounts
         return results, totals
     finally:
         # Never leak the registry past the run: a later _build_broker() outside
-        # this function must not append to a stale list.
+        # this function must not append to a stale list, nor inherit a journal
+        # path the caller did not ask for on this run.
         _RUN_BROKERS = None
+        _JOURNAL_PATH = None
 
 
 def print_results(results: dict[str, ExperimentResult]) -> None:
