@@ -721,6 +721,13 @@ class IndependentEffectLedger:
             # gap), not in outcome, so both are `unknown` here; verify() is where
             # the two are told apart.
             return OUTCOME_UNKNOWN
+        evidence = self.evidence_for(task_id, nonce)
+        if evidence is not None:
+            return {
+                "committed": OUTCOME_COMMITTED,
+                "failed": OUTCOME_FAILED,
+                "denied": OUTCOME_DENIED,
+            }.get(evidence.outcome, OUTCOME_UNKNOWN)
 
         # An ALLOW-list, not a deny-list. Classifying by "anything that is not
         # obviously a block" makes every unrecognised source a commit by default,
@@ -737,16 +744,7 @@ class IndependentEffectLedger:
             e.source in _DENYING_SOURCES or e.source.startswith("shim.") for e in obs_entries
         ):
             return OUTCOME_DENIED
-        # No observation source decided it. Fall back to the evidence, which is
-        # a measurement rather than a claim -- and which, unlike a source string,
-        # cannot be produced by the executor guessing about its own success.
-        evidence = self.evidence_for(task_id, nonce)
-        if evidence is not None:
-            return {
-                "committed": OUTCOME_COMMITTED,
-                "failed": OUTCOME_FAILED,
-                "denied": OUTCOME_DENIED,
-            }.get(evidence.outcome, OUTCOME_UNKNOWN)
+        # No observation source decided it, and there is no evidence to consult.
         return OUTCOME_UNKNOWN
 
     def outcome_counts(self) -> OutcomeCounts:
