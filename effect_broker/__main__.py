@@ -15,7 +15,11 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .experiment import print_results, run_all_experiments
+from .experiment import (
+    collect_outcome_counts,
+    print_outcome_counts,
+    print_results,
+)
 
 
 def main() -> None:
@@ -40,7 +44,39 @@ def main() -> None:
         action="store_true",
         help="Show per-experiment details (not just pass/fail summary)",
     )
+    parser.add_argument(
+        "--journal",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Persist the in-flight marker to PATH before each real operation, "
+            "so a crash mid-operation leaves 'dispatched, unobserved' rather "
+            "than nothing. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--journal-max-bytes",
+        metavar="N",
+        type=int,
+        default=None,
+        help=(
+            "Rotate the journal to PATH.1 once it reaches N bytes. Requires "
+            "--journal. Off by default, which leaves one unbounded file."
+        ),
+    )
+    parser.add_argument(
+        "--journal-keep",
+        metavar="N",
+        type=int,
+        default=1,
+        help="Rotated journal segments to retain besides the live file (default: 1).",
+    )
     args = parser.parse_args()
+
+    if args.journal_max_bytes is not None and not args.journal:
+        parser.error("--journal-max-bytes requires --journal")
+    if args.journal_keep < 1:
+        parser.error("--journal-keep must be at least 1")
 
     # Suppress same-process warning unless explicitly requested
     import warnings
@@ -48,8 +84,13 @@ def main() -> None:
     if not args.warn_same_process:
         warnings.filterwarnings("ignore", message="SAME-PROCESS", category=UserWarning)
 
-    results = run_all_experiments()
+    results, counts = collect_outcome_counts(
+        journal_path=args.journal,
+        journal_max_bytes=args.journal_max_bytes,
+        journal_keep=args.journal_keep,
+    )
     print_results(results)
+    print_outcome_counts(counts)
     sys.stdout.flush()
 
     if args.verbose:
@@ -62,8 +103,25 @@ def main() -> None:
             if result.replay_blocked:
                 print(f"    replay_blocked={result.replay_blocked}")
 
-    # Exit code: 0 if all passed, 1 if any failed
-    all_passed = all(r.mediation_complete for r in results.values())
+    # Exit code: 0 only if every result was EVALUATED and passed.
+    unevaluated = [n for n, r in results.items() if not r.mediation_evaluated]
+    failed = [
+        n
+        for n, r in results.items()
+        if r.mediation_evaluated and r.mediation_complete is False
+    ]
+    all_passed = not unevaluated and not failed
+    if unevaluated:
+        print(f"NOT EVALUATED ({len(unevaluated)}): mediation was never checked")
+        for n in unevaluated:
+            print(f"  - {n}")
+    if failed:
+        print(f"MEDIATION INCOMPLETE ({len(failed)}):")
+        for n in failed:
+            result = results[n]
+            print(f"  - {n}")
+            for failure in result.mediation_failures:
+                print(f"      {failure}")
     sys.exit(0 if all_passed else 1)
 
 
