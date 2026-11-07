@@ -67,11 +67,17 @@ def _capability(
     return Capability(owner, holder, right, target, scope, expiry, nonce, derives_from=derives)
 
 
-def build() -> EffectBroker:
+def build(journal_path: str | None = None) -> EffectBroker:
     # Create an EXTERNAL independent ledger — the single source of truth
     # This ledger is passed to the broker. Both broker.commit() (direct) and
-    # executor.execute() (via-shim) record to this same ledger
-    ledger = IndependentEffectLedger()
+    # executor.execute() (via-shim) record to this same ledger.
+    #
+    # journal_path is opt-in. When set, the IN_FLIGHT marker is fsynced before
+    # every real operation, so a SIGKILL leaves "dispatched, unobserved" on
+    # disk instead of nothing. Left off by default because every caller that
+    # does not pass a path -- all the tests, most scripts -- has no use for a
+    # file it would then have to clean up.
+    ledger = IndependentEffectLedger(_journal_path=journal_path)
     broker = EffectBroker(ledger=ledger)
 
     # RESTRICTIVE default task (no wildcard) — fail-closed for unknown callers.

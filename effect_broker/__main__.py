@@ -44,6 +44,16 @@ def main() -> None:
         action="store_true",
         help="Show per-experiment details (not just pass/fail summary)",
     )
+    parser.add_argument(
+        "--journal",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Persist the in-flight marker to PATH before each real operation, "
+            "so a crash mid-operation leaves 'dispatched, unobserved' rather "
+            "than nothing. Off by default."
+        ),
+    )
     args = parser.parse_args()
 
     # Suppress same-process warning unless explicitly requested
@@ -52,7 +62,7 @@ def main() -> None:
     if not args.warn_same_process:
         warnings.filterwarnings("ignore", message="SAME-PROCESS", category=UserWarning)
 
-    results, counts = collect_outcome_counts()
+    results, counts = collect_outcome_counts(journal_path=args.journal)
     print_results(results)
     print_outcome_counts(counts)
     sys.stdout.flush()
