@@ -67,7 +67,11 @@ def _capability(
     return Capability(owner, holder, right, target, scope, expiry, nonce, derives_from=derives)
 
 
-def build(journal_path: str | None = None) -> EffectBroker:
+def build(
+    journal_path: str | None = None,
+    journal_max_bytes: int | None = None,
+    journal_keep: int = 1,
+) -> EffectBroker:
     # Create an EXTERNAL independent ledger — the single source of truth
     # This ledger is passed to the broker. Both broker.commit() (direct) and
     # executor.execute() (via-shim) record to this same ledger.
@@ -77,7 +81,11 @@ def build(journal_path: str | None = None) -> EffectBroker:
     # disk instead of nothing. Left off by default because every caller that
     # does not pass a path -- all the tests, most scripts -- has no use for a
     # file it would then have to clean up.
-    ledger = IndependentEffectLedger(_journal_path=journal_path)
+    ledger = IndependentEffectLedger(
+        _journal_path=journal_path,
+        _journal_max_bytes=journal_max_bytes,
+        _journal_keep=journal_keep,
+    )
     broker = EffectBroker(ledger=ledger)
 
     # RESTRICTIVE default task (no wildcard) — fail-closed for unknown callers.

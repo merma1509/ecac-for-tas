@@ -97,26 +97,23 @@ class ExperimentResult:
                 f"this is the 'blocked implies complete' inference in disguise"
             )
 
-
-#: Brokers built during the current run_all_experiments() call.
-#:
-#: Each scenario builds its own broker, so outcome accounting needs a way to
-#: find them afterwards. Module-level mutable state is a smell, so the scope is
-#: strictly one run: run_all_experiments() sets the list, _build_broker() appends,
-#: and the list is cleared in a finally block. Nothing outside a run reads it.
 _RUN_BROKERS: list[EffectBroker] | None = None
-
-#: Journal path applied to every broker built during a run. Set by
-#: collect_outcome_counts(); None means in-memory, which is the default and the
-#: behaviour every existing caller gets.
 _JOURNAL_PATH: str | None = None
+_JOURNAL_MAX_BYTES: int | None = None
+
+#: Rotated segments to retain besides the live file.
+_JOURNAL_KEEP: int = 1
 
 
 def _build_broker() -> EffectBroker:
     """Standard broker setup for all experiments."""
     from .traces import build
 
-    broker = build(journal_path=_JOURNAL_PATH)
+    broker = build(
+        journal_path=_JOURNAL_PATH,
+        journal_max_bytes=_JOURNAL_MAX_BYTES,
+        journal_keep=_JOURNAL_KEEP,
+    )
     if _RUN_BROKERS is not None:
         _RUN_BROKERS.append(broker)
     return broker
@@ -1490,6 +1487,8 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
 
 def collect_outcome_counts(
     journal_path: str | None = None,
+    journal_max_bytes: int | None = None,
+    journal_keep: int = 1,
 ) -> tuple[dict[str, ExperimentResult], OutcomeCounts]:
     """Run the suite and tally every effect by outcome (P4-4).
 
@@ -1499,11 +1498,16 @@ def collect_outcome_counts(
     different executions.
 
     When journal_path is given, every broker built during the run persists its
-    in-flight markers there.
+    in-flight markers there. journal_max_bytes bounds the file: once it reaches
+    that size the live file is rotated to `<path>.1` and replay follows the
+    segments in order. Left of None the journal grows without limit, which is
+    fine for a single run and wrong for a long-lived broker.
     """
-    global _RUN_BROKERS, _JOURNAL_PATH
+    global _RUN_BROKERS, _JOURNAL_PATH, _JOURNAL_MAX_BYTES, _JOURNAL_KEEP
     _RUN_BROKERS = []
     _JOURNAL_PATH = journal_path
+    _JOURNAL_MAX_BYTES = journal_max_bytes
+    _JOURNAL_KEEP = journal_keep
     try:
         results = run_all_experiments()
         totals = OutcomeCounts()
@@ -1523,6 +1527,10 @@ def collect_outcome_counts(
         # path the caller did not ask for on this run.
         _RUN_BROKERS = None
         _JOURNAL_PATH = None
+        # Reset the bound too, or a bounded run would silently impose its limit
+        # on the next unbounded one.
+        _JOURNAL_MAX_BYTES = None
+        _JOURNAL_KEEP = 1
 
 
 def print_results(results: dict[str, ExperimentResult]) -> None:
