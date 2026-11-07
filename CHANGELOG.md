@@ -65,6 +65,22 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ### Added
 
+- **The journal is wired into the build path.** `build(journal_path=...)`,
+  `collect_outcome_counts(journal_path=...)` and
+  `python -m effect_broker --journal PATH` now pass the path down to the
+  ledger. Off by default, so nothing that existed before writes a file.
+
+  Observations are journaled too, and that is the load-bearing part. Without
+  them a _clean_ run recovered as 29 unknowns: authorizations survived, outcome
+  records did not, and recovery reconstructed a field of dispatched-but-
+  unobserved effects. A successful shutdown was indistinguishable from a kill,
+  and the better the run went the worse it looked. `_replay` now restores
+  observations, and `tests/test_journal_wiring.py` pins the difference.
+
+  `reset()` appends a marker instead of truncating, and `_replay` honours it, so
+  effects from a previous run cannot reappear after recovery while the record of
+  what was in flight is not silently discarded.
+
 - **The IN_FLIGHT marker now survives a real crash.** `record_dispatched()`
   fsyncs a one-line JSON record to a journal before the caller reaches the
   syscall, and `IndependentEffectLedger.from_journal()` rebuilds the ledger
