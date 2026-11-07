@@ -123,6 +123,17 @@ whose current `pyproject.toml` version is `0.1.1`.
   `broker.create_real_file_shim()`. Reverting the executor's measurement makes
   it fail with `observed_bytes=None`, which is the point.
 
+- **The outcome counts now agree with the verdict.** `outcome_of()` (which feeds
+  the published `committed` / `unknown` tallies) consulted the observation's
+  source string _before_ the executor's evidence, while `verify()` had always let
+  evidence veto an optimistic observation. So an executor that labelled its
+  observation `executor.apply` while its own measurement said `unknown` was
+  counted as **committed** by the metrics and reported as **UNKNOWN** by the
+  verdict — the published number being the optimistic half of a contradiction.
+  Evidence is now consulted first in both, and `tests/test_outcome_consistency.py`
+  pins the agreement rather than either function alone. Restoring the old
+  ordering makes it fail with `committed=1, unknown=0`.
+
 - **A commit claim for a file effect is now backed by the syscall.** In
   same-process mode `executor.apply` was recorded inside `broker.commit()`,
   which runs _before_ the shim opens the file — so the ledger read "applied"
