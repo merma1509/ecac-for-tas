@@ -35,36 +35,6 @@ whose current `pyproject.toml` version is `0.1.1`.
   an effect that was never attempted. Written before the I/O at all three shim
   call sites.
 
-### Changed
-
-- **TCB size counts code, not comments.** `_count_code_lines` strips comments
-  and blank lines, so the reported TCB figure reflects logic rather than
-  documentation volume.
-
-- **CI no longer skips the sealed eval.** The `Release eval gate` job used to
-  carry `if: github.event_name == 'pull_request' && github.base_ref == 'main'`,
-  so it reported as _skipped_ on every push to `develop`/`main` and on every PR
-  targeting `develop`. It now runs on every push and every pull request, so the
-  sealed evaluation is exercised continuously instead of only at release time.
-  On `main` it remains the required `Release eval gate` status check.
-- `gate` matrix sets `fail-fast: false`: a failing Python version no longer
-  cancels its sibling, which previously surfaced as a _skipped_ required check.
-- Added a `concurrency` group to `ci.yml`: a newer commit on the same ref
-  cancels superseded runs.
-
-- **Five-outcome accounting** (`committed`, `failed`, `unknown`, `denied`,
-  `abandoned`), printed by both entry points. Classification uses closed
-  allow-lists rather than exclusion, so an unrecognised observation source is
-  reported as unexplained instead of being promoted to a commit.
-
-### Removed
-
-- The explicit `actions/cache` step for `~/.cache/uv` in all jobs. It duplicated
-  the cache that `astral-sh/setup-uv` already manages internally (same path,
-  same `uv.lock`-based key), so it only added a second, redundant cache entry.
-
-### Added
-
 - **The journal is wired into the build path.** `build(journal_path=...)`,
   `collect_outcome_counts(journal_path=...)` and
   `python -m effect_broker --journal PATH` now pass the path down to the
@@ -102,7 +72,56 @@ whose current `pyproject.toml` version is `0.1.1`.
   the parent recovers. Five of its tests fail if journaling is switched off,
   which was checked by doing exactly that.
 
+### Changed
+
+- **TCB size counts code, not comments.** `_count_code_lines` strips comments
+  and blank lines, so the reported TCB figure reflects logic rather than
+  documentation volume.
+
+- **CI no longer skips the sealed eval.** The `Release eval gate` job used to
+  carry `if: github.event_name == 'pull_request' && github.base_ref == 'main'`,
+  so it reported as _skipped_ on every push to `develop`/`main` and on every PR
+  targeting `develop`. It now runs on every push and every pull request, so the
+  sealed evaluation is exercised continuously instead of only at release time.
+  On `main` it remains the required `Release eval gate` status check.
+
+- `gate` matrix sets `fail-fast: false`: a failing Python version no longer
+  cancels its sibling, which previously surfaced as a _skipped_ required check.
+
+- Added a `concurrency` group to `ci.yml`: a newer commit on the same ref
+  cancels superseded runs.
+
+- **Five-outcome accounting** (`committed`, `failed`, `unknown`, `denied`,
+  `abandoned`), printed by both entry points. Classification uses closed
+  allow-lists rather than exclusion, so an unrecognised observation source is
+  reported as unexplained instead of being promoted to a commit.
+
+### Removed
+
+- The explicit `actions/cache` step for `~/.cache/uv` in all jobs. It duplicated
+  the cache that `astral-sh/setup-uv` already manages internally (same path,
+  same `uv.lock`-based key), so it only added a second, redundant cache entry.
+
 ### Fixed
+
+- **A commit claim on the IPC path is now backed by the executor's measurement.**
+  The multi-process half of the same defect fixed earlier for the local path:
+  `RealFileShim` recorded an observation straight from the subprocess reply and
+  claimed `committed` on the strength of "the IPC call returned". The write
+  branch now records `EffectEvidence` carrying the size the _executor_ read back
+  with `stat()` after writing, and a short write raises instead of reporting a
+  clean commit. The delete branch confirms the target is actually gone before
+  committing.
+
+  A failure across the process boundary previously left **no** evidence at all:
+  `ProcessExecutorClient` wraps subprocess errors in `RuntimeError`, so the
+  errno-based handlers never fired, and the case that matters — the operation
+  may have landed — read as "never attempted". Those paths now record `unknown`
+  evidence before re-raising.
+
+  `tests/test_ipc_evidence.py` drives the real multi-process path through
+  `broker.create_real_file_shim()`. Reverting the executor's measurement makes
+  it fail with `observed_bytes=None`, which is the point.
 
 - **A commit claim for a file effect is now backed by the syscall.** In
   same-process mode `executor.apply` was recorded inside `broker.commit()`,
@@ -115,9 +134,8 @@ whose current `pyproject.toml` version is `0.1.1`.
   lets evidence veto a bare observation, so the executor can no longer satisfy
   a commit with its own assertion.
 
-  Scope: the same-process path only. The IPC path still relies on the
-  subprocess response, which is a real observation but is not yet converted
-  into `EffectEvidence`.
+  Scope was the same-process path only at the time; the IPC half is fixed
+  separately above.
 
 - **Mediation verdicts are checked, not inferred.** Eighteen sites wrote
   `mediation_complete=not actual_allow` — "the effect was blocked, so mediation
