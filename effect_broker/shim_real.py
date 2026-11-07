@@ -721,6 +721,10 @@ class RealFileShim:
             self.broker.ledger.record_dispatched(
                 self.task_id, nonce, source="shim_real.dispatch"
             )
+            # Opens at the dispatch marker, so evidence reports how long the
+            # operation was in flight in the other process, not how long this
+            # process spent on bookkeeping around it.
+            io_started = time.monotonic()
             try:
                 if op_type == "write":
                     assert content is not None
@@ -738,6 +742,46 @@ class RealFileShim:
                     # session_update may carry taint from CONFIDENTIAL write
                     if result.get("session_update"):
                         self._sync_session_from_subprocess(result["session_update"])
+                    # Evidence from the isolated executor's measurement, not from
+                    # `content`. The subprocess stats the file after writing and
+                    # reports the size it actually landed, so a torn write in the
+                    # other process is visible here. Recording "committed" on the
+                    # strength of "the IPC call returned" would make the broker's
+                    # own expectation the proof
+                    landed = result.get("landed_bytes")
+                    self.broker.ledger.record_evidence(
+                        self.task_id,
+                        nonce,
+                        self._evidence_after_io(
+                            nonce,
+                            op_type,
+                            canon,
+                            io_started,
+                            observed=frozenset({uri}),
+                            transport_response=(
+                                f"subprocess fsize={landed}"
+                                if landed is not None
+                                else "subprocess ok (size unmeasured)"
+                            ),
+                            observed_bytes=landed,
+                        )
+                        if landed is None or landed == len(content)
+                        else self._evidence_failed(
+                            nonce,
+                            op_type,
+                            io_started,
+                            OSError(f"short write: {landed} != {len(content)}"),
+                            observed=frozenset(),
+                        ),
+                    )
+                    if landed is not None and landed != len(content):
+                        self.ops.append(op)
+                        raise PostAuthorizationFailure(
+                            f"[{self.tool_name}] write on {canon} landed {landed} "
+                            f"bytes but {len(content)} were authorized. Outcome is "
+                            f"UNKNOWN: the file exists and is not what was approved.",
+                            effect_id=nonce,
+                        )
                     op.post_exists = True
                     op.post_content = content
                     self.ops.append(op)
@@ -781,6 +825,32 @@ class RealFileShim:
 
                 elif op_type == "delete":
                     self.ipc_client.real_file_delete(canon, self.task_id)
+                    # The executor removed the file; confirm it is actually gone
+                    # before claiming a commit. A delete that returned cleanly
+                    # while the target survives is the case this rules out.
+                    still_there = os.path.exists(canon)
+                    self.broker.ledger.record_evidence(
+                        self.task_id,
+                        nonce,
+                        self._evidence_after_io(
+                            nonce,
+                            op_type,
+                            canon,
+                            io_started,
+                            observed=frozenset({uri}),
+                            transport_response=(
+                                "subprocess gone" if not still_there else "subprocess still-present"
+                            ),
+                        )
+                        if not still_there
+                        else self._evidence_failed(
+                            nonce,
+                            op_type,
+                            io_started,
+                            OSError("target still present after subprocess delete"),
+                            observed=frozenset(),
+                        ),
+                    )
                     op.post_exists = False
                     op.post_content = post_content
                     self.ops.append(op)
@@ -789,11 +859,26 @@ class RealFileShim:
                 else:
                     raise ValueError(f"Unknown op type: {op_type}")
 
+            except RuntimeError as ex:
+                # What the IPC client actually raises when the executor reports a
+                # failure: it wraps the subprocess's error, so the errno-based
+                # handlers below never fire on this path. Without this branch a
+                # failure in the other process left NO evidence at all, and the
+                # ledger read a possibly-applied operation as never attempted.
+                self._record_failure_evidence(nonce, op_type, io_started, ex)
+                raise
             except FileNotFoundError as ex:
+                # The operation crossed a process boundary, so this process
+                # cannot know whether anything landed before the error surfaced.
+                # Unknown, not absent: an empty evidence set would let the
+                # ledger treat a possibly-applied write as never executed.
+                self._record_failure_evidence(nonce, op_type, io_started, ex)
                 raise OSError(f"File not found: {canon}") from ex
             except PermissionError as ex:
+                self._record_failure_evidence(nonce, op_type, io_started, ex)
                 raise OSError(f"Permission denied: {canon}") from ex
             except OSError as ex:
+                self._record_failure_evidence(nonce, op_type, io_started, ex)
                 raise PostAuthorizationFailure(
                     f"[{self.tool_name}] {op_type} on {canon} OS ERROR after ALLOW: {ex}. "
                     f"Outcome is UNKNOWN: the write may have partially landed and "
