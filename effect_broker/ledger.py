@@ -39,11 +39,9 @@ import json
 import os
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
-if TYPE_CHECKING:
-    from .model import EffectEvidence
-
+from .model import EffectEvidence
 
 #: Reason prefix for an effect that was dispatched but never observed.
 #: Distinguished from a plain "authorized_not_observed" because the two mean
@@ -213,6 +211,15 @@ class IndependentEffectLedger:
         if key not in self._observations:
             self._observations[key] = []
         self._observations[key].append(entry)
+        self._append_journal(
+            {
+                "kind": "observed",
+                "task_id": task_id,
+                "nonce": nonce,
+                "observed_targets": sorted(observed_targets) if observed_targets else [],
+                "source": source,
+            }
+        )
 
     def record_dispatched(
         self,
@@ -414,6 +421,15 @@ class IndependentEffectLedger:
     def _replay(self, rec: dict[str, object]) -> None:
         """Apply one journal record. Mirrors the recording API, without re-logging."""
         kind = rec.get("kind")
+        if kind == "reset":
+            # Everything before this marker belongs to a previous run. Forgetting
+            # it is the point of the reset, and keeping it would let a crash
+            # report effects the operator deliberately discarded.
+            self._authorizations.clear()
+            self._observations.clear()
+            self._dispatched.clear()
+            self._evidences.clear()
+            return
         task_id = str(rec.get("task_id", ""))
         nonce = str(rec.get("nonce", ""))
         if not task_id or not nonce:
@@ -423,6 +439,14 @@ class IndependentEffectLedger:
             self.record_authorization(task_id, nonce, targets, source=str(rec.get("source", "")))
         elif kind == "dispatched":
             self.record_dispatched(task_id, nonce, source=str(rec.get("source", "")))
+        elif kind == "observed":
+            targets = frozenset(str(t) for t in cast(list[str], rec.get("observed_targets", [])))
+            self.record_observation(
+                task_id,
+                nonce,
+                targets if targets else None,
+                source=str(rec.get("source", "")),
+            )
         elif kind == "evidence":
             self.record_evidence(
                 task_id,
@@ -753,12 +777,21 @@ class IndependentEffectLedger:
         return self._authorizations
 
     def reset(self) -> None:
-        """Clear all entries. Use with caution (testing only in same-process model)."""
+        """Clear all entries. Use with caution (testing only in same-process model).
+
+        A journaled ledger records the reset as a marker line rather than
+        truncating the file. Truncating would make the journal's meaning depend
+        on when you look at it, and would lose the record of whatever was in
+        flight when the reset happened -- which is the one thing a crash log
+        must not quietly discard. `from_journal()` honours the marker by
+        starting empty from that point.
+        """
         self._authorizations.clear()
         self._observations.clear()
         self._dispatched.clear()
         self._evidences.clear()
         self._logical_time = 0.0
+        self._append_journal({"kind": "reset"})
 
 
 #: Observation sources that PROVE the effect reached external state.
