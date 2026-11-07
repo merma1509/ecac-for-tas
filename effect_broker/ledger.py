@@ -51,6 +51,24 @@ from .model import EffectEvidence
 DISPOSITION_UNKNOWN = "dispatched_outcome_unknown"
 
 
+def _journal_segments(path: str) -> list[str]:
+    """Journal files to replay, oldest first.
+
+    Rotation moves the live file to `<path>.1` and shifts older ones up, so the
+    highest suffix is the oldest. Replaying in that order keeps "later record
+    wins", which is what a reader of a single append-only file would expect.
+    """
+    segments: list[str] = []
+    index = 1
+    while os.path.exists(f"{path}.{index}"):
+        segments.append(f"{path}.{index}")
+        index += 1
+    segments.reverse()  # highest suffix == oldest segment
+    if os.path.exists(path):
+        segments.append(path)
+    return segments
+
+
 class LedgerVerdict(Enum):
     """Verdict of the independent effect ledger.
 
@@ -116,11 +134,10 @@ class IndependentEffectLedger:
     _evidences: dict[tuple[str, str], list[EffectEvidence]] = field(default_factory=dict)
     _counter: int = field(default=0)
     _logical_time: float = 0.0
-    # Optional append-only journal on disk. When set, every IN_FLIGHT marker is
-    # fsynced before the caller reaches the syscall, so a SIGKILL leaves the
-    # marker behind. Without it "a crash mid-operation" is only ever a story the
-    # tests tell themselves: the state they construct is unreachable in reality.
     _journal_path: str | None = None
+    _journal_max_bytes: int | None = None
+    _journal_keep: int = 1
+    journal_truncated: bool = False
 
     # ---- Recording API (called by broker.gate and executor/store) ----
     def record_authorization(
@@ -377,44 +394,103 @@ class IndependentEffectLedger:
         """
         if self._journal_path is None:
             return
+        self._rotate_if_needed()
         line = json.dumps(record, sort_keys=True) + "\n"
         with open(self._journal_path, "a", encoding="utf-8") as fh:
             fh.write(line)
             fh.flush()
             os.fsync(fh.fileno())
 
+    def _rotate_if_needed(self) -> None:
+        """Move the current journal aside once it outgrows the limit.
+
+        Rotation happens *before* an append, so a segment ends cleanly on a line
+        boundary and the reader never has to reason about a seam mid-record.
+
+        The new segment starts with a `segment` marker rather than continuing
+        silently. A reader that starts in the middle of a rotated file would
+        otherwise see observations whose authorizations live in the previous
+        file and report them as effects nobody authorized -- a bypass that never
+        happened. The marker is what lets `from_journal()` say "history was
+        truncated here" instead of inventing one.
+        """
+        if self._journal_max_bytes is None or self._journal_path is None:
+            return
+        try:
+            size = os.path.getsize(self._journal_path)
+        except OSError:
+            return  # no file yet; nothing to rotate
+        if size < self._journal_max_bytes:
+            return
+        # Shift retained segments: .1 -> .2, .2 -> .3, oldest dropped.
+        for index in range(self._journal_keep, 0, -1):
+            src = f"{self._journal_path}.{index}"
+            dst = f"{self._journal_path}.{index + 1}"
+            if os.path.exists(src):
+                if index == self._journal_keep:
+                    os.unlink(src)  # beyond the retention window
+                else:
+                    os.replace(src, dst)
+        os.replace(self._journal_path, f"{self._journal_path}.1")
+        self._write_segment_marker()
+
+    def _write_segment_marker(self) -> None:
+        """Open a fresh segment with a marker recording the truncation."""
+        assert self._journal_path is not None
+        line = json.dumps({"kind": "segment", "partial_history": True}, sort_keys=True) + "\n"
+        with open(self._journal_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+
     @classmethod
-    def from_journal(cls, path: str) -> IndependentEffectLedger:
+    def from_journal(
+        cls,
+        path: str,
+        journal_max_bytes: int | None = None,
+        journal_keep: int = 1,
+    ) -> IndependentEffectLedger:
         """Rebuild a ledger from a journal left behind by a crashed process.
 
-        Only what was durable is restored: authorizations, dispatch markers and
-        evidence. There are deliberately no observations to recover -- an
-        observation is written after the I/O completes, so by definition it is
-        not in the journal of a process that died mid-operation. That absence is
-        the finding, not a gap in the recovery.
+        Everything durable is restored: authorizations, dispatch markers,
+        evidence and observations. Observations were originally left out, on the
+        reasoning that one is written after the I/O completes and so cannot be in
+        the journal of a process that died mid-operation. That reasoning was
+        right about a crash and wrong about every other run: a *clean* shutdown
+        also left no outcome records, so recovery reconstructed a field of
+        dispatched-but-unobserved effects and reported a catastrophe that had not
+        happened. The absence of an observation now carries information -- it
+        means nothing was recorded -- which is only true if presence does too.
 
         A truncated final line is dropped rather than raising: the process was
         killed mid-write, which is precisely the case being reconstructed.
         """
         ledger = cls()
-        # Journaling is enabled only AFTER the replay. Constructing the ledger
-        # with the path already set would make every recovery append a second
-        # copy of every record, doubling the file on each open.
+        ledger._journal_max_bytes = journal_max_bytes
+        ledger._journal_keep = journal_keep
         if not os.path.exists(path):
             ledger._journal_path = path
             return ledger
-        with open(path, encoding="utf-8") as fh:
-            raw = fh.read()
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                # Interrupted write; everything after it is suspect too.
-                break
-            ledger._replay(rec)
+        # Oldest segment first, so a later record still overrides an earlier one
+        # exactly as it did when the whole history lived in one file.
+        truncated = False
+        for segment in _journal_segments(path):
+            with open(segment, encoding="utf-8") as fh:
+                raw = fh.read()
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    # Interrupted write; everything after it is suspect too.
+                    break
+                if rec.get("kind") == "segment":
+                    truncated = True
+                    continue
+                ledger._replay(rec)
+        ledger.journal_truncated = truncated
         ledger._journal_path = path
         return ledger
 
@@ -422,9 +498,6 @@ class IndependentEffectLedger:
         """Apply one journal record. Mirrors the recording API, without re-logging."""
         kind = rec.get("kind")
         if kind == "reset":
-            # Everything before this marker belongs to a previous run. Forgetting
-            # it is the point of the reset, and keeping it would let a crash
-            # report effects the operator deliberately discarded.
             self._authorizations.clear()
             self._observations.clear()
             self._dispatched.clear()
@@ -516,9 +589,6 @@ class IndependentEffectLedger:
                 has_shim_source = any(entry.source.startswith("shim.") for entry in obs_entries)
                 all_blocked = all(entry.source.startswith("shim.") for entry in obs_entries)
                 if has_shim_source and all_blocked:
-                    # Explicit shim block (BCC, capability mismatch) — CONFIRMED_BLOCKED
-                    # The shim observed and blocked. No auth entry needed because
-                    # the shim is the authoritative boundary for this class of effects
                     return LedgerVerdict.CONFIRMED_BLOCKED
                 return UnknownLedgerResult(
                     reason=f"observed_without_authorization(task={task_id},nonce={nonce})"
@@ -531,12 +601,6 @@ class IndependentEffectLedger:
             authorized_targets |= entry.authorized_targets
 
         if not obs_entries:
-            # Authorized but no observation. Two very different situations:
-            #   - nothing was dispatched: an ordinary gap (possible bypass);
-            #   - we dispatched and never learned the result: a crash or a
-            #     transport fault mid-operation. The effect may well have landed.
-            # Reporting both as one string hid the second, which is the one that
-            # matters. Both are still UNKNOWN -- never COMMITTED, never safe.
             if self.was_dispatched(task_id, nonce):
                 return UnknownLedgerResult(
                     reason=f"{DISPOSITION_UNKNOWN}(task={task_id},nonce={nonce},"

@@ -54,7 +54,29 @@ def main() -> None:
             "than nothing. Off by default."
         ),
     )
+    parser.add_argument(
+        "--journal-max-bytes",
+        metavar="N",
+        type=int,
+        default=None,
+        help=(
+            "Rotate the journal to PATH.1 once it reaches N bytes. Requires "
+            "--journal. Off by default, which leaves one unbounded file."
+        ),
+    )
+    parser.add_argument(
+        "--journal-keep",
+        metavar="N",
+        type=int,
+        default=1,
+        help="Rotated journal segments to retain besides the live file (default: 1).",
+    )
     args = parser.parse_args()
+
+    if args.journal_max_bytes is not None and not args.journal:
+        parser.error("--journal-max-bytes requires --journal")
+    if args.journal_keep < 1:
+        parser.error("--journal-keep must be at least 1")
 
     # Suppress same-process warning unless explicitly requested
     import warnings
@@ -62,7 +84,11 @@ def main() -> None:
     if not args.warn_same_process:
         warnings.filterwarnings("ignore", message="SAME-PROCESS", category=UserWarning)
 
-    results, counts = collect_outcome_counts(journal_path=args.journal)
+    results, counts = collect_outcome_counts(
+        journal_path=args.journal,
+        journal_max_bytes=args.journal_max_bytes,
+        journal_keep=args.journal_keep,
+    )
     print_results(results)
     print_outcome_counts(counts)
     sys.stdout.flush()
@@ -78,12 +104,6 @@ def main() -> None:
                 print(f"    replay_blocked={result.replay_blocked}")
 
     # Exit code: 0 only if every result was EVALUATED and passed.
-    #
-    # The old form was `all(r.mediation_complete ...)`, which treated an
-    # unevaluated result as a pass the moment the field was defaulted to True,
-    # and would treat None as failure-by-accident otherwise. "Did not check" is
-    # neither pass nor fail; making it a separate condition forces the missing
-    # check to be visible instead of silently green.
     unevaluated = [n for n, r in results.items() if not r.mediation_evaluated]
     failed = [
         n

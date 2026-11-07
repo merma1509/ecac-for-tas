@@ -51,6 +51,24 @@ whose current `pyproject.toml` version is `0.1.1`.
   effects from a previous run cannot reappear after recovery while the record of
   what was in flight is not silently discarded.
 
+- **The journal can now be bounded** (`ledger.py`). `_journal_max_bytes` rotates
+  the live file to `<path>.1` once it outgrows the limit, retaining
+  `_journal_keep` segments besides it; `from_journal()` replays the segments
+  oldest-first so "later record wins" still holds. Growth was previously
+  unbounded — roughly 150 bytes per effect, so ~150 MB per million effects, all
+  of it re-read on every recovery. Off by default, so existing callers keep one
+  file.
+
+  A rotated segment opens with a `segment` marker, and recovery surfaces it as
+  `journal_truncated`. Without that the reader would start mid-history, see
+  observations whose authorizations had been dropped, and report effects nobody
+  authorized — a bypass that never happened, invented by the log that exists to
+  detect real ones.
+
+  Reachable from `build(journal_max_bytes=..., journal_keep=...)`,
+  `collect_outcome_counts(...)`, `from_journal(...)` and
+  `python -m effect_broker --journal PATH --journal-max-bytes N --journal-keep N`.
+
 - **The IN_FLIGHT marker now survives a real crash.** `record_dispatched()`
   fsyncs a one-line JSON record to a journal before the caller reaches the
   syscall, and `IndependentEffectLedger.from_journal()` rebuilds the ledger
