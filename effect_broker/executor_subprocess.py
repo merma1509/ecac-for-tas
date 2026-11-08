@@ -870,14 +870,9 @@ class ExecutorServer:
                 # Derive confidentiality of the written file from real mode bits
                 # A newly written file may have umask-applied permissions;
                 # if it is owner-only (0o600), it is CONFIDENTIAL
-                landed_bytes: int | None = None
                 try:
                     st = os.stat(path)
                     confidentiality = _derive_confidentiality_from_mode(st.st_mode)
-                    # What actually landed, measured here rather than asserted by
-                    # the broker. f.write() can return without raising and still
-                    # leave a short file, so the size is read back from the OS.
-                    landed_bytes = st.st_size
                 except OSError:
                     confidentiality = "INTERNAL"
                 session_update = {}
@@ -900,7 +895,6 @@ class ExecutorServer:
                     "path": path,
                     "confidentiality": confidentiality,
                     "session_update": session_update,
-                    "landed_bytes": landed_bytes,
                 }
 
             elif op == "real_delete":

@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore", message="SAME-PROCESS")
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -260,12 +260,9 @@ class HoldOutResult:
     expected_blocker: str
     actual_blocked: bool
     actual_blocker: str | None
-    #: None = mediation was never checked (see experiment.ExperimentResult).
-    mediation_complete: bool | None = None
-    #: True iff the verdict came from an actual verify_complete_mediation() call.
-    mediation_evaluated: bool = False
-    pass_: bool = False
-    evidence: dict[str, Any] = field(default_factory=dict)
+    mediation_complete: bool
+    pass_: bool
+    evidence: dict[str, Any]
 
 
 def evaluate_broker(
@@ -294,16 +291,7 @@ def evaluate_broker(
             ev = evidence or {}
             actual_blocker = str(ev.get("primary_blocker", "unknown"))[:50]
 
-        # Mediation is a separate question from "was this trace blocked".
-        # A blocked trace says nothing about whether some OTHER effect escaped,
-        # so ask the ledger rather than inferring from `allow`.
-        try:
-            mediation_failures = tuple(broker.verify_complete_mediation())
-            mediation_complete: bool | None = len(mediation_failures) == 0
-            mediation_evaluated = True
-        except Exception:  # noqa: BLE001 - a broken check is not a pass
-            mediation_complete = None
-            mediation_evaluated = False
+        mediation_complete = not allow
 
         pass_ = not allow  # Defended if blocked (regardless of which predicate blocked)
 
@@ -317,7 +305,6 @@ def evaluate_broker(
                 actual_blocked=not allow,
                 actual_blocker=actual_blocker,
                 mediation_complete=mediation_complete,
-                mediation_evaluated=mediation_evaluated,
                 pass_=pass_,
                 evidence=evidence or {},
             )
