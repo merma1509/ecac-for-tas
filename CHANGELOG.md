@@ -12,89 +12,7 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ## [Unreleased]
 
-### Added
-
-- **Metrics tripwire** (`scripts/metrics_snapshot.py`). Compares two metric
-  snapshots and exits non-zero on regression, so a change that slows the gate
-  path gets caught by CI instead of being noticed later.
-
-- **Provenance transforms** (`provenance_transforms.py`). Label-algebra helpers
-  for deriving output labels from inputs, with the transform identities pinned
-  by tests.
-
-- **Effect states and evidence** (`model.py`). `EffectState`,
-  `ALLOWED_TRANSITIONS`, `can_transition()`, and `EffectEvidence` — the last
-  makes an unbacked `committed` state unconstructible, so a commit claim must
-  carry what backs it. `PostAuthorizationFailure` replaces the "security event"
-  mislabel for failures that happen after an effect was authorized.
-
-- **In-flight marker** (`ledger.py`). `record_dispatched()` / `was_dispatched()`
-  record that an effect was handed to the OS or the network before it is
-  observed, and `verify()` distinguishes "dispatched, never observed" from
-  "never dispatched". Without it a crash mid-operation is indistinguishable from
-  an effect that was never attempted. Written before the I/O at all three shim
-  call sites.
-
-- **The journal is wired into the build path.** `build(journal_path=...)`,
-  `collect_outcome_counts(journal_path=...)` and
-  `python -m effect_broker --journal PATH` now pass the path down to the
-  ledger. Off by default, so nothing that existed before writes a file.
-
-  Observations are journaled too, and that is the load-bearing part. Without
-  them a _clean_ run recovered as 29 unknowns: authorizations survived, outcome
-  records did not, and recovery reconstructed a field of dispatched-but-
-  unobserved effects. A successful shutdown was indistinguishable from a kill,
-  and the better the run went the worse it looked. `_replay` now restores
-  observations, and `tests/test_journal_wiring.py` pins the difference.
-
-  `reset()` appends a marker instead of truncating, and `_replay` honours it, so
-  effects from a previous run cannot reappear after recovery while the record of
-  what was in flight is not silently discarded.
-
-- **The journal can now be bounded** (`ledger.py`). `_journal_max_bytes` rotates
-  the live file to `<path>.1` once it outgrows the limit, retaining
-  `_journal_keep` segments besides it; `from_journal()` replays the segments
-  oldest-first so "later record wins" still holds. Growth was previously
-  unbounded — roughly 150 bytes per effect, so ~150 MB per million effects, all
-  of it re-read on every recovery. Off by default, so existing callers keep one
-  file.
-
-  A rotated segment opens with a `segment` marker, and recovery surfaces it as
-  `journal_truncated`. Without that the reader would start mid-history, see
-  observations whose authorizations had been dropped, and report effects nobody
-  authorized — a bypass that never happened, invented by the log that exists to
-  detect real ones.
-
-  Reachable from `build(journal_max_bytes=..., journal_keep=...)`,
-  `collect_outcome_counts(...)`, `from_journal(...)` and
-  `python -m effect_broker --journal PATH --journal-max-bytes N --journal-keep N`.
-
-- **The IN_FLIGHT marker now survives a real crash.** `record_dispatched()`
-  fsyncs a one-line JSON record to a journal before the caller reaches the
-  syscall, and `IndependentEffectLedger.from_journal()` rebuilds the ledger
-  from what is left on disk. Until now the marker existed only in memory, so
-  "the process died between the I/O and the bookkeeping" was a state the tests
-  constructed by hand and nothing could actually reach — the docstring claimed
-  the marker was persisted, and it was not.
-
-  After a kill the verdict is `dispatched_outcome_unknown`, not
-  `no_record`: the recovery knows an operation was mid-flight. A torn final
-  line is dropped, since a process killed mid-write is the case being
-  reconstructed, and replaying does not write back to the journal.
-
-  Persistence is opt-in via `journal_path`; the default stays in-memory, so
-  existing behaviour is unchanged.
-
-- **A crash harness that actually kills.** `tests/test_crash_harness.py`
-  SIGKILLs a child parked between the marker and the outcome, then asserts what
-  the parent recovers. Five of its tests fail if journaling is switched off,
-  which was checked by doing exactly that.
-
 ### Changed
-
-- **TCB size counts code, not comments.** `_count_code_lines` strips comments
-  and blank lines, so the reported TCB figure reflects logic rather than
-  documentation volume.
 
 - **CI no longer skips the sealed eval.** The `Release eval gate` job used to
   carry `if: github.event_name == 'pull_request' && github.base_ref == 'main'`,
@@ -102,17 +20,10 @@ whose current `pyproject.toml` version is `0.1.1`.
   targeting `develop`. It now runs on every push and every pull request, so the
   sealed evaluation is exercised continuously instead of only at release time.
   On `main` it remains the required `Release eval gate` status check.
-
 - `gate` matrix sets `fail-fast: false`: a failing Python version no longer
   cancels its sibling, which previously surfaced as a _skipped_ required check.
-
 - Added a `concurrency` group to `ci.yml`: a newer commit on the same ref
   cancels superseded runs.
-
-- **Five-outcome accounting** (`committed`, `failed`, `unknown`, `denied`,
-  `abandoned`), printed by both entry points. Classification uses closed
-  allow-lists rather than exclusion, so an unrecognised observation source is
-  reported as unexplained instead of being promoted to a commit.
 
 ### Removed
 
@@ -121,71 +32,6 @@ whose current `pyproject.toml` version is `0.1.1`.
   same `uv.lock`-based key), so it only added a second, redundant cache entry.
 
 ### Fixed
-
-- **A commit claim on the IPC path is now backed by the executor's measurement.**
-  The multi-process half of the same defect fixed earlier for the local path:
-  `RealFileShim` recorded an observation straight from the subprocess reply and
-  claimed `committed` on the strength of "the IPC call returned". The write
-  branch now records `EffectEvidence` carrying the size the _executor_ read back
-  with `stat()` after writing, and a short write raises instead of reporting a
-  clean commit. The delete branch confirms the target is actually gone before
-  committing.
-
-  A failure across the process boundary previously left **no** evidence at all:
-  `ProcessExecutorClient` wraps subprocess errors in `RuntimeError`, so the
-  errno-based handlers never fired, and the case that matters — the operation
-  may have landed — read as "never attempted". Those paths now record `unknown`
-  evidence before re-raising.
-
-  `tests/test_ipc_evidence.py` drives the real multi-process path through
-  `broker.create_real_file_shim()`. Reverting the executor's measurement makes
-  it fail with `observed_bytes=None`, which is the point.
-
-- **The outcome counts now agree with the verdict.** `outcome_of()` (which feeds
-  the published `committed` / `unknown` tallies) consulted the observation's
-  source string _before_ the executor's evidence, while `verify()` had always let
-  evidence veto an optimistic observation. So an executor that labelled its
-  observation `executor.apply` while its own measurement said `unknown` was
-  counted as **committed** by the metrics and reported as **UNKNOWN** by the
-  verdict — the published number being the optimistic half of a contradiction.
-  Evidence is now consulted first in both, and `tests/test_outcome_consistency.py`
-  pins the agreement rather than either function alone. Restoring the old
-  ordering makes it fail with `committed=1, unknown=0`.
-
-- **A commit claim for a file effect is now backed by the syscall.** In
-  same-process mode `executor.apply` was recorded inside `broker.commit()`,
-  which runs _before_ the shim opens the file — so the ledger read "applied"
-  for a write that had not happened yet, and reported `CONFIRMED_COMMITTED` for
-  a read whose `open()` had raised. `RealFileShim` now records `EffectEvidence`
-  after the syscall: the size is read back with `stat()` rather than taken from
-  the request, a delete is only committed if the target is actually gone, and
-  every failure path leaves `unknown` evidence before raising. `ledger.verify()`
-  lets evidence veto a bare observation, so the executor can no longer satisfy
-  a commit with its own assertion.
-
-  Scope was the same-process path only at the time; the IPC half is fixed
-  separately above.
-
-- **Mediation verdicts are checked, not inferred.** Eighteen sites wrote
-  `mediation_complete=not actual_allow` — "the effect was blocked, so mediation
-  must be complete". That is inverted in its effect: the more successfully the
-  suite blocked, the more confidently it declared mediation complete, and the
-  scenario that would expose a hole (one effect escaping while another is
-  blocked) was the one nobody checked. `mediation_complete` is now `None` until
-  something asks the ledger, alongside `mediation_evaluated`, and
-  `__post_init__` rejects either field without the other.
-
-- **A second `all(mediation_complete)` aggregate** in `experiment._main()` had
-  the same defect as the one in `__main__.py`; both now require an explicit
-  evaluation and report unevaluated results by name.
-
-- **IPC payload fields are required.** `_require_field` makes a missing field
-  fail loudly instead of deserializing to `None` and continuing with a value
-  that looks legitimate.
-
-- **Label exceptions survive the IPC boundary.** `label_exception_to_dict` /
-  `dict_to_label_exception` carry the structured reason across instead of
-  degrading it to a string.
 
 - Action runtime warnings from the Node.js 20 deprecation. All actions moved to
   Node 24 lines: `actions/checkout@v7`, `actions/cache` (dropped),

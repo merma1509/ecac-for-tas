@@ -307,48 +307,15 @@ def compute_metrics() -> EvaluationMetrics:
     return m
 
 
-def _count_code_lines(text: str) -> int:
-    """Count non-blank, non-comment lines.
-
-    Raw line count was misleading: documenting a decision grew the reported
-    TCB by 171 lines without adding a single executable statement. The metric
-    exists to size what must be CORRECT, so comments and blank lines -- which
-    no attacker can exploit -- must not inflate it.
-    """
-    return sum(
-        1
-        for line in text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    )
-
-
 def tcb_size() -> int:
-    """Executable lines in the trusted core (broker + model).
-
-    Counts code lines only; see _count_code_lines. Use this as the trend
-    metric: an increase means more logic the security argument depends on.
-    """
+    """Lines of code in the trusted core (broker + model)."""
     root = Path(__file__).resolve().parent.parent
     total = 0
     for rel in _TCB_FILES:
         path = root / rel
         if path.exists():
-            total += _count_code_lines(path.read_text())
+            total += len(path.read_text().splitlines())
     return total
-
-
-def tcb_size_raw() -> int:
-    """Raw line count of the trusted core, for reference only.
-
-    Retained because earlier reports quoted this number; it is NOT the metric
-    to track. `tcb_size()` is.
-    """
-    root = Path(__file__).resolve().parent.parent
-    return sum(
-        len((root / rel).read_text().splitlines())
-        for rel in _TCB_FILES
-        if (root / rel).exists()
-    )
 
 
 def session_taint_metrics() -> dict[str, object]:

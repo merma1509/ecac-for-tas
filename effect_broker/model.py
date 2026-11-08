@@ -26,7 +26,7 @@ import hashlib
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal, TypedDict
+from typing import TypedDict
 
 from .lattice import Confidentiality, Integrity
 
@@ -346,29 +346,6 @@ class Session:
         self._tainted_resources.clear()
         self._taint_reason = ""
 
-    def restore_taint(self, records: dict[str, tuple[str, str | None]]) -> None:
-        """Restore per-resource taint from a serialized snapshot (IPC).
-
-        `records` maps resource → (reason, cleared_by). Unlike calling
-        `taint_for_send()` per resource, this preserves the `cleared_by` marker:
-        a resource that was legitimately declassified before serialization stays
-        declassified after deserialization.
-
-        Restoring through `taint_for_send()` alone re-creates every resource as
-        ACTIVE, which silently turns a granted declass into a false denial once
-        the session crosses into the executor subprocess
-
-        This is the public counterpart to `session_state_to_dict()`; it exists so
-        the codec never has to mutate `_tainted_resources` directly.
-        """
-        for resource, (reason, cleared_by) in records.items():
-            self.taint_for_send(resource=resource, reason=reason)
-            record = self._tainted_resources.get(resource)
-            if record is not None:
-                record.cleared_by = cleared_by
-        # Recompute the legacy derived reason from the restored records.
-        self._taint_reason = ""
-
     @property
     def taint_reason(self) -> str:
         """First active (uncleared) taint reason, or "" if none. For evidence."""
@@ -464,33 +441,15 @@ class Session:
     def is_trusted_provenance(self, datum: Data) -> bool:
         """True if `datum` is the unmodified output of a committed read.
 
-        A datum is trusted only if ALL of the following hold:
+        verifies ID AND scope AND (content hash where stored).
+        A datum is trusted only if:
           - its provenance_id exists in the registry, AND
           - its scope_hash matches the capability scope that issued it
             (prevents cross-capability reuse of a leaked provenance_id), AND
           - its name matches the committed read output, AND
-          - its CONFIDENTIALITY and INTEGRITY labels match the recorded ones
-            (labels are part of the datum's identity, not decoration — see
-            below), AND
           - if the entry recorded a content hash, the datum content matches it.
-
-        LABELS ARE PART OF IDENTITY:
-          A valid provenance_id must not permit changing the associated labels.
-          Without the label comparison, a tool could read a PUBLIC/UNTRUSTED
-          file, keep the legitimate provenance_id, and re-declare the result
-          CONFIDENTIAL/HIGH — defeating Myers-Liskov (claiming more secrecy
-          than held) and Biba (claiming more integrity than held) at once.
-
-          This is safe for legitimate labelling because confidentiality is
-          derived from trusted OS state in one place (statx.derive_provenance:
-          statx bits -> permission bits -> keyword -> deny-most) and its
-          integrity is always USER for OS-derived content. The label recorded
-          at read-commit time is therefore authoritative; a caller that wants
-          a different label must obtain a new committed read under a different
-          capability — not edit the field.
-
-        Data without a provenance_id, or with a wrong scope/name/label/content,
-        is UNTRUSTED (a forge cannot mint a valid scope_hash).
+        Data without a provenance_id, or with a wrong scope/name/content, is
+        UNTRUSTED (a forge cannot mint a valid scope_hash).
         """
         if datum.provenance_id is None or datum.scope_hash is None:
             return False
@@ -501,53 +460,9 @@ class Session:
             return False
         if entry.data.name != datum.name:
             return False
-        # Labels must match the recorded datum exactly. Comparing with != (not
-        # <) is deliberate: ANY divergence — up or down — breaks the binding.
-        if entry.data.confidentiality != datum.confidentiality:
-            return False
-        if entry.data.integrity != datum.integrity:
-            return False
         if entry.content_hash is not None:
             return compute_content_hash(datum.content) == entry.content_hash
         return True
-
-    def provenance_mismatch_reason(self, datum: Data) -> str:
-        """Explain WHY `datum` is not trusted provenance (for evidence strings).
-
-        Returns "trusted" when the datum is valid. Otherwise a precise reason
-        naming the diverging field with both the recorded and the claimed
-        value, so an operator can distinguish a forged label from a stale
-        provenance_id. Used by verify_effect_provenance() to keep evidence
-        actionable instead of the previous generic message.
-        """
-        if datum.provenance_id is None:
-            return "missing-provenance-id"
-        if datum.scope_hash is None:
-            return "missing-scope-hash"
-        entry = self._read_provenance.get(datum.provenance_id)
-        if entry is None:
-            return f"unknown-provenance-id({datum.provenance_id})"
-        if entry.scope_hash != datum.scope_hash:
-            return (
-                f"scope-mismatch(recorded={entry.scope_hash},"
-                f"claimed={datum.scope_hash})"
-            )
-        if entry.data.name != datum.name:
-            return f"name-mismatch(recorded={entry.data.name},claimed={datum.name})"
-        if entry.data.confidentiality != datum.confidentiality:
-            return (
-                f"confidentiality-relabelled(recorded={entry.data.confidentiality.name},"
-                f"claimed={datum.confidentiality.name})"
-            )
-        if entry.data.integrity != datum.integrity:
-            return (
-                f"integrity-relabelled(recorded={entry.data.integrity.name},"
-                f"claimed={datum.integrity.name})"
-            )
-        if entry.content_hash is not None:
-            if compute_content_hash(datum.content) != entry.content_hash:
-                return "content-mismatch"
-        return "trusted"
 
     def verify_effect_provenance(self, effect: Effect) -> tuple[bool, str]:
         """Verify high-integrity data comes from trusted, in-scope broker reads.
@@ -572,11 +487,9 @@ class Session:
                     f"datum={datum.name}, "
                     f"integrity={datum.integrity.name}, "
                     f"prov_id={datum.provenance_id!r}, "
-                    f"scope={datum.scope_hash!r}, "
-                    f"reason={self.provenance_mismatch_reason(datum)}): "
+                    f"scope={datum.scope_hash!r}): "
                     f"HIGH+ integrity requires broker-monitored origin whose "
-                    f"provenance_id, scope_hash, name and labels all match a "
-                    f"committed read."
+                    f"provenance_id, scope_hash and name all match a committed read."
                 )
         return True, "trusted"
 
@@ -769,19 +682,6 @@ class Data:
         3. FlowOK checks: does broker._read_provenance contain this ID?
            YES → Data is from broker-mediated read → TRUSTED
            NO  → Data is from untrusted source → UNTRUSTED
-
-    TRANSFORMATIONS:
-      Which operations preserve a datum's provenance (and hence its labels) is
-      defined as a machine-readable table, not prose:
-      `effect_broker.provenance_transforms.PROVENANCE_TRANSFORMS`.
-
-      The rule: a transformation preserves provenance iff its output is a
-      deterministic function of its inputs AND every output byte is
-      attributable to an input byte. Summarise/translate/model-generate BREAK
-      provenance (their output is new content and must be labelled UNTRUSTED);
-      slicing/hashing/encryption preserve it; concatenation preserves it but
-      requires the lattice JOIN across all inputs (confidentiality MAX,
-      integrity MIN), never the primary input's labels.
     """
 
     name: str
@@ -1037,174 +937,3 @@ class Commit:
     # the SAME hash. This closes the gate↔execute coupling gap in same-process
     # mode (IPC mode already had this via executor_subprocess._verify_content_binding).
     authorized_content_hash: str | None = None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Effect lifecycle: evidence-based outcome recording
-# ─────────────────────────────────────────────────────────────────────────────
-# Replaces the implicit two-step (gate -> apply) with a recorded state machine.
-# The security property: COMMITTED may be recorded ONLY from evidence produced
-# by the executor that performed the protected operation -- never from the
-# gate's own decision. Before this, a transport failure after ALLOW left the
-# ledger with auth > 0 and obs = 0, which is UNKNOWN, yet the code reported it
-# as a security event and never distinguished "committed" from "attempted".
-
-
-class EffectState(Enum):
-    """Where an effect is in its lifecycle.
-
-    PREPARED ──gate──> AUTHORIZED ──dispatch──> IN_FLIGHT ──evidence──> COMMITTED
-       │                    │                        │
-       └──blocked──> DENIED └──expired──> ABANDONED  └──ambiguous──> UNKNOWN
-
-    Only COMMITTED, DENIED, ABANDONED and UNKNOWN are terminal. IN_FLIGHT is
-    persisted BEFORE the syscall/network call, so a crash between the I/O and
-    the bookkeeping yields UNKNOWN -- never a silent COMMITTED.
-    """
-
-    PREPARED = "prepared"
-    AUTHORIZED = "authorized"
-    IN_FLIGHT = "in_flight"
-    COMMITTED = "committed"
-    DENIED = "denied"
-    ABANDONED = "abandoned"
-    UNKNOWN = "unknown"
-
-    @property
-    def is_terminal(self) -> bool:
-        """True if no further transition is legal from this state."""
-        return self in _TERMINAL_STATES
-
-
-_TERMINAL_STATES = frozenset(
-    {
-        EffectState.COMMITTED,
-        EffectState.DENIED,
-        EffectState.ABANDONED,
-        EffectState.UNKNOWN,
-    }
-)
-
-#: Legal transitions. Anything not listed is a programming error, not a
-#: runtime condition -- the state machine is fixed at design time.
-ALLOWED_TRANSITIONS: dict[EffectState, frozenset[EffectState]] = {
-    EffectState.PREPARED: frozenset({EffectState.AUTHORIZED, EffectState.DENIED}),
-    EffectState.AUTHORIZED: frozenset(
-        {EffectState.IN_FLIGHT, EffectState.DENIED, EffectState.ABANDONED}
-    ),
-    EffectState.IN_FLIGHT: frozenset(
-        {EffectState.COMMITTED, EffectState.UNKNOWN}
-    ),
-    EffectState.COMMITTED: frozenset(),
-    EffectState.DENIED: frozenset(),
-    EffectState.ABANDONED: frozenset(),
-    EffectState.UNKNOWN: frozenset(),
-}
-
-
-def can_transition(src: EffectState, dst: EffectState) -> bool:
-    """True if src -> dst is a legal lifecycle move."""
-    return dst in ALLOWED_TRANSITIONS[src]
-
-
-class EvidenceInsufficient(ValueError):
-    """Raised when evidence is asked to establish more than it can support."""
-
-
-@dataclass(frozen=True)
-class EffectEvidence:
-    """Proof, produced by the executor, that a protected operation happened.
-
-    The point of this type is that `outcome="committed"` CANNOT be constructed
-    without a transport response and at least one observed target. A claim that
-    the effect landed must be backed by something observed at the boundary --
-    the request itself does not count, because the request is exactly what an
-    attacker controls.
-
-    Fields:
-      effect_id: occurrence identity (PLAN 6 makes this per-occurrence; today
-          it is the effect nonce).
-      outcome: what the executor established.
-      observed_bytes: how much actually left/landed, if measurable.
-      observed_targets: targets seen at the TRANSPORT, not requested.
-      transport_response: "250 OK", an errno string, or an fsync result.
-      source: which observation produced this ("smtp-envelope", "fs-stat", ...).
-      window: (start, end) monotonic observation window.
-
-    An empty `source` is rejected: evidence must name where it came from, else
-    it is an assertion wearing the costume of evidence.
-    """
-
-    effect_id: str
-    outcome: Literal["committed", "failed", "unknown", "denied"]
-    source: str
-    window: tuple[float, float]
-    observed_bytes: int | None = None
-    observed_targets: frozenset[str] | None = None
-    transport_response: str | None = None
-
-    def __post_init__(self) -> None:
-        if not self.source.strip():
-            raise EvidenceInsufficient(
-                "evidence must name its observation source "
-                "(empty source is an assertion, not evidence)"
-            )
-        start, end = self.window
-        if end < start:
-            raise EvidenceInsufficient(
-                f"observation window is inverted: start={start} end={end}"
-            )
-        if self.outcome == "committed":
-            # The whole point of the type: no unbacked commits.
-            if not self.transport_response:
-                raise EvidenceInsufficient(
-                    "outcome='committed' requires a transport_response; "
-                    "a commit claim with no response is exactly the "
-                    "auth=1/obs=0 state the ledger reports as UNKNOWN"
-                )
-            if not self.observed_targets:
-                raise EvidenceInsufficient(
-                    "outcome='committed' requires at least one observed target; "
-                    "the requested targets are attacker-controlled and do not count"
-                )
-        if self.outcome == "unknown" and self.transport_response:
-            raise EvidenceInsufficient(
-                "outcome='unknown' must not carry a transport response; "
-                "if the transport replied, the outcome is committed or failed"
-            )
-
-    @property
-    def is_conclusive(self) -> bool:
-        """True if this evidence settles the outcome (not merely reports one)."""
-        return self.outcome in ("committed", "failed", "denied")
-
-    def to_state(self) -> EffectState:
-        """Map the evidential outcome onto a terminal lifecycle state.
-
-        `failed` maps to UNKNOWN, not DENIED: a transport failure means we do
-        not know whether the effect landed (an SMTP timeout may still have
-        delivered). It is emphatically not a denial -- the gate allowed it.
-        """
-        return {
-            "committed": EffectState.COMMITTED,
-            "denied": EffectState.DENIED,
-            "failed": EffectState.UNKNOWN,
-            "unknown": EffectState.UNKNOWN,
-        }[self.outcome]
-
-
-def state_from_evidence(
-    evidence: EffectEvidence | None,
-    *,
-    was_allowed: bool,
-) -> EffectState:
-    """Derive the terminal state. No evidence => UNKNOWN, never COMMITTED.
-
-    This is the single place that decides an outcome from evidence, so there is
-    one rule to audit. A denied effect with no evidence is DENIED (the gate's
-    decision IS the evidence for a denial -- nothing was dispatched). An allowed
-    effect with no evidence is UNKNOWN, because something may have escaped.
-    """
-    if evidence is not None:
-        return evidence.to_state()
-    return EffectState.DENIED if not was_allowed else EffectState.UNKNOWN
