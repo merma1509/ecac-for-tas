@@ -18,7 +18,9 @@ from effect_broker.lattice import Confidentiality, Integrity
 from effect_broker.model import Capability, Task
 from effect_broker.shim_email import (
     EmailSecurityError,
+    PostAuthorizationFailure,
     RealEmailShim,
+    SMTPError,
 )
 
 
@@ -480,3 +482,101 @@ class TestDispatchMarker:
             "IN_FLIGHT marker must exist before the SMTP call; "
             "found it written after (a crash mid-send would leave no trace)"
         )
+
+
+class TestEmailEvidence:
+    """COMMITTED for a send must rest on transport evidence.
+
+    The email path used to reach CONFIRMED_COMMITTED with no evidence at all:
+    the ledger inferred it from the `executor.apply` observation, which is the
+    executor asserting its own success. These tests pin the evidence down.
+    """
+
+    def _shim(self, broker: EffectBroker) -> RealEmailShim:
+        shim = RealEmailShim(
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            smtp_host="127.0.0.1",
+            smtp_port=9025,
+        )
+        shim._smtp_probe = lambda sender, decl: (  # type: ignore[method-assign]
+            decl,
+            decl,
+            frozenset(),
+        )
+        return shim
+
+    def test_successful_send_records_transport_evidence(
+        self, smtp_server
+    ) -> None:
+        """An allowed send carries evidence naming the transport reply."""
+        broker = _make_broker()
+        shim = self._shim(broker)
+        shim._smtp_send = lambda s, r, raw: (  # type: ignore[method-assign]
+            ["internal@corp.com"],
+            "data=250 OK",
+        )
+
+        shim.send("user@corp.com", "internal@corp.com", "hello")
+
+        evidence = broker.ledger.evidence_for("email-test", "send-cap")
+        assert evidence is not None, "a send must be backed by evidence"
+        assert evidence.outcome == "committed"
+        assert evidence.transport_response == "data=250 OK"
+        assert evidence.observed_targets == frozenset({"internal@corp.com"})
+        assert evidence.source == "shim_email.send.transport"
+
+    def test_transport_failure_is_unknown_not_committed(
+        self, smtp_server
+    ) -> None:
+        """A transport fault after ALLOW must not read as a confirmed commit."""
+        from effect_broker.ledger import OUTCOME_UNKNOWN
+
+        broker = _make_broker()
+        shim = self._shim(broker)
+
+        def failing_send(sender, recipients, raw):
+            raise SMTPError("connection refused")
+
+        shim._smtp_send = failing_send  # type: ignore[method-assign]
+
+        with pytest.raises(PostAuthorizationFailure):
+            shim.send("user@corp.com", "internal@corp.com", "hello")
+
+        evidence = broker.ledger.evidence_for("email-test", "send-cap")
+        assert evidence is not None, (
+            "a failed delivery must leave evidence; otherwise the "
+            "executor.apply observation reads as a commit"
+        )
+        assert evidence.outcome == "unknown"
+        assert evidence.transport_response is None
+        assert broker.ledger.outcome_of("email-test", "send-cap") == OUTCOME_UNKNOWN
+
+    def test_no_accepted_recipient_is_unknown_not_a_crash(
+        self, smtp_server
+    ) -> None:
+        """DATA accepted, nothing delivered: UNKNOWN with a readable error.
+
+        A commit claim with no observed target is not constructible, so this
+        path must classify as UNKNOWN rather than let the type's own guard
+        surface as an unhandled EvidenceInsufficient.
+        """
+        from effect_broker.model import EvidenceInsufficient
+
+        broker = _make_broker()
+        shim = self._shim(broker)
+        shim._smtp_send = lambda s, r, raw: (  # type: ignore[method-assign]
+            [],
+            "data=250 but no rcpt accepted",
+        )
+
+        with pytest.raises(PostAuthorizationFailure) as excinfo:
+            shim.send("user@corp.com", "internal@corp.com", "hello")
+
+        # A type error escaping here would be the bug this test pins down.
+        assert not isinstance(excinfo.value, EvidenceInsufficient)
+        assert "UNKNOWN" in str(excinfo.value)
+        evidence = broker.ledger.evidence_for("email-test", "send-cap")
+        assert evidence is not None
+        assert evidence.outcome == "unknown"

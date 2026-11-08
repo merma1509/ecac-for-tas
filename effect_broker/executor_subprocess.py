@@ -958,13 +958,28 @@ class ExecutorServer:
                     smtp.quit()
                 if bcc_detected:
                     return {"ok": True, "bcc_detected": bcc_detected}
-                # Real send
+                # Real send. sendmail() discards the DATA reply, so drive the
+                # transaction explicitly: the code is the transport's answer and
+                # it is what the broker records as evidence.
                 smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
                 try:
-                    smtp.sendmail(sender, recipients, body)
+                    smtp.ehlo()
+                    smtp.mail(sender)
+                    for rcpt in recipients:
+                        smtp.rcpt(rcpt)
+                    code, reply_text = smtp.data(body)
                 finally:
                     smtp.quit()
-                return {"ok": True, "delivered": actual_recipients}
+                reply_str = (
+                    reply_text.decode("utf-8", errors="replace")
+                    if isinstance(reply_text, bytes)
+                    else (reply_text or "")
+                )
+                return {
+                    "ok": True,
+                    "delivered": actual_recipients,
+                    "reply": f"data={code} {reply_str}".strip(),
+                }
 
             elif op == "real_smtp_probe":
                 # RSET-only probe for BCC detection — happens ENTIRELY in subprocess.
