@@ -637,10 +637,35 @@ class RealEmailShim:
         # Phase 2 (ALLOW): real IMAP connection
         # In multi-process mode, routes through subprocess IPC.
         # In same-process mode, uses direct imaplib calls.
+        io_started = time.monotonic()
+        read_nonce = effect.capability_nonce or ""
         try:
             messages, total_size = self._imap_read_inbox(user)
         except SMTPError as ex:
+            self.broker.ledger.record_evidence(
+                self.task_id,
+                read_nonce,
+                self._evidence_transport_failed(
+                    read_nonce, "read_inbox", io_started, ex
+                ),
+            )
             raise EmailSecurityError(f"[{self.tool_name}] read_inbox failed: {ex}") from ex
+
+        # Evidence from what IMAP returned, not from the request: the target is
+        # the inbox that was actually selected and the count is what SEARCH
+        # listed. Without it the ledger would call this read `committed` on the
+        # strength of `executor.apply` alone.
+        self.broker.ledger.record_evidence(
+            self.task_id,
+            read_nonce,
+            self._evidence_committed(
+                read_nonce,
+                "read_inbox",
+                io_started,
+                observed=frozenset({effect.target}),
+                transport_response=f"messages={len(messages)} bytes={total_size}",
+            ),
+        )
 
         # Derive confidentiality from content
         if messages:

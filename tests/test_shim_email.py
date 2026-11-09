@@ -15,6 +15,7 @@ import pytest
 
 from effect_broker.broker import EffectBroker
 from effect_broker.lattice import Confidentiality, Integrity
+from effect_broker.ledger import LedgerVerdict
 from effect_broker.model import Capability, Task
 from effect_broker.shim_email import (
     EmailSecurityError,
@@ -578,5 +579,88 @@ class TestEmailEvidence:
         assert not isinstance(excinfo.value, EvidenceInsufficient)
         assert "UNKNOWN" in str(excinfo.value)
         evidence = broker.ledger.evidence_for("email-test", "send-cap")
+        assert evidence is not None
+        assert evidence.outcome == "unknown"
+
+
+class TestReadInboxLedger:
+    """A successful read_inbox must not be recorded as a failed apply.
+
+    The effect target `imap:<user>` was never resolvable in the store, so
+    apply_effect() returned False and the ledger read a completed read as
+    UNKNOWN(apply_failed) -- the store reporting a failure it did not have.
+    """
+
+    def _broker_and_shim(self) -> tuple[EffectBroker, RealEmailShim, str]:
+        broker = _make_broker()
+        # The shared helper's ceiling grants `send` only, so a read would be
+        # blocked by NoAmp before ever reaching IMAP. Register a read task.
+        broker.register_task(
+            Task(
+                task_id="read-test",
+                owner="User",
+                ceiling=Capability(
+                    owner="User",
+                    holder="EffectBroker",
+                    right="read",
+                    target="internal@corp.com",
+                    scope=frozenset({"internal"}),
+                    expiry=float("inf"),
+                    nonce="ceiling-read-test",
+                ),
+                flow_boundary=(Confidentiality.CONFIDENTIAL, Integrity.USER),
+            )
+        )
+        nonce = "TestTool:read:imap:internal@corp.com"
+        broker.capabilities[nonce] = Capability(
+            owner="User",
+            holder="TestTool",
+            right="read",
+            target="imap:internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce=nonce,
+        )
+        shim = RealEmailShim(broker, task_id="read-test", tool_name="TestTool")
+        return broker, shim, nonce
+
+    def test_successful_read_is_committed_not_apply_failed(self) -> None:
+        broker, shim, nonce = self._broker_and_shim()
+        shim._imap_read_inbox = lambda u: (["1", "2"], 120)  # type: ignore[method-assign]
+
+        before = len(broker.store.effects_log)
+        shim.read_inbox("internal@corp.com")
+
+        # The store must actually record the read, not just return True.
+        recorded = broker.store.effects_log[before:]
+        assert recorded == [("read", "mailbox:imap:internal@corp.com")]
+
+        assert broker.ledger.outcome_of("read-test", nonce) != "failed"
+        assert broker.ledger.verify("read-test", nonce) is LedgerVerdict.CONFIRMED_COMMITTED
+
+    def test_successful_read_records_transport_evidence(self) -> None:
+        broker, shim, nonce = self._broker_and_shim()
+        shim._imap_read_inbox = lambda u: (["1"], 50)  # type: ignore[method-assign]
+
+        shim.read_inbox("internal@corp.com")
+
+        evidence = broker.ledger.evidence_for("read-test", nonce)
+        assert evidence is not None, "a completed read must be backed by evidence"
+        assert evidence.outcome == "committed"
+        assert evidence.observed_targets == frozenset({"imap:internal@corp.com"})
+        assert evidence.transport_response == "messages=1 bytes=50"
+
+    def test_imap_failure_records_unknown_evidence(self) -> None:
+        broker, shim, nonce = self._broker_and_shim()
+
+        def failing_read(user: str):
+            raise SMTPError("IMAP connection refused")
+
+        shim._imap_read_inbox = failing_read  # type: ignore[method-assign]
+
+        with pytest.raises(EmailSecurityError):
+            shim.read_inbox("internal@corp.com")
+
+        evidence = broker.ledger.evidence_for("read-test", nonce)
         assert evidence is not None
         assert evidence.outcome == "unknown"

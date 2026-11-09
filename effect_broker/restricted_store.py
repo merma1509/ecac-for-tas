@@ -299,6 +299,11 @@ class RestrictedResourceStore:
                 return self._read_mailboxes()[target]
             if target.startswith("http://") or target.startswith("https://"):
                 return self._url_for(target)
+            if target.startswith("imap:"):
+                # IMAP inboxes are never pre-registered (like URLs). Without
+                # this, a successful read_inbox fell through to `resource is
+                # None` and was recorded as a failed apply.
+                return Mailbox(target.split(":", 1)[1].split("@")[0])
             return None
         finally:
             self._lock.release()
