@@ -50,7 +50,7 @@ OS/SMTP state** — the tool cannot forge outcomes.
 make all          # lint + typecheck + test + held-out + comparative + experiment
 make test         # pytest suite
 make held-out     # 8 sealed adversarial traces
-make comparative  # ECAC vs 7 baselines
+make comparative  # ECAC vs 8 baselines
 make experiment   # M1–M5, H1–H3, T9–T20
 make run          # T1–T20 + R1 traces
 ```

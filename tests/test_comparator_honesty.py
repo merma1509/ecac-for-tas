@@ -96,16 +96,28 @@ class TestTodaysComparatorReality:
     """
 
     #: Observed at the time of writing. Update deliberately, with a reason.
+    #:
+    #: CaMeL, PACT, ChainCaps, Cordon and ArgProv used to
+    #: return True unconditionally — 0/20 was a *stub*, not a measurement, and
+    #: every comparative claim resting on it was unsupported. Each now
+    #: implements the mechanism its docstring names:
+    #:   CaMeL      4 — IFC denies untrusted provenance at a publish sink
+    #:   PACT      14 — capability scope covers (etype, target)
+    #:   ChainCaps  3 — capability scope, honoring EXPAND (its documented gap)
+    #:   Cordon     3 — proposal revalidated: expiry + target match
+    #:   ArgProv    6 — broken/untrusted provenance denies
+    #: The gaps that remain are exactly the traces each comparator lacks the
+    #: mechanism for; they are the honest basis of ECAC's 20/20.
     EXPECTED_BLOCKED = {
         "ECAC": 20,
         "PathAllowlist": 9,
         "FORGE": 9,
         "Allowlist": 2,
-        "CaMeL": 0,
-        "PACT": 0,
-        "ChainCaps": 0,
-        "Cordon": 0,
-        "ArgProv": 0,
+        "CaMeL": 4,
+        "PACT": 14,
+        "ChainCaps": 3,
+        "Cordon": 3,
+        "ArgProv": 6,
     }
 
     @pytest.mark.parametrize(("name", "expected"), sorted(EXPECTED_BLOCKED.items()))

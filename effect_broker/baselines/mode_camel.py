@@ -2,14 +2,21 @@
 
 What CaMeL/FIDES provides:
 - Information Flow Control (IFC) at commit time
-- Principal-aware authorization
-- LLM outside TCB (trusted computing base)
+- Integrity: values from untrusted sources must not reach a sink unendorsed
+- LLM outside TCB
 
-What ECAC adds:
+What ECAC adds (and this comparator deliberately lacks):
 - Session taint propagation
 - Capability nonce with replay prevention
 - Ledger-based audit trail
 - NoAmp predicate (authority monotonicity)
+- Recipient (BCC) completeness
+
+The IFC check below is the mechanism CaMeL actually names: a data policy
+attached to a value's provenance decides whether that value may flow to the
+effect's sink. An untrusted value reaching a send/write sink is denied. This
+is a real deny path — before it, `commit_effect` returned True unconditionally
+and could not reject any trace.
 """
 
 from __future__ import annotations
@@ -19,58 +26,46 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from effect_broker.model import Effect
 
-from effect_broker.lattice import Confidentiality
+from effect_broker.lattice import Confidentiality, Integrity
+
+#: Effect types that publish data outside the agent's trust domain.
+_SINKS = frozenset({"send", "write", "network"})
 
 
 class CaMeLBroker:
-    """
-    CaMeL-style broker: IFC-only, no taint, no ledger.
+    """CaMeL-style broker: IFC only — no capabilities, no ledger, no taint.
 
-    Key difference from ECAC:
-    - Only checks information flow (no capabilities, no ledger)
-    - No session taint propagation
-    - No replay prevention
-    - No authority monotonicity check
+    Deliberately absent (each is a trace this comparator does not block):
 
-    WEAKNESSES (these bypass CaMeL but not ECAC):
-    - No session taint: T1 passes (send after CONFIDENTIAL read)
-    - No ledger: T4 passes (replay attack)
-    - No capability: T5 passes (scope widening)
-    - No delegation check: T6 passes
+    - No session taint: T1 passes (send after a CONFIDENTIAL read).
+    - No ledger: T4 passes (replay).
+    - No capability/scope: T5 passes (scope widening).
+    - No delegation check: T6 passes.
+    - No recipient completeness: T3 passes (hidden BCC).
+    - No content binding: T2, T15 pass.
     """
 
     def commit_effect(self, effect: Effect, task_id: str = "default") -> tuple[bool, dict]:
+        """IFC check: deny untrusted values flowing to a publish sink.
+
+        CaMeL's rule is per-value: the value carries a policy, and the policy
+        must permit the flow. Confidentiality alone is NOT a block — CaMeL
+        permits reading confidential data and acting on it; what it forbids is
+        an *unendorsed* value reaching a sink. That is why T1 (confidential
+        flow within the session) passes, while T7 (PUBLIC/UNTRUSTED injection)
+        is denied.
         """
-        CaMeL-style commit: IFC check only.
-
-        Checks:
-        - Confidentiality: no downward flow
-        - Integrity: no upward flow
-
-        MISSING (these are ECAC's additions):
-        - Capability nonce verification
-        - Session taint propagation
-        - Ledger-based replay prevention
-        - Authority monotonicity (NoAmp)
-        """
-        # CaMeL checks IFC on provenance data
-        # But it doesn't check:
-        # 1. Whether the capability is valid
-        # 2. Whether the nonce is fresh
-        # 3. Whether the session is tainted
-
-        if effect.etype == "send":
-            # CaMeL only checks confidentiality in provenance
-            # No taint propagation - same confidential data allows send
-            for d in effect.provenance:
-                if d.confidentiality == Confidentiality.CONFIDENTIAL:
-                    # CaMeL doesn't propagate session taint!
-                    # This is T1: session taint → send passes
-                    pass
-
-        # WEAKNESS: No capability check (any effect allowed)
-        # WEAKNESS: No ledger (replay is possible)
-        # WEAKNESS: No session taint
+        if effect.etype in _SINKS:
+            for datum in effect.provenance:
+                if datum.integrity == Integrity.UNTRUSTED:
+                    return False, {
+                        "blocker": "IFC",
+                        "reason": (
+                            f"CaMeL IFC: untrusted value {datum.name!r} "
+                            f"flows to {effect.etype} sink"
+                        ),
+                        "policy": "CaMeL",
+                    }
 
         return True, {
             "blocker": None,

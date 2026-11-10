@@ -12,6 +12,30 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ## [Unreleased]
 
+### Changed
+
+- **The five non-blocking comparators now enforce their named mechanism
+  .** CaMeL, PACT, ChainCaps, Cordon and ArgProv each
+  returned `True` unconditionally: the docstring described a check that was
+  never wired to a return value, so they scored 0/20 and every comparative
+  claim resting on that number was unsupported — a comparison against a stub
+  measures the stub. Each now has a real deny path:
+
+  | Comparator | Enforces                                       | Still misses                  |
+  | ---------- | ---------------------------------------------- | ----------------------------- |
+  | CaMeL      | IFC: untrusted provenance at a publish sink    | taint, replay, scope, content |
+  | PACT       | capability scope covers (etype, target)        | taint, replay, content, BCC   |
+  | ChainCaps  | capability scope, EXPAND honored as documented | taint, replay, content        |
+  | Cordon     | proposal revalidation: expiry + target match   | taint, provenance, replay     |
+  | ArgProv    | argument provenance (untrusted denies)         | capability, scope, taint      |
+
+  Scores are now CaMeL 4/20, PACT 14/20, ChainCaps 3/20, Cordon 3/20,
+  ArgProv 6/20 against ECAC's 20/20. `COMPARATOR_MECHANISMS` states
+  enforced-versus-omitted per comparator, `tests/test_comparator_honesty.py`
+  pins both the counts and the table, and `docs/VERIFICATION.md` no longer
+  quotes the 0/20 stub figures. The dead ECAC-setup branch (which imported a
+  `_capability` helper that does not exist in `traces.py`) is gone.
+
 ### Added
 
 - **Diagnostic run** `scripts/diagnostic_run.py` and
