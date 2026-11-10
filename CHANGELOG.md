@@ -14,6 +14,11 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ### Added
 
+- **Comparator mechanisms table** (`baselines.COMPARATOR_MECHANISMS`). States,
+  per comparator, what is enforced and what is omitted. It exists so a
+  comparative number can be read against the mechanism that produced it rather
+  than against a name.
+
 - **Metrics tripwire** (`scripts/metrics_snapshot.py`). Compares two metric
   snapshots and exits non-zero on regression, so a change that slows the gate
   path gets caught by CI instead of being noticed later.
@@ -123,6 +128,15 @@ whose current `pyproject.toml` version is `0.1.1`.
   evidence" hid the thing worth knowing.
 
 ### Changed
+
+- **`mode_conventional_sandbox.py` renamed to `mode_path_allowlist.py`**, and
+  the comparator key `ConvSandbox` to `PathAllowlist`. The file compared strings
+  on `effect.target` while claiming "seccomp + landlock/SELinux"; the kernel was
+  never involved. PLAN 6 Part D allows a comparator to either implement the named
+  mechanism or be renamed — this is the rename, since a real one needs kernel
+  enforcement (Landlock or seatbelt) and proof that a denied path fails with
+  `EACCES`. Trace decisions are unchanged. The `README.md` claims that rested on
+  the old name were corrected in the same commit.
 
 - **An observation alone is no longer a commit** -- see above. This changes test
   expectations, not just code: sixteen tests recorded authorization and

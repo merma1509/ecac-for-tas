@@ -77,14 +77,25 @@ Or via `dev.sh`:
   before reaching the broker gate — closes T14 (hidden write) that the four-predicate gate
   alone cannot catch
 - **Held-out evaluation:** 8/8 supplied held-out traces blocked by the gate regression (SHA-256 `e0239fbfa49c1cbe`)
-- **Baseline regression:** ECAC's gate blocks all 20 supplied adversarial traces; each named baseline (CaMeL/PACT/ChainCaps/Cordon/FORGE) misses at least one. This is regression coverage of gate logic on supplied traces — NOT a causal evaluation of mechanism effectiveness (see "Honest limitations")
+- **Baseline regression:** ECAC's gate blocks all 20 supplied adversarial traces, and every
+  comparator in `baselines/` misses at least one. Read this carefully: the comparators are
+  **reduced models**, not deployments of the systems they are named after. Each one's enforced
+  and omitted mechanisms are declared in `baselines.COMPARATOR_MECHANISMS`; a number here
+  therefore measures ECAC's gate against those reduced models, and is regression coverage of
+  gate logic on supplied traces — NOT a causal evaluation of mechanism effectiveness, and not a
+  claim about the real systems (see "Honest limitations")
 - **Adversarial workload regressions:** 17/18 supplied traces blocked; M4 benign correctly allowed
 - **Independent oracle (out-of-band).** `effect_broker/oracle.py` re-derives 'did this effect
   occur?' from the real filesystem / real SMTP MTA log, never the broker store — it can refute
   a ledger that claims success the effect did not actually produce.
-- **Conventional sandbox baseline.** `baselines/mode_conventional_sandbox.py` adds a
-  seccomp/landlock-style OS path+syscall confinement baseline so the comparison includes a
-  genuine conventional broker+sandbox, not only named IFC/capability mechanisms.
+- **Path/host allowlist baseline (not a sandbox).** `baselines/mode_path_allowlist.py` checks
+  target paths and hosts by string comparison. It was previously named
+  `mode_conventional_sandbox.py` and described as "seccomp/landlock-style"; it never enforced
+  either, so the claim was removed and the file renamed rather than the mechanism implemented.
+  There is currently **no faithful conventional-sandbox comparator** — a real one needs Landlock
+  or a seatbelt profile enforced by the kernel, proven by a denied path failing with `EACCES`.
+  Every comparator's enforced and omitted mechanisms are listed in
+  `baselines.COMPARATOR_MECHANISMS`.
 - **Mechanism-level attack regressions.** Each named predicate (Auth/FlowOK/NoAmp/Fresh) is
   exercised by an attack pair (legitimate allowed + attack blocked by that predicate).
 
