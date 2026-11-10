@@ -14,6 +14,21 @@ See `README.md` → "Honest limitations" for the known boundaries (regression
 evidence vs. real confinement, advisory same-process isolation, trusted-manifest
 requirements, deferred cross-task taint tracking, etc.).
 
+## What is actually enforced, per platform
+
+| Mechanism                             | Linux 5.13+ (Landlock LSM on)                                        | macOS                     |
+| ------------------------------------- | -------------------------------------------------------------------- | ------------------------- |
+| Kernel path confinement               | yes — Landlock ruleset, writes only under `ECAC_LANDLOCK_WRITE_ROOT` | **none**                  |
+| `restricted-open` (`os.open` wrapper) | yes — Python-level hygiene                                           | Python-level hygiene only |
+| Import blocklist                      | hygiene, not a boundary                                              | hygiene, not a boundary   |
+
+The confinement status reported by the executor names what is in effect and
+never says `landlock` unless a selftest observed a write outside the sandbox
+root being denied. Set `ECAC_REQUIRE_CONFINEMENT=1` to make the executor refuse
+to start where no kernel mechanism exists (CI sets this; local development
+defaults off). On macOS the Python-level layers are a speed bump, not a
+security boundary — treat the platform as unconfined.
+
 ---
 
 ## Reporting a vulnerability

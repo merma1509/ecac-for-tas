@@ -468,6 +468,183 @@ def build_report() -> EvaluationReport:
     return report
 
 
+# ─────────────────────────── ───────────────────────────
+# The seven-metric diagnostic table. Each metric must be present even when
+# the honest value is zero — an absent field reads as "not measured".
+
+
+def trusted_boundary() -> list[str]:
+    """Components the other numbers depend on to report truthfully.
+
+    Explicit and reviewed: if any of these lies, the metrics are unsupported.
+    This list IS the trusted boundary metrically.
+    """
+    return [
+        "effect_broker/shim_real.py — performs real I/O and reports it",
+        "effect_broker/broker.py — the store is the observation source",
+        "effect_broker/executor_subprocess.py — applies effects, reports observed targets",
+        "effect_broker/oracle.py — derives verdicts from external sources",
+        "effect_broker/metrics.py — labels scenarios attack/legitimate",
+    ]
+
+
+def diagnostic_report() -> dict[str, object]:
+    """The seven metrics from one run of the labeled scenario set."""
+    import warnings
+
+    warnings.filterwarnings("ignore")
+
+    m = EvaluationMetrics()
+    unauthorized_effects = 0
+    approvals_granted = 0
+    approvals_used = 0
+    approvals_expired_unused = 0
+    false_denials: dict[str, int] = {}
+
+    for sc in _build_scenarios():
+        broker = build()
+        task = _task(sc.ceiling_scope)
+        before = len(broker.capabilities)
+        effect = sc.builder(broker, task)
+        granted_here = len(broker.capabilities) - before
+        approvals_granted += granted_here
+
+        start = time.perf_counter()
+        allow, evidence = broker.commit(Commit(effect, task))
+        m.latency_ms.append((time.perf_counter() - start) * 1000)
+
+        m.total += 1
+        blocked = not allow
+        blocker = evidence.get("primary_blocker")
+
+        # An allowed effect must have an authorizing capability on record.
+        if allow and effect.capability_nonce not in broker.capabilities:
+            unauthorized_effects += 1
+
+        # session is always set: Task.__post_init__ creates a default one.
+        session = task.session
+        assert session is not None
+        if effect.capability_nonce in session.used:
+            approvals_used += 1
+        elif granted_here and not blocked:
+            approvals_expired_unused += 1  # granted, never consumed
+
+        if sc.is_attack:
+            m.attacks += 1
+            if blocked:
+                m.attacks_blocked += 1
+                if blocker:
+                    m.per_mechanism[blocker] = m.per_mechanism.get(blocker, 0) + 1
+            else:
+                m.attacks_missed += 1
+        else:
+            m.legitimate += 1
+            if blocked:
+                m.legit_blocked += 1
+                # by predicate, so over-blocking has an address
+                key = blocker or "unknown"
+                false_denials[key] = false_denials.get(key, 0) + 1
+            else:
+                m.legit_allowed += 1
+
+    return {
+        # 1. Unauthorized effects: allowed with no authorizing record.
+        "unauthorized_effects": unauthorized_effects,
+        # 2. Legitimate completion: benign operations that succeeded.
+        "legitimate_completion": m.legit_allowed,
+        "legitimate_total": m.legitimate,
+        # 3. False denials, by predicate.
+        "false_denials": false_denials,
+        "false_denials_total": m.legit_blocked,
+        # 4. UNKNOWN outcomes: explicitly reported by the ledger's own
+        # verify_complete_mediation; distinct from a False verdict.
+        "unknown_outcomes": _ledger_unknowns(),
+        # 5. Approvals: granted vs used vs expired unused.
+        "approvals": {
+            "granted": approvals_granted,
+            "used": approvals_used,
+            "expired_unused": approvals_expired_unused,
+        },
+        # 6. Overhead: wall-clock. Syscall counts are not portable; the honest
+        # report omits them rather than inventing a number.
+        "overhead": {
+            "wall_clock_p50_ms": m.p50(),
+            "wall_clock_p95_ms": m.p95(),
+            "wall_clock_p99_ms": m.p99(),
+            "syscalls": None,
+        },
+        # 7. Trusted boundary: the reviewed list.
+        "trusted_boundary": trusted_boundary(),
+        # Context from the regression report.
+        "attacks": m.attacks,
+        "attacks_blocked": m.attacks_blocked,
+        "false_negatives": m.attacks_missed,
+    }
+
+
+def _ledger_unknowns() -> int:
+    """Count UNKNOWN verdicts from the ledger's own complete-mediation check.
+
+    UNKNOWN is the ledger's category (IN_FLIGHT without evidence, observation
+    with no authorization). It is read from there rather than inferred from
+    gate evidence, which never carries a mediation verdict.
+    """
+    import warnings
+
+    from effect_broker.ledger import UnknownLedgerResult
+
+    warnings.filterwarnings("ignore")
+    unknowns = 0
+    for sc in _build_scenarios():
+        broker = build()
+        task = _task(sc.ceiling_scope)
+        effect = sc.builder(broker, task)
+        broker.commit(Commit(effect, task))
+        verdict = broker.ledger.verify(task.task_id, effect.capability_nonce or "")
+        if isinstance(verdict, UnknownLedgerResult):
+            unknowns += 1
+    return unknowns
+
+
+def print_diagnostic_report() -> None:
+    """The table, text form. JSON: json.dumps(diagnostic_report())."""
+    r = diagnostic_report()
+    print("=" * 64)
+    print("ECAC DIAGNOSTIC RUN")
+    print("=" * 64)
+    print(f"1. Unauthorized effects:   {r['unauthorized_effects']}")
+    print(
+        f"2. Legitimate completion:  {r['legitimate_completion']}/{r['legitimate_total']}"
+    )
+    print(f"3. False denials:          {r['false_denials_total']} {r['false_denials']}")
+    print(f"4. UNKNOWN outcomes:       {r['unknown_outcomes']}")
+    ap = r["approvals"]
+    assert isinstance(ap, dict)
+    print(
+        f"5. Approvals:              granted={ap['granted']} used={ap['used']} "
+        f"expired_unused={ap['expired_unused']}"
+    )
+    ov = r["overhead"]
+    assert isinstance(ov, dict)
+    print(
+        f"6. Overhead (wall clock):  p50={ov['wall_clock_p50_ms']:.2f}ms "
+        f"p95={ov['wall_clock_p95_ms']:.2f}ms p99={ov['wall_clock_p99_ms']:.2f}ms "
+        f"(syscalls: not measured)"
+    )
+    print("7. Trusted boundary (these must tell the truth for 1-6 to mean anything):")
+    tb = r["trusted_boundary"]
+    assert isinstance(tb, list)
+    for component in tb:
+        print(f"   - {component}")
+    print("=" * 64)
+    print(f"Context: attacks={r['attacks']} blocked={r['attacks_blocked']} "
+          f"missed={r['false_negatives']}")
+
+
+if __name__ == "__main__":
+    print_diagnostic_report()
+
+
 def print_report() -> None:
     r = build_report()
     print("=" * 64)

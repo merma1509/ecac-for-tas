@@ -12,6 +12,22 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ## [Unreleased]
 
+### Added
+
+- **Diagnostic run** `scripts/diagnostic_run.py` and
+  `metrics.diagnostic_report()` emit all seven metrics: unauthorized effects,
+  legitimate completion, false denials by predicate, UNKNOWN outcomes,
+  approvals (granted/used/expired unused), wall-clock overhead (syscall counts
+  reported as `null` rather than invented) and the reviewed trusted boundary.
+  UNKNOWN is read from the ledger's own verdict, not inferred from gate
+  evidence, which carries none.
+- **Occurrence records.** `oracle.Occurrence` and
+  `count_occurrences` count repeats instead of collapsing them: two identical
+  writes are two occurrences, a write followed by a delete keeps both, a
+  repeated send is two, and an effect landing outside its window is flagged.
+- **Concurrent-ticket coverage in the multiprocess path (P6-3).** Ten threads
+  racing one nonce through subprocess `APPLY_COMMIT` yield exactly one commit.
+
 ### Fixed
 
 - **Ambiguous request binding.** `CanonicalRequest`

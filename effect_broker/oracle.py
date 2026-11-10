@@ -42,6 +42,49 @@ class OracleVerdict:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class Occurrence:
+    """One observed effect event — counted, never collapsed to a boolean.
+
+    the observer emits events; verdicts are derived. Two
+    identical writes are two Occurrences with the same payload_id, not one
+    `exists=True`.
+    """
+
+    effect_id: str  # unique per occurrence
+    payload_id: str  # digest of what was actually transmitted/written
+    etype: str
+    target: str
+    targets: frozenset[str]  # full observed target set
+    observed_at: float
+    source: str  # "fs-diff" | "smtp-envelope" | "imap-uid"
+    window: tuple[float, float]  # (start, end); outside ⇒ flagged
+
+    @property
+    def out_of_window(self) -> bool:
+        """True if this occurrence landed outside its observation window."""
+        start, end = self.window
+        return not (start <= self.observed_at <= end)
+
+
+def count_occurrences(
+    occurrences: list[Occurrence],
+    *,
+    etype: str | None = None,
+    target: str | None = None,
+    payload_id: str | None = None,
+) -> int:
+    """Count matching occurrences. Counting, not collapsing: 2 identical
+    writes are 2."""
+    return sum(
+        1
+        for o in occurrences
+        if (etype is None or o.etype == etype)
+        and (target is None or o.target == target)
+        and (payload_id is None or o.payload_id == payload_id)
+    )
+
+
 @dataclass
 class IndependentOracle:
     """Out-of-band effect verifier: real FS + real SMTP log.
