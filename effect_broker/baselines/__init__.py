@@ -55,37 +55,51 @@ COMPARATOR_MECHANISMS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         (),
     ),
     "CaMeL": (
-        ("confidentiality label check on provenance",),
-        ("session taint propagation", "capability scope", "replay prevention"),
+        (),
+        (
+            "NOTHING BLOCKED: `commit_effect` has no reachable deny path, so this "
+            "comparator cannot reject any trace (0/20). The IFC check it describes "
+            "in its docstring is not wired to a return value.",
+        ),
     ),
     "PACT": (
-        ("capability presence", "provenance tracking", "activity log"),
+        (),
         (
-            "content hash binding (modify-after-approval)",
-            "session taint",
-            "replay prevention",
-            "attenuation-only narrowing (widening passes)",
+            "NOTHING BLOCKED: single unconditional `return True` (0/20).",
         ),
     ),
     "ChainCaps": (
-        ("capability transformation chain",),
-        ("session taint", "replay prevention", "content binding"),
+        (),
+        (
+            "NOTHING BLOCKED (0/20); the transformation chain is recorded but never "
+            "consulted for a decision.",
+        ),
     ),
     "Cordon": (
-        ("commit-time revalidation of a proposal",),
-        ("content hash binding is optional", "session taint", "replay prevention"),
+        (),
+        (
+            "NOTHING BLOCKED: allows by default with no strict check (0/20).",
+        ),
     ),
     "FORGE": (
-        ("policy DSL: effect-type + target-pattern rules",),
-        ("capability scope", "session taint", "replay prevention"),
+        ("deny rule in a policy DSL (effect-type + target regex), real decision",),
+        (
+            "capability scope",
+            "session taint",
+            "replay prevention",
+            "no policy for an effect type ⇒ default allow",
+        ),
     ),
     "Allowlist": (
         ("tool-name + target-prefix pattern match",),
         ("everything else — the weakest baseline by design",),
     ),
     "ArgProv": (
-        ("argument provenance chain integrity",),
-        ("capabilities", "session taint", "replay prevention"),
+        (),
+        (
+            "NOTHING BLOCKED: `commit_effect` has a single `return True` (0/20). "
+            "The provenance chain it names is never consulted.",
+        ),
     ),
     "PathAllowlist": (
         ("target-path prefix allowlist (string compare)", "target-host allowlist"),
