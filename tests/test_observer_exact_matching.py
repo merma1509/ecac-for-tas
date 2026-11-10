@@ -32,7 +32,9 @@ class TestEffectObserverExactMatching:
         ledger = IndependentEffectLedger()
         ledger.record_authorization("default", "cap:read", frozenset({"file:///reports"}))
         ledger.record_observation("default", "cap:read", frozenset({"file:///reports"}))
-        ledger.record_evidence("default", "cap:read", commit_evidence("cap:read", {"file:///reports"}))
+        ledger.record_evidence(
+            "default", "cap:read", commit_evidence("cap:read", {"file:///reports"})
+        )
 
         verdict = ledger.verify("default", "cap:read")
         assert verdict == LedgerVerdict.CONFIRMED_COMMITTED
