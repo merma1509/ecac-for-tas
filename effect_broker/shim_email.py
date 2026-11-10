@@ -499,7 +499,13 @@ class RealEmailShim:
                 f"[{self.tool_name}] task_id '{self.task_id}' not registered. "
                 f"Register task first with broker.register_task()."
             )
-        commit = Commit(effect=effect, task=task, tool_name=self.tool_name)
+        commit = Commit(
+            effect=effect,
+            task=task,
+            tool_name=self.tool_name,
+            # Real SMTP/IMAP below: the shim measures the transport, not the store.
+            store_is_external_state=False,
+        )
         allow, evidence = self.broker.executor.execute(commit)
 
         op = EmailOp(
@@ -627,7 +633,13 @@ class RealEmailShim:
                 f"[{self.tool_name}] task_id '{self.task_id}' not registered. "
                 f"Register task first with broker.register_task()."
             )
-        commit = Commit(effect=effect, task=task, tool_name=self.tool_name)
+        commit = Commit(
+            effect=effect,
+            task=task,
+            tool_name=self.tool_name,
+            # Real SMTP/IMAP below: the shim measures the transport, not the store.
+            store_is_external_state=False,
+        )
         allow, evidence = self.broker.executor.execute(commit)
 
         if not allow:

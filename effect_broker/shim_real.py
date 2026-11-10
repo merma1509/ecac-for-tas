@@ -688,6 +688,8 @@ class RealFileShim:
             task=task,
             tool_name=self.tool_name,
             authorized_content_hash=authorized_content_hash,
+            # Bytes land below, after commit(); the shim measures them itself.
+            store_is_external_state=False,
         )
         allow, evidence = self.broker.commit(commit)
 
