@@ -90,7 +90,53 @@ whose current `pyproject.toml` version is `0.1.1`.
   the parent recovers. Five of its tests fail if journaling is switched off,
   which was checked by doing exactly that.
 
+- **No commit is reported without evidence** (`ledger.py`, `executor.py`,
+  `ipc.py`). `verify()` now returns `UNKNOWN` when an effect has an
+  authorization and an observation but no `EffectEvidence` behind it. Until now
+  "observed" was enough, and the observation was frequently the executor
+  agreeing with itself.
+
+  Which evidence is admissible depends on what actually holds the state, so
+  `Commit.store_is_external_state` states it rather than assuming it. For the
+  simulated `FileShim` and a plain `broker.commit()` the store _is_ the external
+  state -- `_do_write`/`_do_send` are documented NO-OPs -- so the executor's
+  record of the mutation is a real measurement and the flag defaults to `True`.
+  The real shims set it `False`: there the store only bookkeeps and the bytes
+  land later, in `shim_real.write()`, after `commit()` returns. Recording store
+  evidence for them put `evidence` in the journal _before_ `dispatched` --
+  proof preceding the operation it proves, caught by
+  `test_dispatch_precedes_evidence_in_the_file`.
+
+  The subprocess path records evidence from the IPC reply, which is the only
+  measurement the parent process can obtain; without it every multi-process
+  commit reported `committed_without_evidence`.
+
+- **`LedgerBackend` can carry evidence** (`ipc.py`). `record_evidence` /
+  `evidence_for` are on the interface and implemented by `LocalLedgerBackend`
+  and `ProcessLedgerClient`, with `RECORD_EVIDENCE` / `EVIDENCE_FOR` requests and
+  a serializer for `EffectEvidence` (`frozenset` is not JSON-encodable). They are
+  not abstract: a backend that does not support evidence then honestly yields
+  `committed_without_evidence` instead of failing to construct.
+
+- **`verify()` reports over-observation before missing evidence.** An extra
+  application on a nonce is a distinct finding, and answering it with "no
+  evidence" hid the thing worth knowing.
+
 ### Changed
+
+- **An observation alone is no longer a commit** -- see above. This changes test
+  expectations, not just code: sixteen tests recorded authorization and
+  observation straight into the ledger and asserted `CONFIRMED_COMMITTED`, which
+  is the contract P4-1 removes. They now record evidence via a
+  `commit_evidence()` helper in `tests/conftest.py`.
+
+  Two expectations were inverted rather than updated, because their premises
+  contradict an invariant: `EffectEvidence(outcome="committed")` cannot be
+  constructed without observed targets, so "wrong source + empty obs ⇒ COMMITTED"
+  can never be backed, and dispatch marks intent, which was never sufficient for
+  a commit. Both now assert the weaker true thing (the path refuses to
+  over-claim); the strong assertion lives in `test_io_evidence.py` and
+  `test_crash_harness.py`.
 
 - **TCB size counts code, not comments.** `_count_code_lines` strips comments
   and blank lines, so the reported TCB figure reflects logic rather than
