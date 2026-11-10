@@ -19,6 +19,8 @@ These tests verify the "unknown, not safe" requirement from the review:
 
 from __future__ import annotations
 
+from conftest import commit_evidence
+
 from effect_broker.ledger import (
     IndependentEffectLedger,
     LedgerVerdict,
@@ -70,6 +72,7 @@ class TestLedgerUnknownForUnobservable:
         ledger4 = IndependentEffectLedger()
         ledger4.record_authorization("t", "exact-match", frozenset({"target"}))
         ledger4.record_observation("t", "exact-match", frozenset({"target"}))
+        ledger4.record_evidence("t", "exact-match", commit_evidence("exact-match", {"target"}))
         verdict_d = ledger4.verify("t", "exact-match")
         assert verdict_d == LedgerVerdict.CONFIRMED_COMMITTED
 
@@ -135,6 +138,7 @@ class TestLedgerCompleteMediationSemantics:
         ledger = IndependentEffectLedger()
         ledger.record_authorization("default", "cap-1", frozenset({"file:///reports"}))
         ledger.record_observation("default", "cap-1", frozenset({"file:///reports"}))
+        ledger.record_evidence("default", "cap-1", commit_evidence("cap-1", {"file:///reports"}))
 
         failures = ledger.verify_all({("default", "cap-1"): frozenset({"file:///reports"})})
         assert failures == [], f"Exact match should have 0 failures, got: {failures}"
@@ -158,6 +162,9 @@ class TestLedgerCompleteMediationSemantics:
         # good-cap: exact match
         ledger.record_authorization("task-1", "good-cap", frozenset({"file:///reports"}))
         ledger.record_observation("task-1", "good-cap", frozenset({"file:///reports"}))
+        ledger.record_evidence(
+            "task-1", "good-cap", commit_evidence("good-cap", {"file:///reports"})
+        )
 
         # bypass-cap: authorized but not observed (possible bypass)
         ledger.record_authorization("task-1", "bypass-cap", frozenset({"file:///secrets"}))
@@ -236,6 +243,7 @@ class TestLedgerBackwardsCompatibility:
         ledger = IndependentEffectLedger()
         ledger.record_authorization("task", "cap1", frozenset({"target1"}))
         ledger.record_observation("task", "cap1", frozenset({"target1"}))
+        ledger.record_evidence("task", "cap1", commit_evidence("cap1", {"target1"}))
 
         entries = ledger.get_entries(task_id="task")
         assert len(entries) == 2
@@ -252,6 +260,8 @@ class TestLedgerBackwardsCompatibility:
         ledger.record_authorization("t", "b", frozenset({"y"}))
         ledger.record_observation("t", "a", frozenset({"x"}))
         ledger.record_observation("t", "c", frozenset({"z"}))
+        ledger.record_evidence("t", "a", commit_evidence("a", {"x"}))
+        ledger.record_evidence("t", "c", commit_evidence("c", {"z"}))
 
         assert ledger.authorization_count == 2
         assert ledger.observation_count == 2

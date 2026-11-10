@@ -25,6 +25,28 @@ warnings.filterwarnings(
 
 
 # ---------------------------------------------------------------------------
+# Evidence helper
+# ---------------------------------------------------------------------------
+# verify() now requires executor-produced evidence before it will report a
+# commit; an observation alone is not enough. Tests that simulate a commit by
+# writing straight to the ledger need to state the evidence too, otherwise they
+# are testing the old "observation implies commit" contract.
+def commit_evidence(nonce: str, targets: object, *, source: str = "test"):
+    """Evidence for a simulated commit over `targets`."""
+    from effect_broker.model import EffectEvidence
+
+    target_set = frozenset(targets) if targets is not None else frozenset()
+    return EffectEvidence(
+        effect_id=nonce,
+        outcome="committed",
+        source=source,
+        window=(0.0, 0.0),
+        observed_targets=target_set,
+        transport_response="test",
+    )
+
+
+# ---------------------------------------------------------------------------
 # SMTP test fixture
 # ---------------------------------------------------------------------------
 # aiosmtpd is only needed in test context; guard so the module loads fine
