@@ -642,20 +642,8 @@ class IndependentEffectLedger:
                         reason=f"extra_observed(task={task_id},nonce={nonce},"
                         f"extra={extra},authorized={authorized_targets})"
                     )
-            # Evidence, when the executor supplies it, outranks the claim.
-            # a commit must be backed by something measured
-            # at the boundary, not by the executor asserting its own success.
-            # When evidence exists and does NOT say committed, the claim loses.
-            backing = self.evidence_for(task_id, nonce)
-            if backing is not None and backing.outcome != "committed":
-                return UnknownLedgerResult(
-                    reason=f"evidence_contradicts_observation(task={task_id},"
-                    f"nonce={nonce},evidence_outcome={backing.outcome})"
-                )
-            # Check occurrence count: obs_count > auth_count is only a problem
-            # when ALL observations are committed (no BLOCKED entries).
-            # When BLOCKED entries exist, they don't count toward the limit
-            # because they represent replay prevention, not extra applications.
+            # Count first: an over-observed nonce is a distinct finding, and
+            # reporting it as "no evidence" would hide the extra application.
             only_committed_count = sum(
                 1 for e in obs_entries if e not in blocked_entries and e not in failed_entries
             )
@@ -664,6 +652,17 @@ class IndependentEffectLedger:
                     reason=f"over-observed(task={task_id},nonce={nonce},"
                     f"auth_count={len(auth_entries)},"
                     f"committed_count={only_committed_count})"
+                )
+            # A commit needs a measurement, not the executor's own assertion.
+            backing = self.evidence_for(task_id, nonce)
+            if backing is None:
+                return UnknownLedgerResult(
+                    reason=f"committed_without_evidence(task={task_id},nonce={nonce})"
+                )
+            if backing.outcome != "committed":
+                return UnknownLedgerResult(
+                    reason=f"evidence_contradicts_observation(task={task_id},"
+                    f"nonce={nonce},evidence_outcome={backing.outcome})"
                 )
             return LedgerVerdict.CONFIRMED_COMMITTED
 

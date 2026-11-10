@@ -1037,6 +1037,22 @@ class Commit:
     # the SAME hash. This closes the gate↔execute coupling gap in same-process
     # mode (IPC mode already had this via executor_subprocess._verify_content_binding).
     authorized_content_hash: str | None = None
+    # True when the ResourceStore IS the external state for this effect rather
+    # than a mirror of it, so the store's own log entry is the measurement of
+    # what actually landed.
+    #
+    # Default True: a plain `broker.commit()` and the simulated FileShim
+    # (shim.py, whose `_do_write`/`_do_send` are documented NO-OPs) both mutate
+    # only the store, so the executor's observation of that mutation is the
+    # best evidence available.
+    #
+    # The REAL shims must set this False. For them the store only records that a
+    # file was written while the bytes land later, in shim_real.write(), after
+    # commit() returns. Letting the executor record evidence there would put
+    # "evidence" in the journal *before* the `dispatched` marker of the I/O it
+    # claims to prove, and evidence_for() would prefer that weaker claim over
+    # the shim's own transport measurement.
+    store_is_external_state: bool = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
