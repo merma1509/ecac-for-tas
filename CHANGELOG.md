@@ -14,6 +14,18 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ### Fixed
 
+- **Ambiguous request binding.** `CanonicalRequest`
+  (`effect_broker/model.py`) binds the full request — operation, acting
+  account, sender, complete recipients, attachment digests — and hashes it
+  over length-prefixed bytes, so `subject='a|b', body='c'` and
+  `subject='a', body='b|c'` no longer collide and a non-UTF-8 attachment
+  hashes identically in both processes. The subprocess's mirrored hashing
+  copy is gone; both sides call one helper. Attachment blobs now change the
+  `request_hash`.
+- **Nonce collision on long paths.** `_resolve_capability_nonce`
+  truncated the path to its last 40 characters, so two distinct paths
+  sharing a 40-char suffix derived the same nonce and a replay of one path
+  consumed the freshness of the other. The path is now length-prefixed.
 - **Landlock was reported active without ever being applied.**
   `_apply_landlock_sandbox()` called `restrict_self` with the ruleset FD where
   the flags argument belongs, added no rules, and ignored the result — then
@@ -148,7 +160,7 @@ whose current `pyproject.toml` version is `0.1.1`.
 - **`mode_conventional_sandbox.py` renamed to `mode_path_allowlist.py`**, and
   the comparator key `ConvSandbox` to `PathAllowlist`. The file compared strings
   on `effect.target` while claiming "seccomp + landlock/SELinux"; the kernel was
-  never involved. PLAN 6 Part D allows a comparator to either implement the named
+  never involved. this allows a comparator to either implement the named
   mechanism or be renamed — this is the rename, since a real one needs kernel
   enforcement (Landlock or seatbelt) and proof that a denied path fails with
   `EACCES`. Trace decisions are unchanged. The `README.md` claims that rested on

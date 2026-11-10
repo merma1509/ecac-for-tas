@@ -22,6 +22,7 @@ THREE ORTHOGONAL TRUST CONCEPTS (do not conflate):
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import time
 from dataclasses import dataclass, field
@@ -528,10 +529,7 @@ class Session:
         if entry is None:
             return f"unknown-provenance-id({datum.provenance_id})"
         if entry.scope_hash != datum.scope_hash:
-            return (
-                f"scope-mismatch(recorded={entry.scope_hash},"
-                f"claimed={datum.scope_hash})"
-            )
+            return f"scope-mismatch(recorded={entry.scope_hash},claimed={datum.scope_hash})"
         if entry.data.name != datum.name:
             return f"name-mismatch(recorded={entry.data.name},claimed={datum.name})"
         if entry.data.confidentiality != datum.confidentiality:
@@ -702,6 +700,174 @@ class EffectTarget:
 
 
 @dataclass(frozen=True)
+class CanonicalRequest:
+    """The request as approved, in a form two processes can agree on byte-for-byte.
+
+    Two defects made the previous binding ambiguous:
+
+    - **separator ambiguity.** The send hash was computed over
+      `f"{subject}|{body}"`. `subject='a|b', body='c'` and `subject='a',
+      body='b|c'` produced the same hash, so one approved message could stand
+      in for another. `canonical_bytes()` length-prefixes every field, so no
+      field content can impersonate a field boundary.
+    - **two hash implementations.** `model.py` decoded attachment bytes
+      with `errors="replace"` before hashing; the subprocess hashed the raw
+      bytes. For any non-UTF-8 attachment the two sides could never agree.
+      There is now one hashing helper, `sha256_raw()`, and both sides call it.
+
+    The hash is over `canonical_bytes()`, not over the dataclass: pickling and
+    re-pickling across the IPC boundary must not change the digest, and field
+    ordering must not depend on declaration order.
+    """
+
+    version: int
+    operation: str  # "send" | "write" | "read" | "delete" | "network"
+    task_id: str
+    acting_account: str  # whose authority is exercised (mailbox being operated on)
+    sender: str | None  # envelope MAIL FROM, for send
+    recipients: tuple[str, ...]  # sorted, complete: primary + CC + BCC
+    target: str
+    resource_digests: tuple[tuple[str, str], ...]  # (name, sha256hex), sorted by name
+    attachments: tuple[tuple[str, str], ...]  # (name, sha256hex), sorted by name
+
+    def canonical_bytes(self) -> bytes:
+        """Length-prefixed, version-tagged, deterministic serialization.
+
+        Every field is `len(field).to_bytes(8, "big") + field`, so field content
+        cannot shift the parse. No delimiters anywhere: a delimiter is what made
+        `subject|body` ambiguous (B2).
+        """
+        parts: list[bytes] = [_canonical_version_bytes(self.version)]
+
+        for field_bytes in (
+            self.operation.encode("utf-8"),
+            self.task_id.encode("utf-8"),
+            (self.acting_account or "").encode("utf-8"),
+            (self.sender or "").encode("utf-8"),
+        ):
+            parts.append(_len_prefixed(field_bytes))
+
+        # Recipients: sorted, each length-prefixed, then the count prefixed too
+        # so ("a",) and ("a", "b") cannot alias.
+        parts.append(_len_prefixed(len(self.recipients).to_bytes(8, "big")))
+        for r in sorted(self.recipients):
+            parts.append(_len_prefixed(r.encode("utf-8")))
+
+        parts.append(_len_prefixed(self.target.encode("utf-8")))
+
+        for table in (self.resource_digests, self.attachments):
+            parts.append(_len_prefixed(len(table).to_bytes(8, "big")))
+            for name, digest in sorted(table):
+                parts.append(_len_prefixed(name.encode("utf-8")))
+                parts.append(_len_prefixed(digest.encode("utf-8")))
+
+        return b"".join(parts)
+
+    def request_hash(self) -> str:
+        """SHA256 over `canonical_bytes()` — the value an approval binds."""
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    def digest(self, name: str) -> str | None:
+        """The digest recorded for a named resource (e.g. `"body"`), else None."""
+        for resource_name, d in self.resource_digests:
+            if resource_name == name:
+                return d
+        return None
+
+
+def _len_prefixed(field: bytes) -> bytes:
+    """Encode one field as its 8-byte big-endian length followed by the bytes."""
+    return len(field).to_bytes(8, "big") + field
+
+
+def _canonical_version_bytes(version: int) -> bytes:
+    """The version field: 8-byte big-endian, length-prefixed like every other field."""
+    return _len_prefixed(version.to_bytes(8, "big"))
+
+
+#: The canonical request version this code emits. Bump on any change to the
+#: serialization; the field is in the digest precisely so old approvals cannot
+#: be silently re-read under new rules.
+CANONICAL_REQUEST_VERSION = 1
+
+
+def sha256_raw(data: bytes) -> str:
+    """The one hashing helper. Both processes must call THIS, not a mirrored copy.
+
+    model.py` used to decode bytes with `errors="replace"` before
+    hashing while the subprocess hashed raw bytes, so any non-UTF-8 attachment
+    produced digests that could never match across the IPC boundary.
+    """
+    return hashlib.sha256(data).hexdigest()
+
+
+def canonical_request_from_effect(
+    effect: Effect,
+    *,
+    acting_account: str = "",
+    sender: str | None = None,
+) -> CanonicalRequest:
+    """Build the canonical request for an effect, hashing raw bytes.
+
+    `acting_account` must come from the caller that knows whose credentials are
+    in play (the shim session); it is not on the effect. `sender` likewise —
+    for a send it is the envelope MAIL FROM, and an approval for one sender
+    must not stand in for another (P5-9).
+    """
+    recipients: list[str] = []
+    resource_digests: list[tuple[str, str]] = []
+    attachments: list[tuple[str, str]] = []
+
+    if effect.etype == "send":
+        recipients = sorted(effect.complete_targets())
+        subject = effect.metadata.get("subject", "")
+        body = effect.metadata.get("body", "")
+        if isinstance(subject, str) and isinstance(body, str):
+            # Hash subject and body as separate length-prefixed entries rather
+            # than one concatenated string (B2).
+            resource_digests.append(("subject", sha256_raw(subject.encode("utf-8"))))
+            resource_digests.append(("body", sha256_raw(body.encode("utf-8"))))
+        raw_body = effect.metadata.get("body_raw")
+        if isinstance(raw_body, bytes):
+            # The bytes that will actually go on the wire, hashed as bytes.
+            resource_digests.append(("body_raw", sha256_raw(raw_body)))
+
+    elif effect.etype == "write":
+        content = effect.metadata.get("content")
+        if content is None:
+            content_b64 = effect.metadata.get("content_b64", "")
+            if isinstance(content_b64, str) and content_b64:
+                content = base64.b64decode(content_b64)
+        if isinstance(content, bytes):
+            resource_digests.append(("content", sha256_raw(content)))
+        elif isinstance(content, str) and content:
+            resource_digests.append(("content", sha256_raw(content.encode("utf-8"))))
+
+    raw_attachments = effect.metadata.get("attachments")
+    if isinstance(raw_attachments, list):
+        for attachment in raw_attachments:
+            if not isinstance(attachment, dict):
+                continue
+            att_name = attachment.get("name", "")
+            att_bytes = attachment.get("bytes")
+            if isinstance(att_bytes, bytes):
+                # Raw bytes, hashed once here — never decoded with errors=replace.
+                attachments.append((str(att_name), sha256_raw(att_bytes)))
+
+    return CanonicalRequest(
+        version=CANONICAL_REQUEST_VERSION,
+        operation=effect.etype,
+        task_id=effect.task_id or "default",
+        acting_account=acting_account,
+        sender=sender,
+        recipients=tuple(recipients),
+        target=effect.target,
+        resource_digests=tuple(sorted(resource_digests)),
+        attachments=tuple(sorted(attachments)),
+    )
+
+
+@dataclass(frozen=True)
 class ApprovedRequest:
     """An immutable authorization binding: exact (etype, targets, task_id, content_hash).
 
@@ -738,6 +904,11 @@ class ApprovedRequest:
     # Content hash for immutable binding. Prevents content modification after approval.
     # None for effects without content (read, delete, etc.)
     content_hash: str | None = None
+    # SHA256 over CanonicalRequest.canonical_bytes() Binds the
+    # full request — operation, acting account, sender, complete recipients,
+    # attachment digests — not just the content. None on approvals created
+    # before the canonical request existed (see content_hash migration note).
+    request_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -973,20 +1144,16 @@ class Effect:
         Content is derived from metadata fields: body, subject, content.
         Returns None for effects without content (read, delete, etc.).
         """
-        # For send effects, hash the body + subject
+        # For send effects, hash the body: it is the content on the wire.
+        # Subject is bound separately in CanonicalRequest (B2: no concatenation).
         if self.etype == "send":
             body = self.metadata.get("body", "")
-            subject = self.metadata.get("subject", "")
-            if isinstance(body, str) and isinstance(subject, str):
-                # Combine body and subject for a single content hash
-                combined = f"{subject}|{body}"
-                return compute_content_hash(combined)
+            if isinstance(body, str):
+                return sha256_raw(body.encode("utf-8"))
 
         # For write effects, hash the content being written
         if self.etype == "write":
             # Handle both direct content (bytes/str) and base64-encoded content
-            import base64
-
             content_raw = self.metadata.get("content", "")
             if content_raw is None or content_raw == "":
                 # Also check for base64 encoded content (from IPC-safe shim)
@@ -994,9 +1161,10 @@ class Effect:
                 if isinstance(content_b64, str) and content_b64:
                     content_raw = base64.b64decode(content_b64)
             if isinstance(content_raw, bytes):
-                content_raw = content_raw.decode("utf-8", errors="replace")
+                # Hash raw bytes; do not decode with errors="replace" (B3).
+                return sha256_raw(content_raw)
             if isinstance(content_raw, str) and content_raw:
-                return compute_content_hash(content_raw)
+                return sha256_raw(content_raw.encode("utf-8"))
 
         # For read/delete effects, there's no mutable content to bind
         return None
@@ -1108,9 +1276,7 @@ ALLOWED_TRANSITIONS: dict[EffectState, frozenset[EffectState]] = {
     EffectState.AUTHORIZED: frozenset(
         {EffectState.IN_FLIGHT, EffectState.DENIED, EffectState.ABANDONED}
     ),
-    EffectState.IN_FLIGHT: frozenset(
-        {EffectState.COMMITTED, EffectState.UNKNOWN}
-    ),
+    EffectState.IN_FLIGHT: frozenset({EffectState.COMMITTED, EffectState.UNKNOWN}),
     EffectState.COMMITTED: frozenset(),
     EffectState.DENIED: frozenset(),
     EffectState.ABANDONED: frozenset(),
@@ -1167,9 +1333,7 @@ class EffectEvidence:
             )
         start, end = self.window
         if end < start:
-            raise EvidenceInsufficient(
-                f"observation window is inverted: start={start} end={end}"
-            )
+            raise EvidenceInsufficient(f"observation window is inverted: start={start} end={end}")
         if self.outcome == "committed":
             # The whole point of the type: no unbacked commits.
             if not self.transport_response:

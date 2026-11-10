@@ -187,43 +187,33 @@ from typing import Any
 
 # PHASE 3: Content hash verification (atomic commit guarantee)
 def _compute_effect_content_hash(effect: dict[str, Any]) -> str | None:
-    """Compute SHA256 hash of effect's content from metadata.
+    """Content hash for a dict-shaped effect, via the shared helper.
 
-    Mirrors model.py:Effect.compute_content_hash() but for dict representation.
-    This is used by the subprocess to verify content_hash before applying effects.
-
-    Returns None if no content to hash (read/delete effects, empty writes).
+    This used to be a mirrored implementation hashing `f"{subject}|{body}"` —
+    the separator ambiguity PLAN 5 B2 — while model.py hashed its own format,
+    so the two sides could disagree. Now: serialize the dict back into an
+    Effect and call the one implementation. No mirrored hashing anywhere.
     """
-    etype = effect.get("etype", "")
-    metadata = effect.get("metadata", {})
+    from effect_broker.model import Effect, canonical_request_from_effect
 
-    if etype == "send":
-        body = metadata.get("body", "")
-        subject = metadata.get("subject", "")
-        if isinstance(body, str) and isinstance(subject, str):
-            combined = f"{subject}|{body}"
-            return hashlib.sha256(combined.encode("utf-8")).hexdigest()
+    try:
+        effect_obj = Effect(
+            etype=effect.get("etype", ""),
+            target=effect.get("target", ""),
+            metadata=dict(effect.get("metadata", {})),
+            provenance=(),
+            capability_nonce=effect.get("capability_nonce", ""),
+            delegation_chain=(),
+        )
+    except Exception:
+        return None
 
-    elif etype == "write":
-        import base64
-
-        # Check for direct bytes content
-        content_raw = metadata.get("content", "")
-        if content_raw is None or content_raw == "":
-            # Check for base64-encoded content (from IPC-safe shim)
-            content_b64 = metadata.get("content_b64", "")
-            if isinstance(content_b64, str) and content_b64:
-                try:
-                    decoded = base64.b64decode(content_b64)
-                    return hashlib.sha256(decoded).hexdigest()
-                except Exception:
-                    return None
-        if isinstance(content_raw, bytes):
-            return hashlib.sha256(content_raw).hexdigest()
-        if isinstance(content_raw, str) and content_raw:
-            return hashlib.sha256(content_raw.encode("utf-8")).hexdigest()
-
-    return None
+    request = canonical_request_from_effect(effect_obj)
+    # The canonical request covers send (subject/body) and write (content).
+    # fall back to the legacy combined hash for anything else with content.
+    if request.resource_digests:
+        return request.digest("body") or request.digest("content")
+    return effect_obj.compute_content_hash()
 
 
 def _verify_content_binding(
