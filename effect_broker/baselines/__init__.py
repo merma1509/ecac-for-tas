@@ -5,7 +5,7 @@ Compares ECAC against external systems:
 - PACT: Property attestation + capabilities
 - ChainCaps: Capability transformations
 - Cordon: Commit-time revalidation
-- ConventionalSandbox: seccomp/landlock-style OS path+syscall confinement
+- PathAllowlist: path/host allowlist (NOT a sandbox — see its docstring)
 - FORGE: Policy DSL
 - Allowlist: Tool pattern matching
 - ArgProv: Argument provenance
@@ -19,11 +19,11 @@ from .mode_allowlist import AllowlistBroker
 from .mode_argument_provenance import ArgumentProvenanceBroker
 from .mode_camel import CaMeLBroker
 from .mode_chaincaps import ChainCapsBroker
-from .mode_conventional_sandbox import ConventionalSandboxBroker
 from .mode_cordon import CordonBroker
 from .mode_ecac import ECACBaselineBroker
 from .mode_forge import ForgeBroker
 from .mode_pact import PACTBroker
+from .mode_path_allowlist import PathAllowlistBroker
 
 warnings.filterwarnings("ignore", message="SAME-PROCESS")
 
@@ -32,13 +32,73 @@ __all__ = [
     "PACTBroker",
     "ChainCapsBroker",
     "CordonBroker",
-    "ConventionalSandboxBroker",
+    "PathAllowlistBroker",
     "ForgeBroker",
     "AllowlistBroker",
     "ArgumentProvenanceBroker",
     "ECACBaselineBroker",
+    "COMPARATOR_MECHANISMS",
     "run_comparison",
 ]
+
+
+#: Per-comparator statement of what is enforced versus omitted.
+COMPARATOR_MECHANISMS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "ECAC": (
+        (
+            "Auth: capability nonce + scope",
+            "FlowOK: session taint + recorded declass",
+            "NoAmp: authority monotonicity (owner != User)",
+            "Fresh: nonce lifetime / replay",
+            "executor-produced EffectEvidence before COMMITTED",
+        ),
+        (),
+    ),
+    "CaMeL": (
+        ("confidentiality label check on provenance",),
+        ("session taint propagation", "capability scope", "replay prevention"),
+    ),
+    "PACT": (
+        ("capability presence", "provenance tracking", "activity log"),
+        (
+            "content hash binding (modify-after-approval)",
+            "session taint",
+            "replay prevention",
+            "attenuation-only narrowing (widening passes)",
+        ),
+    ),
+    "ChainCaps": (
+        ("capability transformation chain",),
+        ("session taint", "replay prevention", "content binding"),
+    ),
+    "Cordon": (
+        ("commit-time revalidation of a proposal",),
+        ("content hash binding is optional", "session taint", "replay prevention"),
+    ),
+    "FORGE": (
+        ("policy DSL: effect-type + target-pattern rules",),
+        ("capability scope", "session taint", "replay prevention"),
+    ),
+    "Allowlist": (
+        ("tool-name + target-prefix pattern match",),
+        ("everything else — the weakest baseline by design",),
+    ),
+    "ArgProv": (
+        ("argument provenance chain integrity",),
+        ("capabilities", "session taint", "replay prevention"),
+    ),
+    "PathAllowlist": (
+        ("target-path prefix allowlist (string compare)", "target-host allowlist"),
+        (
+            "syscall filtering (seccomp)",
+            "kernel-enforced path confinement (Landlock/SELinux/seatbelt)",
+            "capability system",
+            "IFC / session taint",
+            "recipient (BCC) scoping",
+            "replay prevention",
+        ),
+    ),
+}
 
 
 def run_comparison() -> dict[str, list[dict]]:
@@ -51,7 +111,7 @@ def run_comparison() -> dict[str, list[dict]]:
         "PACT": PACTBroker(),
         "ChainCaps": ChainCapsBroker(),
         "Cordon": CordonBroker(),
-        "ConvSandbox": ConventionalSandboxBroker(),
+        "PathAllowlist": PathAllowlistBroker(),
         "FORGE": ForgeBroker(),
         "Allowlist": AllowlistBroker(),
         "ArgProv": ArgumentProvenanceBroker(),
