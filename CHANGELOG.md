@@ -12,6 +12,22 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Landlock was reported active without ever being applied.**
+  `_apply_landlock_sandbox()` called `restrict_self` with the ruleset FD where
+  the flags argument belongs, added no rules, and ignored the result — then
+  reported `landlock` as an active confinement layer. The ruleset is now
+  created with the correct `linux/landlock.h` constants (444/445/446, not 451
+  for every call), a `PATH_BENEATH` rule re-opens writes only under
+  `ECAC_LANDLOCK_WRITE_ROOT`, and `landlock` appears in the confinement status
+  only after a selftest observes a write being denied. The selftest probes a
+  path the process can write and does not read an unrelated `EACCES` (the first
+  version probed `/etc` and mistook ordinary permissions for confinement).
+- **Unconfined execution can now be refused.** `ECAC_REQUIRE_CONFINEMENT=1`
+  makes the executor subprocess raise rather than run with no kernel mechanism,
+  instead of degrading silently on hosts (e.g. macOS) that cannot confine.
+
 ### Added
 
 - **Comparator mechanisms table** (`baselines.COMPARATOR_MECHANISMS`). States,

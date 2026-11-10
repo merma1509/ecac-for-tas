@@ -40,8 +40,15 @@ SUBCONFINEMENT (arbitrary code execution):
 ────────────────────────────────────────────────
   ✓ Module import blocking (builtins.__import__ hook)
   ✓ restricted-open for filesystem writes
-  ✓ Landlock sandbox (Linux 5.13+)
+  ~ Landlock sandbox — Linux only, and only when the selftest passes
   ✓ Network blocking (except local IPC socket)
+
+What "Landlock" means here: on Linux 5.13+ with the LSM enabled, a ruleset is
+applied and `_selftest_confinement()` confirms a write outside
+`ECAC_LANDLOCK_WRITE_ROOT` is denied. On macOS there is no kernel mechanism at
+all, and the Python-level wrappers above are hygiene, not confinement.
+`_get_confinement_status()` reports which of the two you have;
+`ECAC_REQUIRE_CONFINEMENT=1` turns absence into a refusal to start.
 
 IPC PROTOCOL
 ────────────
@@ -62,10 +69,6 @@ from __future__ import annotations
 import builtins
 import sys
 
-# Modules blocked from import in the subprocess (exact matches)
-# NOTE: stdlib modules like 'os', 'subprocess', 'threading', 'signal' are ALLOWED.
-# The blocking is ONLY for dangerous third-party packages and specific attack vectors.
-# Filesystem writes are restricted via _restricted_open wrapper on os.open().
 _DANGEROUS_MODULES: frozenset[str] = frozenset(
     {
         # Code execution — prevents dynamic code generation
@@ -168,18 +171,16 @@ def _secure_import(
 # Install the secure import hook BEFORE any other imports
 builtins.__import__ = _secure_import  # type: ignore[assignment]
 
-# PHASE 2: Safe standard library imports (after blocking hook is installed)
-# These imports are ALLOWED by the secure import hook.
-# The blocking hook only blocks dangerous modules (network, pickle, code exec).
 import ctypes
 import ctypes.util
 import hashlib
 import json
-import os  # Used for path operations, stat, getpid, etc.
-import signal  # Needed for SIGINT/SIGTERM handlers
-import socket  # Needed for Unix socket IPC server
-import subprocess  # Needed for subprocess spawning at startup
-import threading  # Needed for connection handler threads
+import os
+import signal
+import socket
+import subprocess
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -272,45 +273,187 @@ from effect_broker.enforcer import (
     _restricted_open as _restricted_open,
 )
 
+# Landlock ABI constants (linux/landlock.h, x86_64). The code previously used
+# 451 for every landlock call, which is not any of them.
+#
+# Version-gated access flags are filtered through `_LANDLOCK_ABI_HANDLED`: a flag
+# the running kernel does not know makes the whole ruleset call fail with
+# EINVAL, so handling all of them unconditionally would disable confinement on
+# older kernels instead of tightening it.
+_SYS_LANDLOCK_CREATE_RULESET = 444
+_SYS_LANDLOCK_ADD_RULE = 445
+_SYS_LANDLOCK_RESTRICT_SELF = 446
+
+_LANDLOCK_CREATE_RULESET_VERSION = 1 << 0
+_LANDLOCK_RULE_PATH_BENEATH = 1
+
+_LANDLOCK_ACCESS_FS_EXECUTE = 1 << 0
+_LANDLOCK_ACCESS_FS_WRITE_FILE = 1 << 1
+_LANDLOCK_ACCESS_FS_REMOVE_DIR = 1 << 4
+_LANDLOCK_ACCESS_FS_REMOVE_FILE = 1 << 5
+_LANDLOCK_ACCESS_FS_MAKE_REG = 1 << 8
+_LANDLOCK_ACCESS_FS_MAKE_DIR = 1 << 11
+
+#: Access flags introduced after ABI v1, gated by the kernel's reported version.
+#: Asking for a flag the kernel does not know fails the whole ruleset with
+#: EINVAL, so handling all of them unconditionally would silently disable
+#: confinement on an older kernel rather than tightening it.
+_LANDLOCK_ACCESS_BY_ABI: tuple[tuple[int, int], ...] = (
+    # (minimum ABI version, flag)
+    (1, _LANDLOCK_ACCESS_FS_EXECUTE),
+    (1, _LANDLOCK_ACCESS_FS_WRITE_FILE),
+    (1, _LANDLOCK_ACCESS_FS_REMOVE_DIR),
+    (1, _LANDLOCK_ACCESS_FS_REMOVE_FILE),
+    (1, _LANDLOCK_ACCESS_FS_MAKE_REG),
+    (1, _LANDLOCK_ACCESS_FS_MAKE_DIR),
+)
+
+
+def _landlock_handled_access(abi: int) -> int:
+    """Mask of access rights this kernel supports, for the given ABI version."""
+    handled = 0
+    for min_abi, flag in _LANDLOCK_ACCESS_BY_ABI:
+        if abi >= min_abi:
+            handled |= flag
+    return handled
+
+
+#: The single directory writes are permitted beneath. Deliberately narrow: this
+#: is the executor's own sandbox, not the user's home directory.
+_LANDLOCK_WRITE_ROOT = os.environ.get("ECAC_LANDLOCK_WRITE_ROOT", "/tmp/ecac-sandbox")
+
 
 def _apply_landlock_sandbox() -> bool:
-    """Apply Landlock filesystem sandbox (Linux 5.13+).
-    Returns True if Landlock was successfully applied.
-    Note: May require specific kernel config or CAP_SYS_ADMIN on older kernels.
+    """Apply a Landlock filesystem ruleset to this process (Linux 5.13+).
+
+    Returns True ONLY if the kernel reports the ruleset as enforced. A bare
+    `syscall() >= 0` does not establish that: this function used to return True
+    from a call that passed the ruleset FD where the flags argument belongs, so
+    "landlock active" was reported without a rule ever being applied.
+
+    The claim is only made after `_selftest_confinement()` observes a denied
+    path actually being denied, which is the difference between asking the
+    kernel to restrict us and the restriction being in effect.
     """
     if os.uname().sysname != "Linux":
         return False
 
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+
+    # Confirm the kernel implements Landlock before asking for a ruleset. On an
+    # older kernel this fails cleanly, which is what we want: no silent no-op.
+    abi = libc.syscall(
+        _SYS_LANDLOCK_CREATE_RULESET,
+        None,
+        ctypes.c_size_t(0),
+        ctypes.c_uint32(_LANDLOCK_CREATE_RULESET_VERSION),
+    )
+    if abi < 0:
+        return False
+
+    class _RulesetAttr(ctypes.Structure):
+        _fields_ = [("handled_access_fs", ctypes.c_uint64)]
+
+    class _PathBeneathAttr(ctypes.Structure):
+        _fields_ = [
+            ("allowed_access", ctypes.c_uint64),
+            ("parent_fd", ctypes.c_int32),
+        ]
+
+    handled = _landlock_handled_access(abi)
+    attr = _RulesetAttr(handled_access_fs=handled)
+    ruleset_fd = libc.syscall(
+        _SYS_LANDLOCK_CREATE_RULESET,
+        ctypes.byref(attr),
+        ctypes.sizeof(attr),
+        0,
+    )
+    if ruleset_fd < 0:
+        return False
+
     try:
-        # Landlock syscall number (451)
-        SYS_landlock_create_ruleset = 451
-        LANDLOCK_RESTRICT_SELF = 0x03
+        # A ruleset with no rules denies every handled access everywhere. That is
+        # the intended default: writes are re-opened only beneath the sandbox root.
+        if os.path.isdir(_LANDLOCK_WRITE_ROOT):
+            # O_PATH is Linux-only (the only place this code runs), but the macOS
+            # type stubs do not export it, hence the guarded lookup.
+            o_path = getattr(os, "O_PATH", 0)
+            root_fd = os.open(_LANDLOCK_WRITE_ROOT, o_path | os.O_CLOEXEC)
+            try:
+                path_attr = _PathBeneathAttr(
+                    allowed_access=handled,
+                    parent_fd=root_fd,
+                )
+                added = libc.syscall(
+                    _SYS_LANDLOCK_ADD_RULE,
+                    ruleset_fd,
+                    _LANDLOCK_RULE_PATH_BENEATH,
+                    ctypes.byref(path_attr),
+                    0,
+                )
+                if added < 0:
+                    return False
+            finally:
+                os.close(root_fd)
 
-        # Access flags
-        ACCESS_FS_READ = 1
-        ACCESS_FS_WRITE = 2
-        ACCESS_FS_EXEC = 4
+        # restrict_self takes FLAGS, not the ruleset FD — passing the FD here was
+        # the original defect, and it made the call meaningless.
+        if (
+            libc.syscall(
+                _SYS_LANDLOCK_RESTRICT_SELF,
+                ruleset_fd,
+                ctypes.c_uint32(0),
+            )
+            < 0
+        ):
+            return False
+    finally:
+        os.close(ruleset_fd)
 
-        class landlock_ruleset_attr(ctypes.Structure):
-            _fields_ = [("handled_access_fs", ctypes.c_uint64)]
+    # No-op unless a denied path is actually denied.
+    return _selftest_confinement()
 
-        libc = ctypes.CDLL(ctypes.util.find_library("c"))
 
-        # Create ruleset allowing basic filesystem operations
-        handled = ACCESS_FS_READ | ACCESS_FS_WRITE | ACCESS_FS_EXEC
-        attr = landlock_ruleset_attr(handled_access_fs=handled)
+def _selftest_confinement() -> bool:
+    """Return True only if a write that should be allowed is observably denied.
 
-        ruleset_fd = libc.syscall(
-            SYS_landlock_create_ruleset, 0, ctypes.byref(attr), ctypes.sizeof(attr)
-        )
+    The probe must run somewhere writable *without* confinement, otherwise a
+    failure proves nothing: probing `/etc` returns "denied" on any host where
+    `/etc` is not writable for ordinary permission reasons, and that would be
+    read as evidence of confinement it never had. So the probe looks for a
+    directory the process can normally write to and that lies outside
+    `_LANDLOCK_WRITE_ROOT`, and treats only `EACCES` there as denial.
 
-        if ruleset_fd >= 0:
-            # Restrict self with the ruleset
-            libc.syscall(SYS_landlock_create_ruleset, LANDLOCK_RESTRICT_SELF, ruleset_fd, 0, 0)
+    If no such directory is testable, the answer is False: an untested claim is
+    not a claim.
+    """
+    write_root = os.path.abspath(_LANDLOCK_WRITE_ROOT)
+    for base in (tempfile.gettempdir(), os.path.expanduser("~")):
+        if not base:
+            continue
+        base_abs = os.path.abspath(base)
+        # Probing inside the write root would be allowed by design, and would
+        # read as "not confined" even when it is.
+        if base_abs == write_root or base_abs.startswith(write_root + os.sep):
+            continue
+        if not os.access(base_abs, os.W_OK):
+            continue
+        probe = os.path.join(base_abs, f".ecac-landlock-probe-{os.getpid()}")
+        try:
+            fd = os.open(probe, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600)
+        except PermissionError:
+            # Denied where we demonstrably could write: that is confinement.
             return True
-    except Exception:
-        pass
-
+        except OSError:
+            # Some other error says nothing about confinement. Try elsewhere.
+            continue
+        os.close(fd)
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+        return False  # The write landed. Not confined.
     return False
 
 
@@ -318,18 +461,59 @@ def _apply_landlock_sandbox() -> bool:
 _landlock_active = _apply_landlock_sandbox()
 
 
+class ConfinementUnavailable(RuntimeError):
+    """Kernel-enforced confinement was required but is not in effect."""
+
+
+def _require_confinement_if_configured() -> None:
+    """Fail closed when `ECAC_REQUIRE_CONFINEMENT=1` and Landlock is inactive.
+
+    Without this, a host that cannot confine (macOS, an old kernel, a container
+    without the LSM enabled) degrades silently: the executor runs, the ledger
+    says `committed`, and nothing distinguishes "confined" from "wanted to be".
+    Default is off so local development on macOS still runs; CI sets it, and
+    either way the status is reported rather than assumed.
+    """
+    if os.environ.get("ECAC_REQUIRE_CONFINEMENT", "").lower() not in {"1", "true", "yes"}:
+        return
+    if _confinement_is_kernel_enforced():
+        return
+    raise ConfinementUnavailable(
+        f"ECAC_REQUIRE_CONFINEMENT is set but no kernel confinement is in effect "
+        f"(platform={os.uname().sysname}, status={_get_confinement_status()}). "
+        f"Refusing to run unconfined rather than reporting a guarantee we cannot keep. "
+        f"Landlock requires Linux 5.13+ with the LSM enabled."
+    )
+
+
 def _get_confinement_status() -> str:
-    """Return description of active confinement."""
-    methods = ["restricted-open", "import-blocking"]
+    """Return the confinement methods actually in effect, per platform.
+
+    `landlock` appears only when `_apply_landlock_sandbox()` returned True, which
+    requires the selftest to have observed a denied path being denied. There is
+    no code path that reports `landlock` on the strength of a syscall return
+    value alone
+
+    On non-Linux hosts the answer names what is left, so a reader cannot mistake
+    "no kernel confinement" for "confinement not checked".
+    """
+    methods = []
     if _landlock_active:
         methods.append("landlock")
+    methods.append("restricted-open")
+    methods.append("import-blocking")
     return "+".join(methods)
+
+
+def _confinement_is_kernel_enforced() -> bool:
+    """True only if a kernel mechanism, not a Python wrapper, is restricting us."""
+    return _landlock_active
 
 
 def _derive_confidentiality_from_mode(mode_int: int) -> str:
     """Derive confidentiality from Unix permission bits.
 
-    PLAN_2 S4 — delegates to the single source of truth in statx.py instead of
+    delegates to the single source of truth in statx.py instead of
     a forked hard-coded copy, so the subprocess can never drift from the broker
     or shim. Runs in subprocess so taint detection uses real OS state.
     """
@@ -576,6 +760,10 @@ class ExecutorServer:
                 pass
 
     def run(self) -> None:
+        # Refuse to start unconfined when confinement is required. Checked here,
+        # before any effect can be applied, so "required but absent" can never be
+        # discovered late.
+        _require_confinement_if_configured()
 
         self._store = IsolatedStore()
         self._shutdown.clear()

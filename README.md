@@ -101,6 +101,13 @@ Or via `dev.sh`:
 
 ## Honest limitations
 
+- **What is kernel-enforced, per platform.** On Linux 5.13+ with the Landlock LSM enabled, the
+  executor subprocess applies a Landlock ruleset and _keeps_ the claim only if a selftest
+  observes a write outside `ECAC_LANDLOCK_WRITE_ROOT` being denied (`EACCES`). On macOS there is
+  **no kernel confinement**: the Python-level restricted-open wrapper and import blocklist are
+  hygiene, not a security boundary. `_get_confinement_status()` names what is actually in effect,
+  and `ECAC_REQUIRE_CONFINEMENT=1` makes the executor refuse to start where no kernel mechanism
+  exists (off by default for local development, on in CI).
 - **All tests ≠ real confinement.** Regression evidence, not proven protected-effect confinement
 - **Same-process isolation is advisory.** Direct store mutation returns `UNKNOWN`. Use multi-process mode.
 - **Tool declarations require a trusted manifest.** The structural check is only as strong as
