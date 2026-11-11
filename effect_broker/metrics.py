@@ -13,7 +13,7 @@ Metrics:
                                breakdown a pass/fail report lacks
   - latency percentile    : p50 / p95 / p99 gate evaluation time
   - annotation burden     : number of explicit grants per allowed operation
-  - TCB size              : lines of code in the trusted core (broker+model)
+  - TCB size              : executable lines in the trusted core (see _TCB_FILES)
 
 Honesty note: these are REGRESSION metrics on supplied scenarios.
 They quantify how the current build behaves on a fixed set; they are not a
@@ -22,6 +22,7 @@ causal estimate of protection against adaptive/live attackers.
 
 from __future__ import annotations
 
+import ast
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -45,7 +46,13 @@ if TYPE_CHECKING:
 
 # The trusted core: the code whose correctness the security argument rests on.
 # (Excludes shims, tests, baselines, and the evaluation harness.)
-_TCB_FILES = ("effect_broker/broker.py", "effect_broker/model.py")
+
+_TCB_FILES = (
+    "effect_broker/broker.py",
+    "effect_broker/model.py",
+    "effect_broker/executor.py",
+    "effect_broker/restricted_store.py",
+)
 
 
 class EvaluationReport(TypedDict, total=False):
@@ -307,26 +314,79 @@ def compute_metrics() -> EvaluationMetrics:
     return m
 
 
+def _docstring_line_numbers(text: str) -> set[int]:
+    """1-based line numbers occupied entirely by a module/class/function docstring.
+
+    A docstring is prose that happens to be a string literal: no attacker can
+    exploit it. Counting it as code inflated the trusted core by 1238 lines out
+    of 3401 (~36%), which is the same error the comment filter was added to fix,
+    in the form that survived it.
+
+    A line is excluded only if nothing but whitespace surrounds the literal on
+    it, so a single-line def whose body is a docstring still counts as the code
+    it is.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        # Mid-edit or generated file: skip the refinement rather than fail a
+        # metrics run. The result is then the (higher) comment-only figure.
+        return set()
+
+    lines = text.splitlines()
+    spans: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", ())
+        if not body:
+            continue
+        first = body[0]
+        if not (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            continue
+
+        literal = first.value
+        start = literal.lineno
+        end = literal.end_lineno or start
+        for line_no in range(start, end + 1):
+            if line_no > len(lines):
+                continue
+            line = lines[line_no - 1]
+            if line_no == start and line[: literal.col_offset].strip():
+                continue  # code precedes the literal on its first line
+            if line_no == end and line[literal.end_col_offset :].strip():
+                continue  # code follows the literal on its last line
+            spans.add(line_no)
+    return spans
+
+
 def _count_code_lines(text: str) -> int:
-    """Count non-blank, non-comment lines.
+    """Count lines that execute: non-blank, not a comment, not a docstring.
 
     Raw line count was misleading: documenting a decision grew the reported
     TCB by 171 lines without adding a single executable statement. The metric
-    exists to size what must be CORRECT, so comments and blank lines -- which
-    no attacker can exploit -- must not inflate it.
+    exists to size what must be CORRECT, so comments, docstrings and blank
+    lines -- none of which an attacker can exploit -- must not inflate it.
     """
+    docstring_lines = _docstring_line_numbers(text)
     return sum(
         1
-        for line in text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
+        for line_no, line in enumerate(text.splitlines(), start=1)
+        if line.strip() and not line.strip().startswith("#") and line_no not in docstring_lines
     )
 
 
 def tcb_size() -> int:
-    """Executable lines in the trusted core (broker + model).
+    """Executable lines in the trusted core (`_TCB_FILES`).
 
-    Counts code lines only; see _count_code_lines. Use this as the trend
-    metric: an increase means more logic the security argument depends on.
+    Counts lines that execute only; see `_count_code_lines`. Use this as the
+    trend metric: an increase means more logic the security argument depends
+    on. `tcb_breakdown()` gives the per-file split, which is what a reader
+    checking the figure against `docs/ARCHITECTURE.md` needs.
     """
     root = Path(__file__).resolve().parent.parent
     total = 0
@@ -337,18 +397,18 @@ def tcb_size() -> int:
     return total
 
 
-def tcb_size_raw() -> int:
-    """Raw line count of the trusted core, for reference only.
+def tcb_breakdown() -> dict[str, int]:
+    """Per-file executable line counts, in `_TCB_FILES` order.
 
-    Retained because earlier reports quoted this number; it is NOT the metric
-    to track. `tcb_size()` is.
+    Reported alongside the total so a divergence from the documented TCB is
+    visible where it happens rather than only in the sum.
     """
     root = Path(__file__).resolve().parent.parent
-    return sum(
-        len((root / rel).read_text().splitlines())
-        for rel in _TCB_FILES
-        if (root / rel).exists()
-    )
+    breakdown: dict[str, int] = {}
+    for rel in _TCB_FILES:
+        path = root / rel
+        breakdown[Path(rel).name] = _count_code_lines(path.read_text()) if path.exists() else 0
+    return breakdown
 
 
 def session_taint_metrics() -> dict[str, object]:
@@ -613,9 +673,7 @@ def print_diagnostic_report() -> None:
     print("ECAC DIAGNOSTIC RUN")
     print("=" * 64)
     print(f"1. Unauthorized effects:   {r['unauthorized_effects']}")
-    print(
-        f"2. Legitimate completion:  {r['legitimate_completion']}/{r['legitimate_total']}"
-    )
+    print(f"2. Legitimate completion:  {r['legitimate_completion']}/{r['legitimate_total']}")
     print(f"3. False denials:          {r['false_denials_total']} {r['false_denials']}")
     print(f"4. UNKNOWN outcomes:       {r['unknown_outcomes']}")
     ap = r["approvals"]
@@ -637,12 +695,34 @@ def print_diagnostic_report() -> None:
     for component in tb:
         print(f"   - {component}")
     print("=" * 64)
-    print(f"Context: attacks={r['attacks']} blocked={r['attacks_blocked']} "
-          f"missed={r['false_negatives']}")
+    print(
+        f"Context: attacks={r['attacks']} blocked={r['attacks_blocked']} "
+        f"missed={r['false_negatives']}"
+    )
 
 
-if __name__ == "__main__":
-    print_diagnostic_report()
+def main(argv: list[str] | None = None) -> int:
+    """Entry point: the regression report, or `--diagnostic` for the seven metrics.
+
+    Previously this module had two `if __name__ == "__main__"` blocks, so the
+    first one won and `print_report()` was unreachable from the command line —
+    `python -m effect_broker.metrics` silently printed the diagnostic table
+    instead of the regression metrics the module is named for.
+    """
+    import sys
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] in {"-h", "--help"}:
+        print("usage: python -m effect_broker.metrics [--diagnostic]")
+        return 0
+    if args and args[0] == "--diagnostic":
+        print_diagnostic_report()
+        return 0
+    if args:
+        print(f"unknown argument: {args[0]}", file=sys.stderr)
+        return 2
+    print_report()
+    return 0
 
 
 def print_report() -> None:
@@ -665,7 +745,9 @@ def print_report() -> None:
         f"{r['latency_p95_ms']:.2f} / {r['latency_p99_ms']:.2f} ms"
     )
     print(f"Annotations:          {r['annotations']} explicit grants across scenarios")
-    print(f"TCB size:             {r['tcb_lines']} lines (broker.py + model.py)")
+    breakdown = tcb_breakdown()
+    detail = ", ".join(f"{name}={n}" for name, n in breakdown.items())
+    print(f"TCB size:             {r['tcb_lines']} executable lines ({detail})")
     st = r.get("session_taint", {})
     if st:
         print("Session-taint (honest:")
@@ -685,4 +767,4 @@ def print_report() -> None:
 
 
 if __name__ == "__main__":
-    print_report()
+    raise SystemExit(main())

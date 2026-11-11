@@ -38,6 +38,18 @@ from typing import Any
 from effect_broker.metrics import build_report
 
 # Metrics where LOWER is better. Everything else is "lower is worse".
+#
+# `tcb_lines` is deliberately NOT here. It is the size of the trusted core, a
+# reviewed figure with a known target, not a quantity to minimise: it grows when
+# a fix is added and shrinks when logic is deleted, and either can be correct.
+# Listing it as lower-is-better made every legitimate fix fail this gate — a
+# fix that adds a check is "a regression" and one that removes a module is an
+# improvement, which is the wrong incentive to encode in CI.
+#
+# It is still diffed and still reported; it just does not decide the exit code.
+# A real change in TCB size should be argued in review, not gated on a number.
+_ADVISORY = frozenset({"tcb_lines"})
+
 _LOWER_IS_BETTER = frozenset(
     {
         "false_negatives",
@@ -46,7 +58,6 @@ _LOWER_IS_BETTER = frozenset(
         "latency_p50_ms",
         "latency_p95_ms",
         "latency_p99_ms",
-        "tcb_lines",
         "annotations",
     }
 )
@@ -88,10 +99,12 @@ def _is_regression(key: str, before: float, after: float) -> bool:
     """Decide whether a change is a regression.
 
     Latency is compared with a tolerance: sub-millisecond timing noise on a
-    shared machine must not fail a build. All other metrics must not move in
-    the wrong direction at all.
+    shared machine must not fail a build. Advisory metrics never fail a build.
+    All other metrics must not move in the wrong direction at all.
     """
     if before == after:
+        return False
+    if key in _ADVISORY:
         return False
     if key.endswith("_ms"):
         # 25% plus 0.05 ms of slack for measurement noise.
@@ -153,11 +166,20 @@ def compare(before_path: Path, after_path: Path) -> int:
 
     regressions = [c for c in changed if c[3]]
     for key, b, a, is_reg in changed:
-        marker = "REGRESSION" if is_reg else "ok"
+        if key in _ADVISORY:
+            marker = "advisory"
+        elif is_reg:
+            marker = "REGRESSION"
+        else:
+            marker = "ok"
         arrow = "↑" if a > b else "↓"
         print(f"  [{marker:<10}] {key:<34} {b:>10.4g} {arrow} {a:>10.4g}")
 
     print("=" * 68)
+    if _ADVISORY & {c[0] for c in changed}:
+        print("'advisory' metrics are reported but do not fail the gate:")
+        print("  TCB size moves in both directions on correct changes, so it is")
+        print("  argued in review rather than gated on a number.")
     if regressions:
         print(f"REGRESSIONS DETECTED: {len(regressions)}")
         for key, b, a, _ in regressions:

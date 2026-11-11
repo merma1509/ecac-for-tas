@@ -115,6 +115,86 @@ class TestLatencyTolerance:
         assert metrics_snapshot._is_regression("false_positives", 0, 1) is True
 
 
+class TestTcbIsAdvisory:
+    """TCB size is reported, not gated.
+
+    It was listed as lower-is-better, which made every security fix look like a
+    regression and deleting a module look like an improvement — the opposite of
+    the incentive a CI gate should encode. The size still moves in both
+    directions on correct changes, so it is argued in review.
+    """
+
+    def test_growth_is_not_a_regression(self) -> None:
+        assert metrics_snapshot._is_regression("tcb_lines", 2163, 2400) is False
+
+    def test_shrinkage_is_not_an_improvement_gate(self) -> None:
+        """Deleting trusted code is not automatically good, either."""
+        assert metrics_snapshot._is_regression("tcb_lines", 2400, 2163) is False
+
+    def test_it_still_appears_in_the_diff(
+        self, tmp_path: Path, good_snapshot: dict[str, Any], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Advisory must mean 'reported', not 'silently dropped'."""
+        after = dict(good_snapshot, tcb_lines=3300)
+        assert _compare(tmp_path, good_snapshot, after) == 0
+        out = capsys.readouterr().out
+        assert "tcb_lines" in out
+        assert "advisory" in out
+
+    def test_a_real_regression_still_fails_alongside_it(
+        self, tmp_path: Path, good_snapshot: dict[str, Any]
+    ) -> None:
+        """Advisory TCB must not mask a false positive."""
+        after = dict(good_snapshot, tcb_lines=3300, false_positives=2)
+        assert _compare(tmp_path, good_snapshot, after) == 1
+
+
+class TestModuleEntryPoint:
+    """`python -m effect_broker.metrics` must run the report it is named for."""
+
+    def test_default_runs_the_regression_report(self) -> None:
+        from effect_broker.metrics import main
+
+        assert main([]) == 0
+
+    def test_diagnostic_flag_is_separate(self) -> None:
+        from effect_broker.metrics import main
+
+        assert main(["--diagnostic"]) == 0
+
+    def test_unknown_argument_is_rejected(self) -> None:
+        from effect_broker.metrics import main
+
+        assert main(["--nope"]) == 2
+
+    def test_only_one_main_guard_remains(self) -> None:
+        """Two `if __name__` blocks made print_report() unreachable."""
+        import ast
+
+        source = (
+            Path(__file__).resolve().parent.parent / "effect_broker" / "metrics.py"
+        ).read_text()
+
+        def is_main_guard(node: ast.stmt) -> bool:
+            # Structural comparison: `ast.unparse` normalizes quote style, so
+            # matching the source text would be brittle.
+            return (
+                isinstance(node, ast.If)
+                and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name)
+                and node.test.left.id == "__name__"
+                and len(node.test.comparators) == 1
+                and isinstance(node.test.comparators[0], ast.Constant)
+                and node.test.comparators[0].value == "__main__"
+            )
+
+        guards = [n for n in ast.parse(source).body if is_main_guard(n)]
+        assert len(guards) == 1, (
+            f"found {len(guards)} module-level __main__ guards; the first wins and "
+            f"the rest never run"
+        )
+
+
 class TestFileErrors:
     def test_missing_snapshot_returns_2(
         self, tmp_path: Path, good_snapshot: dict[str, Any]
