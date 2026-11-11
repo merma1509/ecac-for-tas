@@ -356,11 +356,69 @@ _LANDLOCK_WRITE_DIRS: tuple[str, ...] = (
 #: key live there, and a read-confinement that re-opens `~` protects nothing.
 #: `ECAC_LANDLOCK_READ_ROOTS` lets a deployment add its own data roots (colon-
 #: separated), which is how a real workload gets its inputs.
+def _interpreter_roots() -> tuple[str, ...]:
+    """Directories this interpreter needs in order to start and import.
+
+    Hardcoding `/usr` and `/lib` was wrong and CI proved it: on a runner whose
+    Python lives in `/opt/hostedtoolcache`, a confined executor could not read
+    the stdlib and every `import smtplib` failed with EACCES. The read roots
+    must be derived from where *this* interpreter actually is, not guessed.
+
+    Only the top-level parents are returned: `sys.path` entries and the
+    executable's own directory. Re-opening a prefix of the filesystem is the
+    point — what matters is that it is the prefix the interpreter uses.
+    """
+    candidates: list[str] = []
+    exe = sys.executable
+    if exe:
+        candidates.append(os.path.dirname(exe))
+        # `.../bin/python3` -> the prefix, which holds lib/pythonX.Y.
+        candidates.append(os.path.dirname(os.path.dirname(exe)))
+    for entry in sys.path:
+        if entry and os.path.isdir(entry):
+            candidates.append(entry)
+
+    # Deduplicate while keeping order, and drop anything that resolves to `/`:
+    # opening `/` would re-open every home directory through the same rule.
+    seen: set[str] = set()
+    roots: list[str] = []
+    for candidate in candidates:
+        try:
+            resolved = os.path.realpath(candidate)
+        except OSError:
+            continue
+        if resolved in seen or resolved == "/":
+            continue
+        seen.add(resolved)
+        roots.append(resolved)
+    return tuple(roots)
+
+
+#: Read-only roots, re-opened for reading now that READ_FILE is handled.
+#:
+#: Two groups, both deliberate:
+#:   - what an interpreter needs to start at all (stdlib, shared libs, the
+#:     executable itself) — derived from `sys.path`/`sys.executable`, because
+#:     the interpreter is not always under `/usr`;
+#:   - `/dev` for `/dev/null`, `/dev/urandom`.
+#:
+#: Home directories are NOT here. `~/.ssh`, `~/.aws`, `~/.config` and any signing
+#: key live there, and a read-confinement that re-opens `~` protects nothing.
+#: `ECAC_LANDLOCK_READ_ROOTS` lets a deployment add its own data roots (colon-
+#: separated), which is how a real workload gets its inputs.
 _LANDLOCK_READ_DIRS: tuple[str, ...] = tuple(
     os.environ.get("ECAC_LANDLOCK_READ_ROOTS", "").split(":")
 ) if os.environ.get("ECAC_LANDLOCK_READ_ROOTS") else (
-    "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/dev", "/proc", "/sys",
-)
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/bin",
+    "/sbin",
+    "/etc",
+    "/dev",
+    "/proc",
+    "/sys",
+) + _interpreter_roots()
 
 
 def _kernel_landlock_abi() -> int:
