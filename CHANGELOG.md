@@ -79,6 +79,31 @@ whose current `pyproject.toml` version is `0.1.1`.
 - **Unconfined execution can now be refused.** `ECAC_REQUIRE_CONFINEMENT=1`
   makes the executor subprocess raise rather than run with no kernel mechanism,
   instead of degrading silently on hosts (e.g. macOS) that cannot confine.
+- **Landlock confined writes but not reads.** `_landlock_handled_access()`
+  omitted `READ_FILE`, so the kernel left reads unconfined entirely:
+  `~/.ssh/id_rsa`, `~/.aws/credentials` and a signing key under `/tmp` all
+  opened through the real syscall while the status still reported `landlock`.
+  `READ_FILE` is now in the handled mask, with read roots limited to system
+  paths, the working directory and the IPC key directory — `~` is deliberately
+  unreadable. The selftest gained a two-way read probe: a canary under `$HOME`
+  must fail with `EACCES` while a legitimate read still succeeds, and the canary
+  is planted before the ruleset applies since afterwards `$HOME` is unwritable.
+  The read roots are derived from `sys.path`/`sys.executable` rather than
+  hardcoded to `/usr`, because an interpreter under `/opt` (as on the CI runner)
+  could otherwise not import the stdlib.
+- **Approvals were not bound to the request.** `ApprovedRequest.request_hash`
+  was declared but never populated by `grant_approval()` and never checked by
+  the gate, so the only binding that ran was `content_hash` — which covers
+  etype, targets and content but not the sender or acting account. An approval
+  granted for `alice@corp.com` authorized a send as `attacker@evil.com`, and a
+  swapped attachment blob with identical subject and body passed. Both sides now
+  derive the hash from one canonical definition.
+- **Send budget was oversubscribed by concurrent sends.** `send_count` was
+  incremented only after a successful apply and the gate only read it, so five
+  concurrent sends with `max_sends=1` all passed. The gate now reserves a
+  ticket in the same critical section as the nonce; the executor commits it on
+  success or releases it on failure. The reservation is in-process only —
+  concurrent sends across processes are not covered.
 
 ### Added
 
