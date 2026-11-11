@@ -72,6 +72,7 @@ from .model import (
     BROKER,
     USER,
     ApprovedRequest,
+    CanonicalRequest,
     Capability,
     Commit,
     CommitGateResult,
@@ -83,6 +84,7 @@ from .model import (
     SessionTaintMetrics,
     Task,
     TaskId,
+    canonical_request_from_effect,
 )
 from .restricted_store import RestrictedResourceStore as ResourceStore
 from .tool_registry import ToolDeclaration, ToolRegistry
@@ -788,6 +790,21 @@ class EffectBroker:
         """True if the risk model wants human review before commit."""
         return self.assess_risk(effect) >= 0.8
 
+    def _canonical_request_for(self, effect: Effect, *, task_id: TaskId) -> CanonicalRequest:
+        """Build the canonical request an approval must bind.
+
+        Sender and acting account are read from the effect's metadata because
+        that is where the executing shim records them; both are part of the
+        digest, so an approval cannot be reused under a different identity.
+        """
+        sender = effect.metadata.get("sender")
+        acting = effect.metadata.get("acting_account", "")
+        return canonical_request_from_effect(
+            effect,
+            acting_account=acting if isinstance(acting, str) else "",
+            sender=sender if isinstance(sender, str) else None,
+        )
+
     def grant_approval(
         self,
         effect: Effect,
@@ -842,6 +859,8 @@ class EffectBroker:
         authorized_targets = effect.complete_targets()
         all_targets = authorized_targets
 
+        canonical = self._canonical_request_for(effect, task_id=task_id)
+
         approved_req = ApprovedRequest(
             nonce=nonce,
             etype=effect.etype,
@@ -850,6 +869,8 @@ class EffectBroker:
             task_id=task_id,
             granted_by=APPROVER,
             content_hash=effect.compute_content_hash(),  # A1 FIX: bind content hash
+            # Derived from the canonical request, never recomputed field-by-field.
+            request_hash=canonical.request_hash(),
         )
         self._approved_requests: dict[str, ApprovedRequest] = getattr(
             self, "_approved_requests", {}
@@ -1703,6 +1724,14 @@ class EffectBroker:
                             f"content-hash-mismatch(approved={stored.content_hash[:16]}...,"
                             f"got={current_hash[:16] if current_hash else 'N/A'}...)"
                         )
+
+                # Full-request check: covers sender, acting account and every
+                # attachment digest, none of which content_hash sees.
+                if approval_binding_ok and stored.request_hash is not None:
+                    current_request = self._canonical_request_for(effect, task_id=task.task_id)
+                    if current_request.request_hash() != stored.request_hash:
+                        approval_binding_ok = False
+                        approval_binding_msg = "request-hash-mismatch(approved != presented)"
 
             if not approval_binding_ok:
                 allow = False
