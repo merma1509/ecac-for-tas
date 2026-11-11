@@ -314,8 +314,8 @@ class EffectBroker:
         *,
         mode: str = "same-process",
         production_safe: bool = False,
-        executor_socket: str | Path = "/tmp/ecac-executor.sock",
-        store_socket: str | Path = "/tmp/ecac-executor-store.sock",
+        executor_socket: str | Path = "/tmp/ecac-sandbox/ecac-executor.sock",
+        store_socket: str | Path = "/tmp/ecac-sandbox/ecac-executor-store.sock",
     ) -> None:
         """Create an EffectBroker.
 

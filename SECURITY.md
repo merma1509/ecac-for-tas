@@ -16,15 +16,32 @@ requirements, deferred cross-task taint tracking, etc.).
 
 ## What is actually enforced, per platform
 
-| Mechanism                             | Linux 5.13+ (Landlock LSM on)                                        | macOS                     |
-| ------------------------------------- | -------------------------------------------------------------------- | ------------------------- |
-| Kernel path confinement               | yes — Landlock ruleset, writes only under `ECAC_LANDLOCK_WRITE_ROOT` | **none**                  |
-| `restricted-open` (`os.open` wrapper) | yes — Python-level hygiene                                           | Python-level hygiene only |
-| Import blocklist                      | hygiene, not a boundary                                              | hygiene, not a boundary   |
+| Mechanism                             | Linux 5.13+ (Landlock LSM on)                                                        | macOS                     |
+| ------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------- |
+| Kernel path confinement (writes)      | yes — only under `/tmp`, `/var/tmp`, `/dev/shm`                                      | **none**                  |
+| Kernel path confinement (reads)       | yes — `/usr`, `/lib`, `/etc`, `/dev`, `/proc`, `/sys`, cwd, IPC key dir; **not `~`** | **none**                  |
+| `restricted-open` (`os.open` wrapper) | yes — Python-level hygiene                                                           | Python-level hygiene only |
+| Import blocklist                      | hygiene, not a boundary                                                              | hygiene, not a boundary   |
+
+The permitted write set matches the Python-level policy in `executor.py`, so the
+same boundary is enforced twice rather than the two layers disagreeing. Set
+`ECAC_LANDLOCK_WRITE_ROOT` to narrow it to a single directory — when that
+variable is set, it becomes the only writable location.
+
+Reads are handled too (`READ_FILE` is in the ruleset), which is what keeps
+`~/.ssh/id_rsa` and `~/.aws/credentials` out of reach. Two exceptions are
+deliberate and auditable: the working directory, so a workload can read its own
+inputs, and `ECAC_IPC_KEY_DIR`, so the executor can read the HMAC key it verifies
+IPC messages with. `ECAC_LANDLOCK_READ_ROOTS` adds deployment-specific data
+roots. **Anything under a write root is readable by design** — do not keep
+secrets inside the sandbox root.
 
 The confinement status reported by the executor names what is in effect and
-never says `landlock` unless a selftest observed a write outside the sandbox
-root being denied. Set `ECAC_REQUIRE_CONFINEMENT=1` to make the executor refuse
+never says `landlock` unless a selftest observed a write outside the permitted
+directories being denied (`EACCES`) _and_ a write inside them succeeding. Both
+halves are required: a ruleset that denies everything also denies the "outside"
+probe, and a process confined out of its own sandbox is broken, not confined.
+Set `ECAC_REQUIRE_CONFINEMENT=1` to make the executor refuse
 to start where no kernel mechanism exists (CI sets this; local development
 defaults off). On macOS the Python-level layers are a speed bump, not a
 security boundary — treat the platform as unconfined.

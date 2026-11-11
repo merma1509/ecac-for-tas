@@ -260,6 +260,9 @@ def _verify_content_binding(
 # The enforcer module is the canonical source for restricted-open logic.
 
 from effect_broker.enforcer import (
+    _real_os_open,
+)
+from effect_broker.enforcer import (
     _restricted_open as _restricted_open,
 )
 
@@ -277,8 +280,19 @@ _SYS_LANDLOCK_RESTRICT_SELF = 446
 _LANDLOCK_CREATE_RULESET_VERSION = 1 << 0
 _LANDLOCK_RULE_PATH_BENEATH = 1
 
+#: `prctl(PR_SET_NO_NEW_PRIVS, 1)`. Landlock's `restrict_self` fails with EPERM
+#: unless this is set first: without it the call is refused outright, which is
+#: exactly how confinement silently never engaged before. It also stops the
+#: process from gaining privilege through setuid/file capabilities, which is the
+#: posture a confined executor wants regardless.
+_PR_SET_NO_NEW_PRIVS = 38
+
 _LANDLOCK_ACCESS_FS_EXECUTE = 1 << 0
 _LANDLOCK_ACCESS_FS_WRITE_FILE = 1 << 1
+#: Reading. Omitting this bit made every read unconfined: `~/.ssh/id_rsa` and
+#: `~/.aws/credentials` opened fine through the real syscall, which is precisely
+#: what item 2 of the review asks to be protected.
+_LANDLOCK_ACCESS_FS_READ_FILE = 1 << 2
 _LANDLOCK_ACCESS_FS_REMOVE_DIR = 1 << 4
 _LANDLOCK_ACCESS_FS_REMOVE_FILE = 1 << 5
 _LANDLOCK_ACCESS_FS_MAKE_REG = 1 << 8
@@ -292,6 +306,7 @@ _LANDLOCK_ACCESS_BY_ABI: tuple[tuple[int, int], ...] = (
     # (minimum ABI version, flag)
     (1, _LANDLOCK_ACCESS_FS_EXECUTE),
     (1, _LANDLOCK_ACCESS_FS_WRITE_FILE),
+    (1, _LANDLOCK_ACCESS_FS_READ_FILE),
     (1, _LANDLOCK_ACCESS_FS_REMOVE_DIR),
     (1, _LANDLOCK_ACCESS_FS_REMOVE_FILE),
     (1, _LANDLOCK_ACCESS_FS_MAKE_REG),
@@ -308,9 +323,65 @@ def _landlock_handled_access(abi: int) -> int:
     return handled
 
 
-#: The single directory writes are permitted beneath. Deliberately narrow: this
-#: is the executor's own sandbox, not the user's home directory.
+#: Directories writes are permitted beneath, as a kernel-enforced allowlist.
+#:
+#: This must agree with the Python-level policy in executor.py — "writes ONLY to
+#: /tmp, /var/tmp, /dev/shm" — because the two layers are meant to be the same
+#: boundary enforced twice. An earlier version permitted only
+#: `/tmp/ecac-sandbox`, which is where the executor's own files live, and that
+#: made Landlock reject every legitimate effect target under `/tmp`. A sandbox
+#: that refuses the work it exists to guard is not a stricter sandbox; it is a
+#: broken one.
+#:
+#: `ECAC_LANDLOCK_WRITE_ROOT` still narrows it to a single directory when a
+#: deployment wants tighter confinement than the default.
 _LANDLOCK_WRITE_ROOT = os.environ.get("ECAC_LANDLOCK_WRITE_ROOT", "/tmp/ecac-sandbox")
+
+#: The directories the kernel ruleset re-opens for writes. The executor's own
+#: root is included so its IPC socket and temp files remain writable.
+_LANDLOCK_WRITE_DIRS: tuple[str, ...] = (
+    (_LANDLOCK_WRITE_ROOT,)
+    if os.environ.get("ECAC_LANDLOCK_WRITE_ROOT")
+    else ("/tmp", "/var/tmp", "/dev/shm")
+)
+
+#: Read-only roots, re-opened for reading now that READ_FILE is handled.
+#:
+#: Two groups, both deliberate:
+#:   - what an interpreter needs to start at all (stdlib, shared libs, the
+#:     executable itself);
+#:   - `/dev` for `/dev/null`, `/dev/urandom`.
+#:
+#: Home directories are NOT here. `~/.ssh`, `~/.aws`, `~/.config` and any signing
+#: key live there, and a read-confinement that re-opens `~` protects nothing.
+#: `ECAC_LANDLOCK_READ_ROOTS` lets a deployment add its own data roots (colon-
+#: separated), which is how a real workload gets its inputs.
+_LANDLOCK_READ_DIRS: tuple[str, ...] = tuple(
+    os.environ.get("ECAC_LANDLOCK_READ_ROOTS", "").split(":")
+) if os.environ.get("ECAC_LANDLOCK_READ_ROOTS") else (
+    "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/dev", "/proc", "/sys",
+)
+
+
+def _kernel_landlock_abi() -> int:
+    """Return the kernel's Landlock ABI version, or a negative value.
+
+    Separated out so that a caller can distinguish "this kernel has no Landlock"
+    (a host property, nothing to fix in this code) from "this kernel has
+    Landlock and our ruleset did not take" (a defect). CI uses it to refuse to
+    skip: on a Landlock-capable runner, being unconfined is always a failure.
+    """
+    if os.uname().sysname != "Linux":
+        return -1
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    result: int = libc.syscall(
+        _SYS_LANDLOCK_CREATE_RULESET,
+        None,
+        ctypes.c_size_t(0),
+        ctypes.c_uint32(_LANDLOCK_CREATE_RULESET_VERSION),
+    )
+    return result
 
 
 def _apply_landlock_sandbox() -> bool:
@@ -328,19 +399,14 @@ def _apply_landlock_sandbox() -> bool:
     if os.uname().sysname != "Linux":
         return False
 
-    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-    libc.syscall.restype = ctypes.c_long
-
     # Confirm the kernel implements Landlock before asking for a ruleset. On an
     # older kernel this fails cleanly, which is what we want: no silent no-op.
-    abi = libc.syscall(
-        _SYS_LANDLOCK_CREATE_RULESET,
-        None,
-        ctypes.c_size_t(0),
-        ctypes.c_uint32(_LANDLOCK_CREATE_RULESET_VERSION),
-    )
+    abi = _kernel_landlock_abi()
     if abi < 0:
         return False
+
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    libc.syscall.restype = ctypes.c_long
 
     class _RulesetAttr(ctypes.Structure):
         _fields_ = [("handled_access_fs", ctypes.c_uint64)]
@@ -350,6 +416,10 @@ def _apply_landlock_sandbox() -> bool:
             ("allowed_access", ctypes.c_uint64),
             ("parent_fd", ctypes.c_int32),
         ]
+
+    # Place the read probe's canary now: once the ruleset applies, writing to
+    # `~` is denied, so this is the last moment it can exist.
+    _place_read_sentinel()
 
     handled = _landlock_handled_access(abi)
     attr = _RulesetAttr(handled_access_fs=handled)
@@ -364,12 +434,26 @@ def _apply_landlock_sandbox() -> bool:
 
     try:
         # A ruleset with no rules denies every handled access everywhere. That is
-        # the intended default: writes are re-opened only beneath the sandbox root.
-        if os.path.isdir(_LANDLOCK_WRITE_ROOT):
-            # O_PATH is Linux-only (the only place this code runs), but the macOS
-            # type stubs do not export it, hence the guarded lookup.
-            o_path = getattr(os, "O_PATH", 0)
-            root_fd = os.open(_LANDLOCK_WRITE_ROOT, o_path | os.O_CLOEXEC)
+        # the intended default: writes are re-opened only beneath the permitted
+        # directories.
+        #
+        # Each directory must exist BEFORE its rule is added. A missing directory
+        # means no rule for it, and the ruleset then denies writes there — which
+        # is how the executor ended up unable to write its own temp files.
+        o_path = getattr(os, "O_PATH", 0)
+        for write_dir in _LANDLOCK_WRITE_DIRS:
+            try:
+                os.makedirs(write_dir, exist_ok=True)
+            except OSError:
+                continue
+            if not os.path.isdir(write_dir):
+                continue
+            # `_real_os_open` rather than `os.open`: inside the executor, os.open
+            # is replaced by the Python-level allowlist, which would refuse to
+            # open the sandbox root itself and leave the ruleset without its one
+            # permitting rule. More importantly, measuring the kernel mechanism
+            # through a Python wrapper would measure the wrapper.
+            root_fd = _real_os_open(write_dir, o_path | os.O_CLOEXEC)
             try:
                 path_attr = _PathBeneathAttr(
                     allowed_access=handled,
@@ -386,6 +470,57 @@ def _apply_landlock_sandbox() -> bool:
                     return False
             finally:
                 os.close(root_fd)
+
+        # Read-only roots: reading is now handled, so it must be re-opened where
+        # it is legitimate. Read+execute only — never write.
+        #
+        # The working directory is included because that is where a workload's
+        # own input files live; without it the confined executor cannot read the
+        # files it was started to process. It is resolved here, at activation,
+        # not at import, so it reflects where this process actually runs.
+        read_access = _LANDLOCK_ACCESS_FS_READ_FILE | _LANDLOCK_ACCESS_FS_EXECUTE
+        try:
+            cwd_root = os.getcwd()
+        except OSError:
+            cwd_root = ""
+        extra_roots = [cwd_root]
+        # The executor must read the HMAC key it verifies IPC messages with.
+        # That directory holds one file (the secret), so opening it is a narrow
+        # exception -- opening `~` to reach it would defeat the point.
+        ipc_key_dir = os.environ.get("ECAC_IPC_KEY_DIR", "")
+        if ipc_key_dir:
+            extra_roots.append(ipc_key_dir)
+        read_dirs = tuple(_LANDLOCK_READ_DIRS) + tuple(r for r in extra_roots if r)
+        for read_dir in read_dirs:
+            read_dir = read_dir.strip()
+            if not read_dir or not os.path.isdir(read_dir):
+                continue
+            try:
+                root_fd = _real_os_open(read_dir, o_path | os.O_CLOEXEC)
+            except OSError:
+                continue
+            try:
+                path_attr = _PathBeneathAttr(allowed_access=read_access, parent_fd=root_fd)
+                added = libc.syscall(
+                    _SYS_LANDLOCK_ADD_RULE,
+                    ruleset_fd,
+                    _LANDLOCK_RULE_PATH_BENEATH,
+                    ctypes.byref(path_attr),
+                    0,
+                )
+                if added < 0:
+                    # A read root the kernel refuses is not fatal: it only means
+                    # that tree stays unreadable, which fails closed for reads.
+                    continue
+            finally:
+                os.close(root_fd)
+
+        # restrict_self requires PR_SET_NO_NEW_PRIVS first; without it the call
+        # returns EPERM and no restriction is applied. This was the second
+        # defect in this path, and the reason `_landlock_active` was always
+        # False on Linux even once the ruleset arguments were correct.
+        if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+            return False
 
         # restrict_self takes FLAGS, not the ruleset FD — passing the FD here was
         # the original defect, and it made the call meaningless.
@@ -406,35 +541,82 @@ def _apply_landlock_sandbox() -> bool:
 
 
 def _selftest_confinement() -> bool:
-    """Return True only if a write that should be allowed is observably denied.
+    """Return True only if confinement is observably BOTH ways.
 
-    The probe must run somewhere writable *without* confinement, otherwise a
-    failure proves nothing: probing `/etc` returns "denied" on any host where
-    `/etc` is not writable for ordinary permission reasons, and that would be
-    read as evidence of confinement it never had. So the probe looks for a
-    directory the process can normally write to and that lies outside
-    `_LANDLOCK_WRITE_ROOT`, and treats only `EACCES` there as denial.
+    A one-sided probe is not evidence. "A write outside the root was denied" is
+    also true of a ruleset that denies everything — and a ruleset that denies
+    everything is not confinement, it is a broken executor: the process cannot
+    write its own temp files. So the probe requires two observations:
 
-    If no such directory is testable, the answer is False: an untested claim is
-    not a claim.
+      1. a write outside `_LANDLOCK_WRITE_ROOT` is denied (EACCES), AND
+      2. a write inside it is allowed.
+
+    The outside probe must run somewhere writable *without* confinement,
+    otherwise a denial proves nothing: probing `/etc` returns "denied" on any
+    host where `/etc` is not writable for ordinary permission reasons. So it
+    looks for a directory the process can normally write to and that lies
+    outside every permitted directory, and treats only `EACCES` there as denial.
+
+    If either observation cannot be made, the answer is False: an untested claim
+    is not a claim.
+
+    The probes use `_real_os_open`, not `os.open`. Inside the executor, `os.open`
+    is replaced by the Python-level path allowlist, so a probe routed through it
+    would report the allowlist's decision and call it kernel confinement — a
+    denial from Python read as evidence from the kernel. The question here is
+    specifically whether the *kernel* is confining us.
     """
-    write_root = os.path.abspath(_LANDLOCK_WRITE_ROOT)
-    for base in (tempfile.gettempdir(), os.path.expanduser("~")):
+    write_dirs = [os.path.abspath(d) for d in _LANDLOCK_WRITE_DIRS]
+
+    def _is_permitted(path: str) -> bool:
+        return any(path == d or path.startswith(d + os.sep) for d in write_dirs)
+
+    # (2) The permitted side must still work. Checked first: if no permitted
+    # directory is writable, the ruleset is denying more than intended and the
+    # outside denial below would be worthless evidence.
+    writable_inside = False
+    for write_dir in write_dirs:
+        if not os.path.isdir(write_dir):
+            continue
+        inside_probe = os.path.join(write_dir, f".ecac-inside-probe-{os.getpid()}")
+        try:
+            fd = _real_os_open(inside_probe, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600)
+        except OSError:
+            continue  # This one is not writable; another permitted dir may be.
+        os.close(fd)
+        try:
+            os.unlink(inside_probe)
+        except OSError:
+            pass
+        writable_inside = True
+        break
+    if not writable_inside:
+        return False  # Confined out of its own sandbox: not a working sandbox.
+
+    try:
+        tmpdir: str | None = tempfile.gettempdir()
+    except OSError:
+        tmpdir = None
+    try:
+        cwd: str | None = os.getcwd()
+    except OSError:
+        cwd = None
+    for base in (tmpdir, cwd, os.path.expanduser("~")):
         if not base:
             continue
         base_abs = os.path.abspath(base)
-        # Probing inside the write root would be allowed by design, and would
-        # read as "not confined" even when it is.
-        if base_abs == write_root or base_abs.startswith(write_root + os.sep):
+        # Probing inside a permitted directory would be allowed by design, and
+        # would read as "not confined" even when it is.
+        if _is_permitted(base_abs):
             continue
         if not os.access(base_abs, os.W_OK):
             continue
         probe = os.path.join(base_abs, f".ecac-landlock-probe-{os.getpid()}")
         try:
-            fd = os.open(probe, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600)
+            fd = _real_os_open(probe, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600)
         except PermissionError:
             # Denied where we demonstrably could write: that is confinement.
-            return True
+            return _read_probe_passes()
         except OSError:
             # Some other error says nothing about confinement. Try elsewhere.
             continue
@@ -447,8 +629,120 @@ def _selftest_confinement() -> bool:
     return False
 
 
-# Apply Landlock if available (defensive - open restriction is primary)
-_landlock_active = _apply_landlock_sandbox()
+def _read_probe_passes() -> bool:
+    """True only if a legitimate read works AND a home read is denied.
+
+    `READ_FILE` is now handled, so a ruleset that forgot to re-open the read
+    roots would confine the executor into being unusable — and a write-only
+    probe would still call that success. Both directions must be observed:
+
+      1. reading a file under a permitted read root succeeds, and
+      2. reading a file under the home directory is denied.
+
+    The sentinel is created by `_place_read_sentinel()` BEFORE the ruleset is
+    applied, because after it the process can no longer write to `~`. Without a
+    pre-placed file this probe had no credential to try, and returned False —
+    which made every legitimate deployment look unconfined.
+
+    A denial is only counted when the file was readable without confinement;
+    otherwise it could just be ordinary permissions.
+    """
+    # (1) Legitimate read must still work.
+    read_ok = False
+    for read_dir in _LANDLOCK_READ_DIRS:
+        read_dir = read_dir.strip()
+        if not read_dir or not os.path.isdir(read_dir):
+            continue
+        try:
+            names = os.listdir(read_dir)
+        except OSError:
+            continue
+        for name in names[:20]:
+            candidate = os.path.join(read_dir, name)
+            if not os.path.isfile(candidate):
+                continue
+            try:
+                fd = _real_os_open(candidate, os.O_RDONLY | os.O_CLOEXEC)
+            except OSError:
+                continue
+            os.close(fd)
+            read_ok = True
+            break
+        if read_ok:
+            break
+    if not read_ok:
+        return False  # Confined out of reading anything: not a usable executor.
+
+    # (2) The sentinel under home must now be denied.
+    sentinel = _read_sentinel_path()
+    if sentinel is None or not os.path.isfile(sentinel):
+        return False  # Nothing to prove the read boundary against.
+    try:
+        fd = _real_os_open(sentinel, os.O_RDONLY | os.O_CLOEXEC)
+    except PermissionError:
+        return True  # Readable without confinement, denied with it.
+    except OSError:
+        return False
+    os.close(fd)
+    return False  # The home read landed. Not confined.
+
+
+def _read_sentinel_path() -> str | None:
+    """Where the read probe's canary lives, or None if there is no home tree."""
+    home = os.path.expanduser("~")
+    if not home or home in {"/", "~"}:
+        return None
+    return os.path.join(home, ".ecac-read-probe")
+
+
+def _place_read_sentinel() -> None:
+    """Create the read-probe canary. Must run BEFORE the ruleset is applied.
+
+    After confinement the process cannot write to `~`, so a sentinel created
+    later cannot exist. Failure is not fatal: the probe then reports False,
+    which is the honest answer for "the boundary could not be demonstrated".
+    """
+    path = _read_sentinel_path()
+    if path is None:
+        return
+    try:
+        with open(path, "w") as handle:
+            handle.write("read-confinement-probe")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+# Landlock is applied when the executor starts, NOT at import time.
+#
+# It was applied at import, and that confined every process that so much as
+# imported this module — the test runner included, which then could not spawn a
+# subprocess, and any in-process caller inherited a ruleset it never asked for.
+# A sandbox belongs to the process that is meant to be sandboxed, so the
+# restriction is now activated explicitly by `_activate_confinement()` from the
+# executor entrypoint.
+_landlock_active: bool = False
+
+
+def _activate_confinement() -> bool:
+    """Confine this process and make it able to write its own temp files.
+
+    Returns True only if `_apply_landlock_sandbox()` observed the restriction
+    taking effect. Idempotent: calling it twice does not stack rulesets.
+    """
+    global _landlock_active
+    if _landlock_active:
+        return True
+    if not _apply_landlock_sandbox():
+        return False
+    # Everything under the root is the only place this process can write, so
+    # anything that reaches for a temp dir must land inside it. Without this,
+    # `tempfile` cannot find a usable directory and raises — the executor would
+    # be confined into being non-functional, which is not a sandbox.
+    os.environ["TMPDIR"] = _LANDLOCK_WRITE_ROOT
+    tempfile.tempdir = _LANDLOCK_WRITE_ROOT
+    _landlock_active = True
+    return True
 
 
 class ConfinementUnavailable(RuntimeError):
@@ -750,6 +1044,18 @@ class ExecutorServer:
                 pass
 
     def run(self) -> None:
+        # The sandbox root must exist before confinement is applied: it is the
+        # only writable location afterwards, and the IPC socket lives inside it.
+        try:
+            os.makedirs(_LANDLOCK_WRITE_ROOT, exist_ok=True)
+        except OSError:
+            pass
+
+        # Confine first: the restriction applies to the whole process, so it has
+        # to be in place before anything else in here touches the filesystem,
+        # and certainly before an effect is applied.
+        _activate_confinement()
+
         # Refuse to start unconfined when confinement is required. Checked here,
         # before any effect can be applied, so "required but absent" can never be
         # discovered late.
@@ -1379,7 +1685,16 @@ class ExecutorProcessHandle:
 
         # Pass cwd + PYTHONPATH so the subprocess resolves modules correctly
         # regardless of how the parent was launched (direct python / uv run / pytest).
+        #
+        # ECAC_IPC_KEY_DIR pins the signing-key directory explicitly. Both sides
+        # must resolve the same file; if they each call `Path.home()` in a
+        # context where it differs, they generate different keys and every
+        # signed request is rejected as forged.
         env = {**os.environ, "PYTHONPATH": str(ecac_root)}
+        if "ECAC_IPC_KEY_DIR" not in env:
+            from effect_broker.executor_ipc import _ipc_key_dir
+
+            env["ECAC_IPC_KEY_DIR"] = str(_ipc_key_dir())
         self._proc = _subprocess.Popen(
             [
                 _sys.executable,
@@ -1432,13 +1747,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Isolated executor subprocess for ECAC.")
     parser.add_argument(
         "--socket",
-        default="/tmp/ecac-executor.sock",
-        help="Unix socket path (default: /tmp/ecac-executor.sock)",
+        default=f"{_LANDLOCK_WRITE_ROOT}/ecac-executor.sock",
+        help="Unix socket path (default: inside the sandbox root)",
     )
     parser.add_argument(
         "--store-socket",
-        default="/tmp/ecac-executor-store.sock",
-        help="Unix socket for observer store reads (default: /tmp/ecac-executor-store.sock)",
+        default=f"{_LANDLOCK_WRITE_ROOT}/ecac-executor-store.sock",
+        help="Unix socket for observer store reads (default: inside the sandbox root)",
     )
     args = parser.parse_args()
 
@@ -1452,39 +1767,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-# ---- Subprocess Confinement Summary ----
-# MULTI-LAYER DEFENSE (in order of application):
-#
-# Layer 1: Import blocking (builtins.__import__ hook) — FIRST
-#   - Blocks subprocess, threading, network modules at Python import time
-#   - Applied BEFORE any other imports
-#   - Prevents loading dangerous code that could break out of sandbox
-#
-# Layer 2: Content hash verification (gate↔execute coupling fix)
-#   - Subprocess verifies hash(content_from_metadata) == approved_content_hash
-#   - Prevents writing content_B when broker authorized content_A
-#   - Both values are HMAC-signed in the same IPC payload
-#
-# Layer 3: Filesystem confinement (restricted-open wrapper)
-#   - Write operations only in broker-configured allowed paths
-#   - Read operations in allowed paths + system directories + /dev
-#   - Blocked paths: /etc, /bin, /usr, /var, /root, /.ssh, /.config
-#   - Applied to os.open() at import time
-#
-# Layer 4: Landlock (Linux 5.13+)
-#   - Kernel-enforced filesystem restrictions
-#   - Best-effort (may fail silently on older kernels / macOS)
-#
-# WHAT IS PROTECTED:
-#   ✓ Content hash verification: executed content matches authorized content
-#   ✓ Import blocking: dangerous modules cannot be loaded
-#   ✓ Filesystem sandboxing: writes restricted to sandbox directories
-#   ✓ Kernel-level enforcement: Landlock restricts at OS level (Linux)
-#   ✓ Audit trail: all operations logged with pid/timestamp
-#
-# REMAINING LIMITATIONS:
-#   - Python stdlib not fully blocked (only dangerous modules)
-#   - seccomp BPF is future work (not currently needed)
-#   - For stronger guarantees: AppArmor/SELinux profiles, Wasm, or gVisor

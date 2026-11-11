@@ -103,7 +103,9 @@ Or via `dev.sh`:
 
 - **What is kernel-enforced, per platform.** On Linux 5.13+ with the Landlock LSM enabled, the
   executor subprocess applies a Landlock ruleset and _keeps_ the claim only if a selftest
-  observes a write outside `ECAC_LANDLOCK_WRITE_ROOT` being denied (`EACCES`). On macOS there is
+  observes a write outside the permitted directories (`/tmp`, `/var/tmp`, `/dev/shm`, or
+  `ECAC_LANDLOCK_WRITE_ROOT` when set) being denied (`EACCES`) **and** a write inside them
+  succeeding — a ruleset that denies everything would otherwise read as success. On macOS there is
   **no kernel confinement**: the Python-level restricted-open wrapper and import blocklist are
   hygiene, not a security boundary. `_get_confinement_status()` names what is actually in effect,
   and `ECAC_REQUIRE_CONFINEMENT=1` makes the executor refuse to start where no kernel mechanism
