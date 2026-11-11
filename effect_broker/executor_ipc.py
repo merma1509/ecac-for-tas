@@ -29,6 +29,7 @@ The executor process deserializes, applies, returns observed_targets as a frozen
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -116,18 +117,38 @@ def dict_to_label_exception(d: dict[str, Any]) -> Any:
     )
 
 
+def _json_safe(value: Any) -> Any:
+    """Coerce a metadata value into something `json.dumps` can encode.
+
+    Metadata is assembled by shims and by tools, so it can hold sets, tuples or
+    bytes. `_sign_payload` json-dumps the whole payload: an unencodable value
+    raises there — after the gate has already authorized, aborting the commit
+    with a `TypeError` that looks like a crash rather than a denial. Normalizing
+    at serialization turns that into a deterministic wire format instead.
+    """
+    if isinstance(value, frozenset | set | tuple | list):
+        if isinstance(value, frozenset | set):
+            return [_json_safe(item) for item in sorted(value, key=repr)]
+        return [_json_safe(item) for item in value]
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    return value
+
+
 def effect_to_dict(effect: Any) -> dict[str, Any]:
     """Serialize an Effect to a plain dict for IPC."""
-    import base64
+    metadata = {k: _json_safe(v) for k, v in dict(effect.metadata).items()}
 
-    # Handle metadata with bytes content - convert to base64 for JSON safety
-    metadata = dict(effect.metadata)
-    if "content" in metadata and isinstance(metadata["content"], bytes):
-        metadata["content_b64"] = base64.b64encode(metadata["content"]).decode()
-        del metadata["content"]
-    elif "content" not in metadata and "content_b64" not in metadata:
-        # Ensure metadata is JSON-safe
-        pass  # Already handled
+    # Raw bytes travel as `content_b64`, which is the field the subprocess's
+    # hash check looks for. Encoding them in place as a base64 *string* in
+    # `content` would make the two sides hash different types and never agree
+    # (B3), so the rename is load-bearing, not cosmetic.
+    raw_content = effect.metadata.get("content")
+    if isinstance(raw_content, bytes):
+        metadata["content_b64"] = base64.b64encode(raw_content).decode()
+        metadata.pop("content", None)
 
     return {
         "etype": effect.etype,
