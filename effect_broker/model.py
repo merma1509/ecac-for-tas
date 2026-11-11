@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -264,6 +265,14 @@ class Session:
     _send_count: int = field(default=0, repr=False)
     _max_sends_per_session: int = field(default=0, repr=False)  # 0 = unlimited
 
+    # In-flight send tickets (ticket_id -> nonce). A ticket counts against the
+    # budget, so concurrent sends cannot all pass `count < max` before any
+    # commit lands (P6-3).
+    _send_tickets: dict[str, str] = field(default_factory=dict, repr=False)
+    _send_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+
     # Trusted provenance chain for integrity verification.
     # Maps provenance_id → ProvenanceEntry (data + scope_hash + content_hash).
     # Only Data whose provenance_id AND scope_hash AND name (and content hash
@@ -399,10 +408,46 @@ class Session:
         return True, ""
 
     def can_send(self) -> bool:
-        """Check if session can send more (without incrementing)."""
+        """True if a send could be admitted right now (check only)."""
         if self._max_sends_per_session <= 0:
             return True
-        return self._send_count < self._max_sends_per_session
+        with self._send_lock:
+            return self._sends_in_use() < self._max_sends_per_session
+
+    def _sends_in_use(self) -> int:
+        """Committed sends + outstanding tickets. Caller must hold the lock."""
+        return self._send_count + len(self._send_tickets)
+
+    @staticmethod
+    def send_ticket_id(task_id: str, nonce: str | None) -> str:
+        """The ticket id for a send. One definition, used by gate and executor."""
+        return f"{task_id}:{nonce}"
+
+    def reserve_send(self, ticket_id: str, nonce: str) -> tuple[bool, str]:
+        """Atomically reserve one send slot. Returns (ok, reason)."""
+        if self._max_sends_per_session <= 0:
+            with self._send_lock:
+                self._send_tickets[ticket_id] = nonce
+            return True, ""
+        with self._send_lock:
+            if self._sends_in_use() >= self._max_sends_per_session:
+                return False, (
+                    f"send-rate-limit(max={self._max_sends_per_session}, "
+                    f"count={self._send_count}, in_flight={len(self._send_tickets)})"
+                )
+            self._send_tickets[ticket_id] = nonce
+            return True, ""
+
+    def commit_send(self, ticket_id: str) -> None:
+        """Consume a reservation: ticket becomes a committed send."""
+        with self._send_lock:
+            self._send_tickets.pop(ticket_id, None)
+            self._send_count += 1
+
+    def release_send(self, ticket_id: str) -> None:
+        """Drop a reservation without consuming budget (failed send)."""
+        with self._send_lock:
+            self._send_tickets.pop(ticket_id, None)
 
     @property
     def send_count(self) -> int:

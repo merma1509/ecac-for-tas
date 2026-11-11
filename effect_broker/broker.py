@@ -1672,6 +1672,21 @@ class EffectBroker:
             "Fresh": fresh_result,
         }
         allow = all(predicate_result[0] for predicate_result in predicate_results.values())
+
+        # Reserve a send slot atomically, so the budget cannot be oversubscribed
+        # by concurrent sends that all pass `can_send()` before any commits are made.
+        # Reserved only when the rest of the gate passed, and released on any
+        # later failure so a blocked send does not consume budget.
+        send_ticket: str | None = None
+        if allow and effect.etype == "send" and task.session is not None:
+            ticket_id = task.session.send_ticket_id(task.task_id, effect.capability_nonce)
+            if reserve_nonce:
+                reserved, reason = task.session.reserve_send(ticket_id, effect.capability_nonce)
+                if not reserved:
+                    predicate_results["NoAmp"] = (False, reason)
+                    allow = False
+                else:
+                    send_ticket = ticket_id
         predicate_order = ("Auth", "FlowOK", "NoAmp", "Fresh")
         blocking_predicate: str | None = next(
             (predicate for predicate in predicate_order if not predicate_results[predicate][0]),
@@ -1773,6 +1788,8 @@ class EffectBroker:
         # even though the effect was correctly blocked).
         if not allow and nonce_reserved:
             self._release_fresh_reservation(effect, task)
+        if not allow and send_ticket is not None and task.session is not None:
+            task.session.release_send(send_ticket)
 
         return CommitGateResult(
             allow=allow,
