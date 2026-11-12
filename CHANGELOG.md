@@ -38,6 +38,12 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ### Added
 
+- **Mediation is reported as three states in the diagnostic run.**
+  `diagnostic_report()["mediation"]` is `{evaluated, complete, failures, note}`,
+  so `evaluated=false` is distinguishable from `false`: when the ledger check
+  cannot run, `complete` is `None` and the text form prints `NOT EVALUATED`
+  rather than a bare `False`, which would send a reader looking for a hole that
+  was never searched for.
 - **Diagnostic run** `scripts/diagnostic_run.py` and
   `metrics.diagnostic_report()` emit all seven metrics: unauthorized effects,
   legitimate completion, false denials by predicate, UNKNOWN outcomes,
@@ -54,6 +60,24 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ### Fixed
 
+- **`/etc` was confined as a subtree, so `/etc/shadow` was readable.** Landlock
+  grants a subtree, so listing `/etc` as a read root also granted `shadow`,
+  `gshadow` and `sudoers`. Measured in a container with ABI 4, a confined
+  process read `/etc/shadow` while `_get_confinement_status()` reported
+  `restricted-open` — the status string advertised a confinement layer, and the
+  one file a reader would ask about was readable through it. `/etc` is no longer
+  a root; `_LANDLOCK_READ_FILES` grants the individual files that are needed
+  (`hosts`, `resolv.conf`, `passwd`, the CA bundle, …). A file missing from that
+  list is unreadable, which fails closed.
+- **`ECAC_REQUIRE_CONFINEMENT` was documented as "on in CI" but no CI step set
+  it.** Every confinement test therefore ran unconfined and the suite was green
+  either way — the failure mode the flag exists to prevent, committed in the act
+  of documenting it. The `Test` step now sets it.
+- **Two tests reported defects that were preconditions.** The
+  read-only-location test fails under uid 0, which ignores directory mode bits,
+  and the git-tracking tests crashed where the `git` binary is absent. The first
+  now skips under root; the second uses a shared `git_tracks` fixture that skips
+  when git is unavailable and still fails an untracked file.
 - **Ambiguous request binding.** `CanonicalRequest`
   (`effect_broker/model.py`) binds the full request — operation, acting
   account, sender, complete recipients, attachment digests — and hashes it
