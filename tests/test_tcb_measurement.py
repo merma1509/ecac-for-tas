@@ -1,84 +1,157 @@
 """What the TCB metric measures, and what it must include.
 
 `tcb_lines` is a claim about the size of the code the security argument rests
-on. Two defects made it measure something else, both in the direction that
-flatters the number:
+on, so it is quoted. Three defects made it measure something else, each in the
+direction that flatters the number:
 
-1. **The file set was wrong.** `_TCB_FILES` held `broker.py` and `model.py`
-   while `docs/ARCHITECTURE.md` §2 defined the TCB as four files. `executor.py`
-   — described in that document as the sole mutation path, i.e. exactly the code
-   an attacker must defeat — was not counted, nor was `restricted_store.py`.
-   The figure read ~45% low.
+1. **The file set was wrong.** The list held `broker.py` and `model.py` while
+   this repository's architecture named four modules. `executor.py` — the sole
+   mutation path, i.e. exactly the code an attacker must defeat — was not
+   counted, nor was `restricted_store.py`. The figure read ~45% low.
 
 2. **Docstrings counted as code.** `_count_code_lines` dropped comments and
-   blank lines but not docstrings, so prose inside string literals was counted
-   as logic: 1238 of the 3401 lines it summed were docstrings. This is the same
-   error the comment filter was added to fix, in the form that survived it.
+   blank lines but not docstrings, so prose inside string literals counted as
+   logic: 1238 of the 3401 lines it summed. The same error the comment filter
+   was added to fix, in the form that survived it.
 
-Neither is visible from the number itself, which is why both are pinned here
-rather than left to review.
+3. **The definition lived where CI cannot see it.** It sat only in
+   `docs/ARCHITECTURE.md`, and `docs/` is not tracked by git, so the consistency
+   test skipped in CI and the drift in (1) was invisible in the only place that
+   runs on every change. The canonical list is now `effect_broker/tcb.py`.
+
+None of this is visible from the number itself, which is why it is pinned here.
 """
 
 from __future__ import annotations
 
-import re
+import ast
+import subprocess
 from pathlib import Path
 
-import pytest
-
-from effect_broker.metrics import _TCB_FILES, _count_code_lines, tcb_size
+from effect_broker.metrics import _TCB_FILES, _count_code_lines, tcb_breakdown, tcb_size
+from effect_broker.tcb import TCB_FILES, TCB_MODULES, assert_complete
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _architecture_tcb_files() -> set[str]:
-    """The TCB files named in `docs/ARCHITECTURE.md` §2.
-
-    Read from the document rather than restated here: a test that hard-codes
-    the same list as the code cannot notice the two drifting apart, which is
-    the failure being pinned.
-    """
-    doc = _REPO_ROOT / "docs" / "ARCHITECTURE.md"
-    if not doc.exists():
-        pytest.skip("docs/ARCHITECTURE.md is not present in this checkout")
-
-    section = doc.read_text().split("### Components in TCB", 1)
-    assert len(section) == 2, "ARCHITECTURE.md no longer has a 'Components in TCB' section"
-    table = section[1].split("### Components NOT in TCB", 1)[0]
-
-    # Rows look like: | `broker.py` — 4-predicate gate | 455 | ... |
-    return {f"effect_broker/{name}" for name in re.findall(r"\|\s*`([a-z_]+\.py)`", table)}
+def _imports(rel_path: str) -> set[str]:
+    """Module names imported by a source file, as written in the source."""
+    tree = ast.parse((_REPO_ROOT / rel_path).read_text())
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            names.add(node.module)
+    return names
 
 
-class TestFileSet:
-    def test_matches_the_documented_tcb(self) -> None:
-        """The metric must count the TCB the architecture names, no more, no less."""
-        documented = _architecture_tcb_files()
-        assert documented, "could not parse any TCB files out of ARCHITECTURE.md"
-        assert set(_TCB_FILES) == documented, (
-            "the measured TCB and the documented TCB disagree:\n"
-            f"  measured but not documented: {sorted(set(_TCB_FILES) - documented)}\n"
-            f"  documented but not measured: {sorted(documented - set(_TCB_FILES))}"
+class TestTheDefinitionIsTracked:
+    def test_the_registry_is_tracked_by_git(self) -> None:
+        """`docs/` is ignored, so a definition living only there is not in CI.
+
+        This is the defect that let the file set drift unobserved: the test that
+        compared the metric against the document skipped, and green meant
+        nothing.
+        """
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "effect_broker/tcb.py"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
         )
+        assert result.returncode == 0, (
+            "effect_broker/tcb.py is not tracked by git, so CI cannot see the TCB "
+            f"definition. git said: {result.stderr.strip()}"
+        )
+
+    def test_the_file_set_comes_from_the_registry(self) -> None:
+        """`metrics._TCB_FILES` must not be a second, independently edited copy."""
+        assert _TCB_FILES == TCB_FILES
+
+    def test_the_registry_asserts_itself(self) -> None:
+        """A listed module that disappears must fail loudly, not shrink the count."""
+        assert_complete()
+
+
+class TestComposition:
+    """What is in the TCB, and why — as executable claims, not comments."""
 
     def test_executor_is_counted(self) -> None:
         """`executor.py` is the sole mutation path — it cannot be out of scope."""
-        assert "effect_broker/executor.py" in _TCB_FILES, (
+        assert "effect_broker/executor.py" in TCB_FILES, (
             "the only path that mutates external state is not in the measured TCB"
         )
 
-    def test_shims_and_tests_are_not_counted(self) -> None:
-        """Shims are untrusted by design; counting them would inflate the TCB."""
-        for untrusted in ("effect_broker/shim_email.py", "effect_broker/tests.py"):
-            assert untrusted not in _TCB_FILES
+    def test_the_security_relevant_modules_are_all_included(self) -> None:
+        """Guard against the *next* module: anything the gate decides with belongs.
+
+        The concrete form of "a defect here can swap accept and reject". If a
+        module is added and the gate calls into it, a reviewer must decide
+        explicitly whether it joins the TCB.
+        """
+        expected_minimum = {
+            "effect_broker/broker.py",
+            "effect_broker/model.py",
+            "effect_broker/executor.py",
+        }
+        assert expected_minimum <= set(TCB_FILES), (
+            f"missing from the TCB: {sorted(expected_minimum - set(TCB_FILES))}"
+        )
+
+    def test_observation_and_advice_are_excluded(self) -> None:
+        """`ledger.py` records and `mediation.py` advises; neither decides.
+
+        Counting them would inflate the TCB with code the allow/deny argument
+        does not rest on.
+        """
+        for excluded, reason in (
+            ("effect_broker/ledger.py", "audit observer"),
+            ("effect_broker/mediation.py", "advisory boundary check"),
+        ):
+            assert excluded not in TCB_FILES, f"{excluded} ({reason}) must stay out"
+
+    def test_shims_baselines_and_tests_are_excluded(self) -> None:
+        """Comparators exist to be scored, not trusted."""
+        for untrusted in (
+            "effect_broker/shim_email.py",
+            "tests/test_tcb_measurement.py",
+        ):
+            assert untrusted not in TCB_FILES
+
+    def test_every_module_has_a_stated_role(self) -> None:
+        """A file with no role is a file nobody argued for."""
+        assert len(TCB_MODULES) == len(TCB_FILES)
+        for path, role in TCB_MODULES:
+            assert role.strip(), f"{path} is in the TCB with no stated role"
 
     def test_every_listed_file_exists(self) -> None:
         """A renamed module would otherwise be skipped silently by tcb_size()."""
-        for rel in _TCB_FILES:
+        for rel in TCB_FILES:
             assert (_REPO_ROOT / rel).exists(), (
-                f"{rel} is listed in _TCB_FILES but does not exist; tcb_size() "
-                f"skips missing paths, so the metric would undercount"
+                f"{rel} is listed but does not exist; the line count skips missing "
+                f"paths, so the metric would undercount without failing"
             )
+
+
+class TestInterdependency:
+    """The TCB must not quietly reach into untrusted code for a decision.
+
+    A gate that consults a shim or the evaluation harness for its verdict is not
+    gated by the listed code, however the line count reads.
+    """
+
+    def test_the_gate_does_not_import_untrusted_modules(self) -> None:
+        untrusted = {
+            "effect_broker.shim_email",
+            "effect_broker.shim_real",
+            "effect_broker.baselines",
+            "effect_broker.metrics",
+            "effect_broker.traces",
+        }
+        for rel in TCB_FILES:
+            leaked = _imports(rel) & untrusted
+            assert not leaked, f"{rel} imports untrusted {sorted(leaked)} for its decision"
 
 
 class TestCountedLines:
@@ -114,7 +187,7 @@ class TestCountedLines:
         assert _count_code_lines(text) == 1
 
     def test_an_empty_docstring_counts_its_line(self) -> None:
-        """`""" """` parses as a literal spanning one line — exclude that line."""
+        """An empty docstring parses as a literal spanning one line — exclude it."""
         text = '""""""\nx = 1\n'
         assert _count_code_lines(text) == 1
 
@@ -128,7 +201,7 @@ class TestTheMetricItself:
         """Docstrings were 36% of the reported figure; prose must not dominate."""
         code = tcb_size()
         naive = 0
-        for rel in _TCB_FILES:
+        for rel in TCB_FILES:
             path = _REPO_ROOT / rel
             if not path.exists():
                 continue
@@ -144,10 +217,16 @@ class TestTheMetricItself:
             f"filter stopped working or the code has become mostly prose"
         )
 
-    def test_the_tcb_is_not_understated(self) -> None:
-        """Sanity floor: sum the files directly and compare."""
-        direct = sum(_count_code_lines((_REPO_ROOT / rel).read_text()) for rel in _TCB_FILES)
-        assert tcb_size() == direct
+    def test_the_total_is_the_sum_of_the_parts(self) -> None:
+        """The breakdown must reconcile with the reported figure."""
+        breakdown = tcb_breakdown()
+        assert set(breakdown) == {Path(rel).name for rel in TCB_FILES}
+        assert sum(breakdown.values()) == tcb_size()
+
+    def test_every_module_contributes_code(self) -> None:
+        """A zero means the file was skipped, not that it is empty."""
+        for name, count in tcb_breakdown().items():
+            assert count > 0, f"{name} contributes 0 lines — was it skipped?"
 
     def test_the_tcb_is_not_a_token_number(self) -> None:
         assert tcb_size() > 1000, f"implausibly small trusted core: {tcb_size()}"

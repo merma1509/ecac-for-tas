@@ -39,20 +39,24 @@ from effect_broker.model import (
     EffectTarget,
     Task,
 )
+from effect_broker.tcb import TCB_FILES, assert_complete
 from effect_broker.traces import build
+
+# A TCB that silently undercounts is worse than no figure, because it is quoted.
+assert_complete()
 
 if TYPE_CHECKING:
     from effect_broker.broker import EffectBroker
 
 # The trusted core: the code whose correctness the security argument rests on.
 # (Excludes shims, tests, baselines, and the evaluation harness.)
-
-_TCB_FILES = (
-    "effect_broker/broker.py",
-    "effect_broker/model.py",
-    "effect_broker/executor.py",
-    "effect_broker/restricted_store.py",
-)
+#
+# The list itself lives in `effect_broker/tcb.py`, which is tracked source.
+# It previously sat here as a literal holding only `broker.py` and `model.py`
+# while the architecture document named four files, so `executor.py` — the sole
+# mutation path — went uncounted and the figure read ~45% low. Keeping the
+# definition somewhere git tracks is what makes that drift observable in CI.
+_TCB_FILES = TCB_FILES
 
 
 class EvaluationReport(TypedDict, total=False):

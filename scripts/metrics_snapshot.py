@@ -22,9 +22,13 @@ USAGE
 
 EXIT CODES
 ──────────
-    0  metrics equal, or only improvements
-    1  a regression was detected (defense rate down, false positives up)
+    0  no regression: correctness metrics equal or improved
+    1  a regression was detected (defense rate down, false positives or
+       false negatives up, annotation burden up)
     2  snapshots are from different scenario sets -- comparison is invalid
+
+Advisory metrics (TCB size, latency) are printed in every diff but never
+decide the exit code; see _ADVISORY for why.
 """
 
 from __future__ import annotations
@@ -37,27 +41,30 @@ from typing import Any
 
 from effect_broker.metrics import build_report
 
-# Metrics where LOWER is better. Everything else is "lower is worse".
+# Metrics that are REPORTED but never fail the gate.
 #
-# `tcb_lines` is deliberately NOT here. It is the size of the trusted core, a
-# reviewed figure with a known target, not a quantity to minimise: it grows when
-# a fix is added and shrinks when logic is deleted, and either can be correct.
-# Listing it as lower-is-better made every legitimate fix fail this gate — a
-# fix that adds a check is "a regression" and one that removes a module is an
-# improvement, which is the wrong incentive to encode in CI.
+# `tcb_lines` — the size of the trusted core. It is a reviewed figure with a
+#   known target, not a quantity to minimise: it grows when a fix is added and
+#   shrinks when logic is deleted, and either can be correct. Listed as
+#   lower-is-better it made every legitimate fix fail this gate — a fix that
+#   adds a check was "a regression" and one that deletes a module was an
+#   improvement, which is the wrong incentive to encode in CI.
 #
-# It is still diffed and still reported; it just does not decide the exit code.
-# A real change in TCB size should be argued in review, not gated on a number.
-_ADVISORY = frozenset({"tcb_lines"})
+# `*_ms` — latency. The scenario set has 6 entries, so p95 and p99 ARE the
+#   sample maximum, not percentiles: they move with a single scheduler hiccup.
+#   Measured here, the same code re-snapshotted 8 times gave p99 between
+#   0.0342 and 0.0948 ms (2.8x) and the gate failed 1 run in 8 on noise alone.
+#   A gate that fires on noise is worse than no gate: it teaches people to
+#   re-run rather than to look. Latency is still printed; the correctness
+#   metrics below are what decide.
+_ADVISORY = frozenset({"tcb_lines", "latency_p50_ms", "latency_p95_ms", "latency_p99_ms"})
 
+# Metrics where LOWER is better. Everything else is "lower is worse".
 _LOWER_IS_BETTER = frozenset(
     {
         "false_negatives",
         "false_positives",
         "false_positive_rate",
-        "latency_p50_ms",
-        "latency_p95_ms",
-        "latency_p99_ms",
         "annotations",
     }
 )
@@ -98,18 +105,15 @@ def snapshot() -> dict[str, Any]:
 def _is_regression(key: str, before: float, after: float) -> bool:
     """Decide whether a change is a regression.
 
-    Latency is compared with a tolerance: sub-millisecond timing noise on a
-    shared machine must not fail a build. Advisory metrics never fail a build.
-    All other metrics must not move in the wrong direction at all.
+    Advisory metrics never fail a build; see `_ADVISORY` for why latency and
+    TCB size are in it. Every remaining metric must not move in the wrong
+    direction at all — these are counts of security outcomes, not timings, so a
+    tolerance would only hide a real failure.
     """
     if before == after:
         return False
     if key in _ADVISORY:
         return False
-    if key.endswith("_ms"):
-        # 25% plus 0.05 ms of slack for measurement noise.
-        tolerance = max(before * 0.25, 0.05)
-        return (after - before) > tolerance
     if key in _LOWER_IS_BETTER:
         return after > before
     return after < before
@@ -178,8 +182,9 @@ def compare(before_path: Path, after_path: Path) -> int:
     print("=" * 68)
     if _ADVISORY & {c[0] for c in changed}:
         print("'advisory' metrics are reported but do not fail the gate:")
-        print("  TCB size moves in both directions on correct changes, so it is")
-        print("  argued in review rather than gated on a number.")
+        print("  TCB size moves both ways on correct changes, and with 6")
+        print("  scenarios p95/p99 ARE the sample maximum — one scheduler")
+        print("  hiccup moves them 2.8x. Both are argued in review instead.")
     if regressions:
         print(f"REGRESSIONS DETECTED: {len(regressions)}")
         for key, b, a, _ in regressions:

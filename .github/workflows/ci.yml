@@ -110,3 +110,22 @@ jobs:
       # ---- sealed evaluation gates (shared with the release pipeline) ----
       - name: Sealed evaluation (held-out + baseline + experiment)
         run: ./scripts/verify_eval.sh
+
+      # ---- regression tripwire on the metrics snapshot ----
+      # `tests/data/metrics_baseline.json` is the recorded reference; this diffs
+      # a live run against it. The script exits 1 on a correctness regression
+      # (defense rate down, false positives/negatives up, annotation burden up)
+      # and 2 if the scenario set changed, which makes the diff meaningless.
+      #
+      # TCB size and latency are printed but advisory — they move on correct
+      # changes and on noise, so they are argued in review rather than gated.
+      # See _ADVISORY in scripts/metrics_snapshot.py.
+      #
+      # The baseline lives under tests/data/ because docs/ is gitignored in this
+      # repository, and a reference file a fresh checkout cannot see would turn
+      # this gate into a no-op.
+      - name: Metrics regression gate
+        run: |
+          uv run python scripts/metrics_snapshot.py --out "${{ runner.temp }}/metrics.json"
+          uv run python scripts/metrics_snapshot.py --compare \
+            tests/data/metrics_baseline.json "${{ runner.temp }}/metrics.json"

@@ -103,16 +103,39 @@ class TestScenarioSetGuard:
         assert _compare(tmp_path, good_snapshot, after) == 2
 
 
-class TestLatencyTolerance:
-    def test_small_latency_noise_is_ignored(self) -> None:
-        """Sub-millisecond jitter on a shared machine must not fail a build."""
+class TestLatencyIsAdvisory:
+    """Latency is reported, not gated.
+
+    With 6 scenarios, `p95` and `p99` ARE the sample maximum: one scheduler
+    hiccup moves them. Measured here, 8 re-snapshots of unchanged code gave p99
+    between 0.0342 and 0.0948 ms (2.8x) and the old tolerance failed 1 run in 8
+    on noise. A gate that fires on noise teaches people to re-run instead of to
+    look, which is worse than no gate.
+    """
+
+    def test_a_large_jump_does_not_fail_the_gate(self) -> None:
+        assert metrics_snapshot._is_regression("latency_p95_ms", 0.04, 0.40) is False
+
+    def test_small_noise_does_not_fail_the_gate(self) -> None:
         assert metrics_snapshot._is_regression("latency_p95_ms", 0.04, 0.05) is False
 
-    def test_large_latency_jump_is_flagged(self) -> None:
-        assert metrics_snapshot._is_regression("latency_p95_ms", 0.04, 0.40) is True
+    def test_every_latency_field_is_advisory(self) -> None:
+        for key in ("latency_p50_ms", "latency_p95_ms", "latency_p99_ms"):
+            assert key in metrics_snapshot._ADVISORY
 
-    def test_non_latency_metrics_have_no_tolerance(self) -> None:
+    def test_it_is_still_printed(
+        self, tmp_path: Path, good_snapshot: dict[str, Any], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        after = dict(good_snapshot, latency_p95_ms=0.99)
+        assert _compare(tmp_path, good_snapshot, after) == 0
+        out = capsys.readouterr().out
+        assert "latency_p95_ms" in out, "advisory must mean reported, not dropped"
+
+    def test_correctness_metrics_have_no_tolerance(self) -> None:
+        """Counts of security outcomes are not timings; a tolerance would hide a
+        real failure."""
         assert metrics_snapshot._is_regression("false_positives", 0, 1) is True
+        assert metrics_snapshot._is_regression("false_negatives", 0, 1) is True
 
 
 class TestTcbIsAdvisory:
@@ -218,3 +241,55 @@ class TestFlatten:
         """Strings and lists are metadata, not metrics — they must not diff."""
         flat = metrics_snapshot._flatten({"label": "x", "items": [1, 2], "n": 5})
         assert flat == {"n": 5}
+
+
+class TestTheBaselineIsUsableInCI:
+    """A reference file a fresh checkout cannot see turns the gate into a no-op.
+
+    The baseline was first placed in `docs/`, which this repository gitignores.
+    CI would then have found no baseline, and the step would have failed on a
+    missing file rather than on a regression — or worse, been "fixed" by making
+    it optional. These tests pin the file to a tracked path.
+    """
+
+    BASELINE = Path(__file__).resolve().parent / "data" / "metrics_baseline.json"
+
+    def test_the_baseline_exists(self) -> None:
+        assert self.BASELINE.exists(), f"{self.BASELINE} is missing"
+
+    def test_the_baseline_is_tracked_by_git(self) -> None:
+        import subprocess
+
+        rel = self.BASELINE.relative_to(Path(__file__).resolve().parent.parent)
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", str(rel)],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"{rel} is not tracked by git, so a CI checkout would not have it and "
+            f"the regression gate could not run. git said: {result.stderr.strip()}"
+        )
+
+    def test_the_baseline_is_a_complete_snapshot(self) -> None:
+        data = json.loads(self.BASELINE.read_text())
+        for key in ("total", "attacks", "legitimate", "defense_rate", "tcb_lines"):
+            assert key in data, f"baseline is missing {key!r}; the diff would skip it"
+
+    def test_the_baseline_matches_the_current_scenario_set(self) -> None:
+        """If the labeled set changes, the baseline must be re-recorded, not left
+        to fail the next run with a confusing exit 2."""
+        import metrics_snapshot as snap
+
+        current = snap.snapshot()
+        data = json.loads(self.BASELINE.read_text())
+        for key in snap._IDENTITY_KEYS:
+            assert data.get(key) == current.get(key), (
+                f"baseline and current differ on {key!r}: {data.get(key)!r} vs "
+                f"{current.get(key)!r}. Re-record with --out."
+            )
+
+    def test_the_committed_baseline_passes_against_itself(self) -> None:
+        """The gate must be green on unchanged code, or nobody will read it."""
+        assert metrics_snapshot.compare(self.BASELINE, self.BASELINE) == 0
