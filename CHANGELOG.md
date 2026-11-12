@@ -57,6 +57,24 @@ whose current `pyproject.toml` version is `0.1.1`.
   repeated send is two, and an effect landing outside its window is flagged.
 - **Concurrent-ticket coverage in the multiprocess path (P6-3).** Ten threads
   racing one nonce through subprocess `APPLY_COMMIT` yield exactly one commit.
+- **The oracle can read a real MTA log.** `oracle.smtp_log` has always carried
+  the comment "in a real deployment this is the MTA's mail log, read
+  out-of-band", but nothing read one: every caller filled the list in by hand
+  from the handler it had just written, which makes the independent observer a
+  listener to the sender's own account of itself. `mta_log.read_postfix_log()`
+  and `IndependentOracle.from_mta_log()` read the MTA's accounting instead, and
+  `hidden_recipients()` names recipients the broker never declared.
+  `tests/data/postfix-maillog.txt` was captured from a real Postfix 3.7.11
+  instance (`scripts/capture_mta_log.sh`) and holds one honest send and one
+  carrying an undeclared BCC. Not a trust boundary — a process that can write
+  the log can forge it — but the observations no longer come from the code being
+  observed.
+- **`oracle.reconcile_unknowns()` settles a crash-torn write from outside the
+  writer.** A write that lands and then loses its process stays UNKNOWN for the
+  ledger's whole life, because nothing in the write path returns to fill the gap.
+  The oracle checks the filesystem and records evidence attributed to
+  `oracle.reconcile`, leaving `authorized_not_observed` and absent or non-file
+  targets untouched.
 
 ### Fixed
 
@@ -73,6 +91,21 @@ whose current `pyproject.toml` version is `0.1.1`.
   it.** Every confinement test therefore ran unconfined and the suite was green
   either way — the failure mode the flag exists to prevent, committed in the act
   of documenting it. The `Test` step now sets it.
+- **Outcome counting contradicted the verdict about the same effect.**
+  `outcome_of()` classified an `executor.apply` observation as `committed`,
+  while `verify()` called the same effect `committed_without_evidence` and
+  returned UNKNOWN. `executor.apply` is recorded _before_ a real write reaches
+  the filesystem — a process killed in between leaves an observation for a write
+  that never happened — so the aggregate metrics reported as committed what the
+  audit path reported as unknown, and the metrics are the half people read.
+  `outcome_of()` now defers to `verify()`. Pinned by
+  `test_outcome_counts.py::test_outcome_of_never_disagrees_with_verify`.
+- **`target_for()` resolved an effect to its parent directory.**
+  `authorized_targets` records both a written file and its parent, so picking
+  `sorted(...)[0]` chose the directory — which always exists, so a check against
+  it "succeeded" and settled the effect against a path nobody authorized.
+  Ambiguity now returns `None` and the caller reports it. Found by
+  `test_oracle_reconcile.py::TestWhatItMustNotTouch`.
 - **Two tests reported defects that were preconditions.** The
   read-only-location test fails under uid 0, which ignores directory mode bits,
   and the git-tracking tests crashed where the `git` binary is absent. The first
