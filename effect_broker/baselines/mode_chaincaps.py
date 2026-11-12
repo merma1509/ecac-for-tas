@@ -84,33 +84,47 @@ class ChainCapsBroker:
         self.capabilities[nonce] = cap
 
     def commit_effect(self, effect: Effect, task_id: str = "default") -> tuple[bool, dict]:
-        """
-        ChainCaps-style commit: check capability + verify transformation chain.
+        """Deny when the capability's scope does not cover the effect's target.
 
-        VULNERABILITY DEMONSTRATION (T6: delegation widening):
-        - EXPAND transformation allows scope widening to wildcard "*"
-        - No monotonicity check on scope narrowing
-        - No session taint propagation
-        - No content hash binding
-        - Replay detection is WEAK (nonce not checked before use)
+        ChainCaps' mechanism is: a capability carries a transformation chain,
+        and the chain determines the authority the holder actually has. This
+        implementation enforces the capability scope — it just does so the way
+        ChainCaps does, which is the point of the comparison:
+
+        - **EXPAND widens to `*` and is honored.** A capability that took the
+          EXPAND transform covers every target. This is the real, documented
+          ChainCaps weakness (T11), not a bug: it is why the chain is recorded.
+        - **No session taint:** T1 passes.
+        - **No content binding:** T2, T15 pass.
+        - **No recipient completeness:** T3 passes.
+        - **Replay is checked, but only per-process and after the fact:** T4
+          and T9 pass when the trace reuses a nonce the broker never saw.
         """
         cap = self.capabilities.get(effect.capability_nonce)
 
         if cap is None:
-            return True, {  # Allow anyway - no strict capability check
+            # No capability: ChainCaps does not deny — it has no policy for an
+            # unknown holder. Kept as a documented difference from ECAC.
+            return True, {
                 "blocker": None,
                 "reason": "ChainCaps: no cap, allow by default",
                 "policy": "ChainCaps",
             }
 
-        # Check transformation chain for EXPAND (scope widening)
-        if Transformation.EXPAND.value in cap.transformations:
-            # VULNERABILITY: EXPAND allows ANY target!
-            # This is T6: delegation widening attack
-            pass
+        # Scope check: the capability must cover this target. EXPAND already
+        # rewrote the scope to {"*"}, so this is where the widening shows up.
+        covered = any(effect.target.startswith(scope) or scope == "*" for scope in cap.scope)
+        right_ok = cap.right in (effect.etype, "*")
 
-        # WEAK replay check - nonce not blocked after use
-        # T4: replay passes because nonce not in used set
+        if not (covered and right_ok):
+            return False, {
+                "blocker": "Auth",
+                "reason": (
+                    f"ChainCaps: cap scope {sorted(cap.scope)} does not cover "
+                    f"{effect.target} for right {cap.right}"
+                ),
+                "policy": "ChainCaps",
+            }
 
         return True, {
             "blocker": None,

@@ -6,6 +6,8 @@ and report delta changes between audit runs.
 
 from __future__ import annotations
 
+from conftest import commit_evidence
+
 from effect_broker.ledger import (
     AuditSnapshot,
     IndependentEffectLedger,
@@ -32,6 +34,7 @@ class TestPeriodicAuditor:
         ledger = IndependentEffectLedger()
         ledger.record_authorization("task", "cap1", frozenset({"target"}))
         ledger.record_observation("task", "cap1", frozenset({"target"}))
+        ledger.record_evidence("task", "cap1", commit_evidence("cap1", {"target"}))
 
         auditor = PeriodicAuditor(ledger)
         result = auditor.audit()
@@ -81,6 +84,7 @@ class TestPeriodicAuditor:
         ledger.record_authorization("task1", "cap1", frozenset({"target1"}))
         ledger.record_authorization("task2", "cap2", frozenset({"target2"}))
         ledger.record_observation("task1", "cap1", frozenset({"target1"}))
+        ledger.record_evidence("task1", "cap1", commit_evidence("cap1", {"target1"}))
         # task2: cap2 authorized but not observed
 
         auditor = PeriodicAuditor(ledger)

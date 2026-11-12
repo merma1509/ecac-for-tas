@@ -22,11 +22,13 @@ THREE ORTHOGONAL TRUST CONCEPTS (do not conflate):
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from .lattice import Confidentiality, Integrity
 
@@ -263,6 +265,14 @@ class Session:
     _send_count: int = field(default=0, repr=False)
     _max_sends_per_session: int = field(default=0, repr=False)  # 0 = unlimited
 
+    # In-flight send tickets (ticket_id -> nonce). A ticket counts against the
+    # budget, so concurrent sends cannot all pass `count < max` before any
+    # commit lands (P6-3).
+    _send_tickets: dict[str, str] = field(default_factory=dict, repr=False)
+    _send_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+
     # Trusted provenance chain for integrity verification.
     # Maps provenance_id → ProvenanceEntry (data + scope_hash + content_hash).
     # Only Data whose provenance_id AND scope_hash AND name (and content hash
@@ -346,6 +356,29 @@ class Session:
         self._tainted_resources.clear()
         self._taint_reason = ""
 
+    def restore_taint(self, records: dict[str, tuple[str, str | None]]) -> None:
+        """Restore per-resource taint from a serialized snapshot (IPC).
+
+        `records` maps resource → (reason, cleared_by). Unlike calling
+        `taint_for_send()` per resource, this preserves the `cleared_by` marker:
+        a resource that was legitimately declassified before serialization stays
+        declassified after deserialization.
+
+        Restoring through `taint_for_send()` alone re-creates every resource as
+        ACTIVE, which silently turns a granted declass into a false denial once
+        the session crosses into the executor subprocess
+
+        This is the public counterpart to `session_state_to_dict()`; it exists so
+        the codec never has to mutate `_tainted_resources` directly.
+        """
+        for resource, (reason, cleared_by) in records.items():
+            self.taint_for_send(resource=resource, reason=reason)
+            record = self._tainted_resources.get(resource)
+            if record is not None:
+                record.cleared_by = cleared_by
+        # Recompute the legacy derived reason from the restored records.
+        self._taint_reason = ""
+
     @property
     def taint_reason(self) -> str:
         """First active (uncleared) taint reason, or "" if none. For evidence."""
@@ -375,10 +408,46 @@ class Session:
         return True, ""
 
     def can_send(self) -> bool:
-        """Check if session can send more (without incrementing)."""
+        """True if a send could be admitted right now (check only)."""
         if self._max_sends_per_session <= 0:
             return True
-        return self._send_count < self._max_sends_per_session
+        with self._send_lock:
+            return self._sends_in_use() < self._max_sends_per_session
+
+    def _sends_in_use(self) -> int:
+        """Committed sends + outstanding tickets. Caller must hold the lock."""
+        return self._send_count + len(self._send_tickets)
+
+    @staticmethod
+    def send_ticket_id(task_id: str, nonce: str | None) -> str:
+        """The ticket id for a send. One definition, used by gate and executor."""
+        return f"{task_id}:{nonce}"
+
+    def reserve_send(self, ticket_id: str, nonce: str) -> tuple[bool, str]:
+        """Atomically reserve one send slot. Returns (ok, reason)."""
+        if self._max_sends_per_session <= 0:
+            with self._send_lock:
+                self._send_tickets[ticket_id] = nonce
+            return True, ""
+        with self._send_lock:
+            if self._sends_in_use() >= self._max_sends_per_session:
+                return False, (
+                    f"send-rate-limit(max={self._max_sends_per_session}, "
+                    f"count={self._send_count}, in_flight={len(self._send_tickets)})"
+                )
+            self._send_tickets[ticket_id] = nonce
+            return True, ""
+
+    def commit_send(self, ticket_id: str) -> None:
+        """Consume a reservation: ticket becomes a committed send."""
+        with self._send_lock:
+            self._send_tickets.pop(ticket_id, None)
+            self._send_count += 1
+
+    def release_send(self, ticket_id: str) -> None:
+        """Drop a reservation without consuming budget (failed send)."""
+        with self._send_lock:
+            self._send_tickets.pop(ticket_id, None)
 
     @property
     def send_count(self) -> int:
@@ -441,15 +510,33 @@ class Session:
     def is_trusted_provenance(self, datum: Data) -> bool:
         """True if `datum` is the unmodified output of a committed read.
 
-        verifies ID AND scope AND (content hash where stored).
-        A datum is trusted only if:
+        A datum is trusted only if ALL of the following hold:
           - its provenance_id exists in the registry, AND
           - its scope_hash matches the capability scope that issued it
             (prevents cross-capability reuse of a leaked provenance_id), AND
           - its name matches the committed read output, AND
+          - its CONFIDENTIALITY and INTEGRITY labels match the recorded ones
+            (labels are part of the datum's identity, not decoration — see
+            below), AND
           - if the entry recorded a content hash, the datum content matches it.
-        Data without a provenance_id, or with a wrong scope/name/content, is
-        UNTRUSTED (a forge cannot mint a valid scope_hash).
+
+        LABELS ARE PART OF IDENTITY:
+          A valid provenance_id must not permit changing the associated labels.
+          Without the label comparison, a tool could read a PUBLIC/UNTRUSTED
+          file, keep the legitimate provenance_id, and re-declare the result
+          CONFIDENTIAL/HIGH — defeating Myers-Liskov (claiming more secrecy
+          than held) and Biba (claiming more integrity than held) at once.
+
+          This is safe for legitimate labelling because confidentiality is
+          derived from trusted OS state in one place (statx.derive_provenance:
+          statx bits -> permission bits -> keyword -> deny-most) and its
+          integrity is always USER for OS-derived content. The label recorded
+          at read-commit time is therefore authoritative; a caller that wants
+          a different label must obtain a new committed read under a different
+          capability — not edit the field.
+
+        Data without a provenance_id, or with a wrong scope/name/label/content,
+        is UNTRUSTED (a forge cannot mint a valid scope_hash).
         """
         if datum.provenance_id is None or datum.scope_hash is None:
             return False
@@ -460,9 +547,50 @@ class Session:
             return False
         if entry.data.name != datum.name:
             return False
+        # Labels must match the recorded datum exactly. Comparing with != (not
+        # <) is deliberate: ANY divergence — up or down — breaks the binding.
+        if entry.data.confidentiality != datum.confidentiality:
+            return False
+        if entry.data.integrity != datum.integrity:
+            return False
         if entry.content_hash is not None:
             return compute_content_hash(datum.content) == entry.content_hash
         return True
+
+    def provenance_mismatch_reason(self, datum: Data) -> str:
+        """Explain WHY `datum` is not trusted provenance (for evidence strings).
+
+        Returns "trusted" when the datum is valid. Otherwise a precise reason
+        naming the diverging field with both the recorded and the claimed
+        value, so an operator can distinguish a forged label from a stale
+        provenance_id. Used by verify_effect_provenance() to keep evidence
+        actionable instead of the previous generic message.
+        """
+        if datum.provenance_id is None:
+            return "missing-provenance-id"
+        if datum.scope_hash is None:
+            return "missing-scope-hash"
+        entry = self._read_provenance.get(datum.provenance_id)
+        if entry is None:
+            return f"unknown-provenance-id({datum.provenance_id})"
+        if entry.scope_hash != datum.scope_hash:
+            return f"scope-mismatch(recorded={entry.scope_hash},claimed={datum.scope_hash})"
+        if entry.data.name != datum.name:
+            return f"name-mismatch(recorded={entry.data.name},claimed={datum.name})"
+        if entry.data.confidentiality != datum.confidentiality:
+            return (
+                f"confidentiality-relabelled(recorded={entry.data.confidentiality.name},"
+                f"claimed={datum.confidentiality.name})"
+            )
+        if entry.data.integrity != datum.integrity:
+            return (
+                f"integrity-relabelled(recorded={entry.data.integrity.name},"
+                f"claimed={datum.integrity.name})"
+            )
+        if entry.content_hash is not None:
+            if compute_content_hash(datum.content) != entry.content_hash:
+                return "content-mismatch"
+        return "trusted"
 
     def verify_effect_provenance(self, effect: Effect) -> tuple[bool, str]:
         """Verify high-integrity data comes from trusted, in-scope broker reads.
@@ -487,9 +615,11 @@ class Session:
                     f"datum={datum.name}, "
                     f"integrity={datum.integrity.name}, "
                     f"prov_id={datum.provenance_id!r}, "
-                    f"scope={datum.scope_hash!r}): "
+                    f"scope={datum.scope_hash!r}, "
+                    f"reason={self.provenance_mismatch_reason(datum)}): "
                     f"HIGH+ integrity requires broker-monitored origin whose "
-                    f"provenance_id, scope_hash and name all match a committed read."
+                    f"provenance_id, scope_hash, name and labels all match a "
+                    f"committed read."
                 )
         return True, "trusted"
 
@@ -615,6 +745,174 @@ class EffectTarget:
 
 
 @dataclass(frozen=True)
+class CanonicalRequest:
+    """The request as approved, in a form two processes can agree on byte-for-byte.
+
+    Two defects made the previous binding ambiguous:
+
+    - **separator ambiguity.** The send hash was computed over
+      `f"{subject}|{body}"`. `subject='a|b', body='c'` and `subject='a',
+      body='b|c'` produced the same hash, so one approved message could stand
+      in for another. `canonical_bytes()` length-prefixes every field, so no
+      field content can impersonate a field boundary.
+    - **two hash implementations.** `model.py` decoded attachment bytes
+      with `errors="replace"` before hashing; the subprocess hashed the raw
+      bytes. For any non-UTF-8 attachment the two sides could never agree.
+      There is now one hashing helper, `sha256_raw()`, and both sides call it.
+
+    The hash is over `canonical_bytes()`, not over the dataclass: pickling and
+    re-pickling across the IPC boundary must not change the digest, and field
+    ordering must not depend on declaration order.
+    """
+
+    version: int
+    operation: str  # "send" | "write" | "read" | "delete" | "network"
+    task_id: str
+    acting_account: str  # whose authority is exercised (mailbox being operated on)
+    sender: str | None  # envelope MAIL FROM, for send
+    recipients: tuple[str, ...]  # sorted, complete: primary + CC + BCC
+    target: str
+    resource_digests: tuple[tuple[str, str], ...]  # (name, sha256hex), sorted by name
+    attachments: tuple[tuple[str, str], ...]  # (name, sha256hex), sorted by name
+
+    def canonical_bytes(self) -> bytes:
+        """Length-prefixed, version-tagged, deterministic serialization.
+
+        Every field is `len(field).to_bytes(8, "big") + field`, so field content
+        cannot shift the parse. No delimiters anywhere: a delimiter is what made
+        `subject|body` ambiguous (B2).
+        """
+        parts: list[bytes] = [_canonical_version_bytes(self.version)]
+
+        for field_bytes in (
+            self.operation.encode("utf-8"),
+            self.task_id.encode("utf-8"),
+            (self.acting_account or "").encode("utf-8"),
+            (self.sender or "").encode("utf-8"),
+        ):
+            parts.append(_len_prefixed(field_bytes))
+
+        # Recipients: sorted, each length-prefixed, then the count prefixed too
+        # so ("a",) and ("a", "b") cannot alias.
+        parts.append(_len_prefixed(len(self.recipients).to_bytes(8, "big")))
+        for r in sorted(self.recipients):
+            parts.append(_len_prefixed(r.encode("utf-8")))
+
+        parts.append(_len_prefixed(self.target.encode("utf-8")))
+
+        for table in (self.resource_digests, self.attachments):
+            parts.append(_len_prefixed(len(table).to_bytes(8, "big")))
+            for name, digest in sorted(table):
+                parts.append(_len_prefixed(name.encode("utf-8")))
+                parts.append(_len_prefixed(digest.encode("utf-8")))
+
+        return b"".join(parts)
+
+    def request_hash(self) -> str:
+        """SHA256 over `canonical_bytes()` — the value an approval binds."""
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    def digest(self, name: str) -> str | None:
+        """The digest recorded for a named resource (e.g. `"body"`), else None."""
+        for resource_name, d in self.resource_digests:
+            if resource_name == name:
+                return d
+        return None
+
+
+def _len_prefixed(field: bytes) -> bytes:
+    """Encode one field as its 8-byte big-endian length followed by the bytes."""
+    return len(field).to_bytes(8, "big") + field
+
+
+def _canonical_version_bytes(version: int) -> bytes:
+    """The version field: 8-byte big-endian, length-prefixed like every other field."""
+    return _len_prefixed(version.to_bytes(8, "big"))
+
+
+#: The canonical request version this code emits. Bump on any change to the
+#: serialization; the field is in the digest precisely so old approvals cannot
+#: be silently re-read under new rules.
+CANONICAL_REQUEST_VERSION = 1
+
+
+def sha256_raw(data: bytes) -> str:
+    """The one hashing helper. Both processes must call THIS, not a mirrored copy.
+
+    model.py` used to decode bytes with `errors="replace"` before
+    hashing while the subprocess hashed raw bytes, so any non-UTF-8 attachment
+    produced digests that could never match across the IPC boundary.
+    """
+    return hashlib.sha256(data).hexdigest()
+
+
+def canonical_request_from_effect(
+    effect: Effect,
+    *,
+    acting_account: str = "",
+    sender: str | None = None,
+) -> CanonicalRequest:
+    """Build the canonical request for an effect, hashing raw bytes.
+
+    `acting_account` must come from the caller that knows whose credentials are
+    in play (the shim session); it is not on the effect. `sender` likewise —
+    for a send it is the envelope MAIL FROM, and an approval for one sender
+    must not stand in for another (P5-9).
+    """
+    recipients: list[str] = []
+    resource_digests: list[tuple[str, str]] = []
+    attachments: list[tuple[str, str]] = []
+
+    if effect.etype == "send":
+        recipients = sorted(effect.complete_targets())
+        subject = effect.metadata.get("subject", "")
+        body = effect.metadata.get("body", "")
+        if isinstance(subject, str) and isinstance(body, str):
+            # Hash subject and body as separate length-prefixed entries rather
+            # than one concatenated string (B2).
+            resource_digests.append(("subject", sha256_raw(subject.encode("utf-8"))))
+            resource_digests.append(("body", sha256_raw(body.encode("utf-8"))))
+        raw_body = effect.metadata.get("body_raw")
+        if isinstance(raw_body, bytes):
+            # The bytes that will actually go on the wire, hashed as bytes.
+            resource_digests.append(("body_raw", sha256_raw(raw_body)))
+
+    elif effect.etype == "write":
+        content = effect.metadata.get("content")
+        if content is None:
+            content_b64 = effect.metadata.get("content_b64", "")
+            if isinstance(content_b64, str) and content_b64:
+                content = base64.b64decode(content_b64)
+        if isinstance(content, bytes):
+            resource_digests.append(("content", sha256_raw(content)))
+        elif isinstance(content, str) and content:
+            resource_digests.append(("content", sha256_raw(content.encode("utf-8"))))
+
+    raw_attachments = effect.metadata.get("attachments")
+    if isinstance(raw_attachments, list):
+        for attachment in raw_attachments:
+            if not isinstance(attachment, dict):
+                continue
+            att_name = attachment.get("name", "")
+            att_bytes = attachment.get("bytes")
+            if isinstance(att_bytes, bytes):
+                # Raw bytes, hashed once here — never decoded with errors=replace.
+                attachments.append((str(att_name), sha256_raw(att_bytes)))
+
+    return CanonicalRequest(
+        version=CANONICAL_REQUEST_VERSION,
+        operation=effect.etype,
+        task_id=effect.task_id or "default",
+        acting_account=acting_account,
+        sender=sender,
+        recipients=tuple(recipients),
+        target=effect.target,
+        resource_digests=tuple(sorted(resource_digests)),
+        attachments=tuple(sorted(attachments)),
+    )
+
+
+@dataclass(frozen=True)
 class ApprovedRequest:
     """An immutable authorization binding: exact (etype, targets, task_id, content_hash).
 
@@ -651,6 +949,11 @@ class ApprovedRequest:
     # Content hash for immutable binding. Prevents content modification after approval.
     # None for effects without content (read, delete, etc.)
     content_hash: str | None = None
+    # SHA256 over CanonicalRequest.canonical_bytes() Binds the
+    # full request — operation, acting account, sender, complete recipients,
+    # attachment digests — not just the content. None on approvals created
+    # before the canonical request existed (see content_hash migration note).
+    request_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -682,6 +985,19 @@ class Data:
         3. FlowOK checks: does broker._read_provenance contain this ID?
            YES → Data is from broker-mediated read → TRUSTED
            NO  → Data is from untrusted source → UNTRUSTED
+
+    TRANSFORMATIONS:
+      Which operations preserve a datum's provenance (and hence its labels) is
+      defined as a machine-readable table, not prose:
+      `effect_broker.provenance_transforms.PROVENANCE_TRANSFORMS`.
+
+      The rule: a transformation preserves provenance iff its output is a
+      deterministic function of its inputs AND every output byte is
+      attributable to an input byte. Summarise/translate/model-generate BREAK
+      provenance (their output is new content and must be labelled UNTRUSTED);
+      slicing/hashing/encryption preserve it; concatenation preserves it but
+      requires the lattice JOIN across all inputs (confidentiality MAX,
+      integrity MIN), never the primary input's labels.
     """
 
     name: str
@@ -873,20 +1189,16 @@ class Effect:
         Content is derived from metadata fields: body, subject, content.
         Returns None for effects without content (read, delete, etc.).
         """
-        # For send effects, hash the body + subject
+        # For send effects, hash the body: it is the content on the wire.
+        # Subject is bound separately in CanonicalRequest (B2: no concatenation).
         if self.etype == "send":
             body = self.metadata.get("body", "")
-            subject = self.metadata.get("subject", "")
-            if isinstance(body, str) and isinstance(subject, str):
-                # Combine body and subject for a single content hash
-                combined = f"{subject}|{body}"
-                return compute_content_hash(combined)
+            if isinstance(body, str):
+                return sha256_raw(body.encode("utf-8"))
 
         # For write effects, hash the content being written
         if self.etype == "write":
             # Handle both direct content (bytes/str) and base64-encoded content
-            import base64
-
             content_raw = self.metadata.get("content", "")
             if content_raw is None or content_raw == "":
                 # Also check for base64 encoded content (from IPC-safe shim)
@@ -894,9 +1206,10 @@ class Effect:
                 if isinstance(content_b64, str) and content_b64:
                     content_raw = base64.b64decode(content_b64)
             if isinstance(content_raw, bytes):
-                content_raw = content_raw.decode("utf-8", errors="replace")
+                # Hash raw bytes; do not decode with errors="replace" (B3).
+                return sha256_raw(content_raw)
             if isinstance(content_raw, str) and content_raw:
-                return compute_content_hash(content_raw)
+                return sha256_raw(content_raw.encode("utf-8"))
 
         # For read/delete effects, there's no mutable content to bind
         return None
@@ -937,3 +1250,186 @@ class Commit:
     # the SAME hash. This closes the gate↔execute coupling gap in same-process
     # mode (IPC mode already had this via executor_subprocess._verify_content_binding).
     authorized_content_hash: str | None = None
+    # True when the ResourceStore IS the external state for this effect rather
+    # than a mirror of it, so the store's own log entry is the measurement of
+    # what actually landed.
+    #
+    # Default True: a plain `broker.commit()` and the simulated FileShim
+    # (shim.py, whose `_do_write`/`_do_send` are documented NO-OPs) both mutate
+    # only the store, so the executor's observation of that mutation is the
+    # best evidence available.
+    #
+    # The REAL shims must set this False. For them the store only records that a
+    # file was written while the bytes land later, in shim_real.write(), after
+    # commit() returns. Letting the executor record evidence there would put
+    # "evidence" in the journal *before* the `dispatched` marker of the I/O it
+    # claims to prove, and evidence_for() would prefer that weaker claim over
+    # the shim's own transport measurement.
+    store_is_external_state: bool = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Effect lifecycle: evidence-based outcome recording
+# ─────────────────────────────────────────────────────────────────────────────
+# Replaces the implicit two-step (gate -> apply) with a recorded state machine.
+# The security property: COMMITTED may be recorded ONLY from evidence produced
+# by the executor that performed the protected operation -- never from the
+# gate's own decision. Before this, a transport failure after ALLOW left the
+# ledger with auth > 0 and obs = 0, which is UNKNOWN, yet the code reported it
+# as a security event and never distinguished "committed" from "attempted".
+
+
+class EffectState(Enum):
+    """Where an effect is in its lifecycle.
+
+    PREPARED ──gate──> AUTHORIZED ──dispatch──> IN_FLIGHT ──evidence──> COMMITTED
+       │                    │                        │
+       └──blocked──> DENIED └──expired──> ABANDONED  └──ambiguous──> UNKNOWN
+
+    Only COMMITTED, DENIED, ABANDONED and UNKNOWN are terminal. IN_FLIGHT is
+    persisted BEFORE the syscall/network call, so a crash between the I/O and
+    the bookkeeping yields UNKNOWN -- never a silent COMMITTED.
+    """
+
+    PREPARED = "prepared"
+    AUTHORIZED = "authorized"
+    IN_FLIGHT = "in_flight"
+    COMMITTED = "committed"
+    DENIED = "denied"
+    ABANDONED = "abandoned"
+    UNKNOWN = "unknown"
+
+    @property
+    def is_terminal(self) -> bool:
+        """True if no further transition is legal from this state."""
+        return self in _TERMINAL_STATES
+
+
+_TERMINAL_STATES = frozenset(
+    {
+        EffectState.COMMITTED,
+        EffectState.DENIED,
+        EffectState.ABANDONED,
+        EffectState.UNKNOWN,
+    }
+)
+
+#: Legal transitions. Anything not listed is a programming error, not a
+#: runtime condition -- the state machine is fixed at design time.
+ALLOWED_TRANSITIONS: dict[EffectState, frozenset[EffectState]] = {
+    EffectState.PREPARED: frozenset({EffectState.AUTHORIZED, EffectState.DENIED}),
+    EffectState.AUTHORIZED: frozenset(
+        {EffectState.IN_FLIGHT, EffectState.DENIED, EffectState.ABANDONED}
+    ),
+    EffectState.IN_FLIGHT: frozenset({EffectState.COMMITTED, EffectState.UNKNOWN}),
+    EffectState.COMMITTED: frozenset(),
+    EffectState.DENIED: frozenset(),
+    EffectState.ABANDONED: frozenset(),
+    EffectState.UNKNOWN: frozenset(),
+}
+
+
+def can_transition(src: EffectState, dst: EffectState) -> bool:
+    """True if src -> dst is a legal lifecycle move."""
+    return dst in ALLOWED_TRANSITIONS[src]
+
+
+class EvidenceInsufficient(ValueError):
+    """Raised when evidence is asked to establish more than it can support."""
+
+
+@dataclass(frozen=True)
+class EffectEvidence:
+    """Proof, produced by the executor, that a protected operation happened.
+
+    The point of this type is that `outcome="committed"` CANNOT be constructed
+    without a transport response and at least one observed target. A claim that
+    the effect landed must be backed by something observed at the boundary --
+    the request itself does not count, because the request is exactly what an
+    attacker controls.
+
+    Fields:
+      effect_id: occurrence identity (PLAN 6 makes this per-occurrence; today
+          it is the effect nonce).
+      outcome: what the executor established.
+      observed_bytes: how much actually left/landed, if measurable.
+      observed_targets: targets seen at the TRANSPORT, not requested.
+      transport_response: "250 OK", an errno string, or an fsync result.
+      source: which observation produced this ("smtp-envelope", "fs-stat", ...).
+      window: (start, end) monotonic observation window.
+
+    An empty `source` is rejected: evidence must name where it came from, else
+    it is an assertion wearing the costume of evidence.
+    """
+
+    effect_id: str
+    outcome: Literal["committed", "failed", "unknown", "denied"]
+    source: str
+    window: tuple[float, float]
+    observed_bytes: int | None = None
+    observed_targets: frozenset[str] | None = None
+    transport_response: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.source.strip():
+            raise EvidenceInsufficient(
+                "evidence must name its observation source "
+                "(empty source is an assertion, not evidence)"
+            )
+        start, end = self.window
+        if end < start:
+            raise EvidenceInsufficient(f"observation window is inverted: start={start} end={end}")
+        if self.outcome == "committed":
+            # The whole point of the type: no unbacked commits.
+            if not self.transport_response:
+                raise EvidenceInsufficient(
+                    "outcome='committed' requires a transport_response; "
+                    "a commit claim with no response is exactly the "
+                    "auth=1/obs=0 state the ledger reports as UNKNOWN"
+                )
+            if not self.observed_targets:
+                raise EvidenceInsufficient(
+                    "outcome='committed' requires at least one observed target; "
+                    "the requested targets are attacker-controlled and do not count"
+                )
+        if self.outcome == "unknown" and self.transport_response:
+            raise EvidenceInsufficient(
+                "outcome='unknown' must not carry a transport response; "
+                "if the transport replied, the outcome is committed or failed"
+            )
+
+    @property
+    def is_conclusive(self) -> bool:
+        """True if this evidence settles the outcome (not merely reports one)."""
+        return self.outcome in ("committed", "failed", "denied")
+
+    def to_state(self) -> EffectState:
+        """Map the evidential outcome onto a terminal lifecycle state.
+
+        `failed` maps to UNKNOWN, not DENIED: a transport failure means we do
+        not know whether the effect landed (an SMTP timeout may still have
+        delivered). It is emphatically not a denial -- the gate allowed it.
+        """
+        return {
+            "committed": EffectState.COMMITTED,
+            "denied": EffectState.DENIED,
+            "failed": EffectState.UNKNOWN,
+            "unknown": EffectState.UNKNOWN,
+        }[self.outcome]
+
+
+def state_from_evidence(
+    evidence: EffectEvidence | None,
+    *,
+    was_allowed: bool,
+) -> EffectState:
+    """Derive the terminal state. No evidence => UNKNOWN, never COMMITTED.
+
+    This is the single place that decides an outcome from evidence, so there is
+    one rule to audit. A denied effect with no evidence is DENIED (the gate's
+    decision IS the evidence for a denial -- nothing was dispatched). An allowed
+    effect with no evidence is UNKNOWN, because something may have escaped.
+    """
+    if evidence is not None:
+        return evidence.to_state()
+    return EffectState.DENIED if not was_allowed else EffectState.UNKNOWN

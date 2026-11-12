@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import threading
 import warnings
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -22,6 +24,28 @@ warnings.filterwarnings(
     message="SAME-PROCESS: ResourceStore lives in the same Python process",
     category=UserWarning,
 )
+
+
+# ---------------------------------------------------------------------------
+# Evidence helper
+# ---------------------------------------------------------------------------
+# verify() now requires executor-produced evidence before it will report a
+# commit; an observation alone is not enough. Tests that simulate a commit by
+# writing straight to the ledger need to state the evidence too, otherwise they
+# are testing the old "observation implies commit" contract.
+def commit_evidence(nonce: str, targets: object, *, source: str = "test"):
+    """Evidence for a simulated commit over `targets`."""
+    from effect_broker.model import EffectEvidence
+
+    target_set = frozenset(targets) if targets is not None else frozenset()
+    return EffectEvidence(
+        effect_id=nonce,
+        outcome="committed",
+        source=source,
+        window=(0.0, 0.0),
+        observed_targets=target_set,
+        transport_response="test",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -132,3 +156,31 @@ else:
     @pytest.fixture  # type: ignore[misc]
     def smtp_server():
         pytest.skip("aiosmtpd not installed — install with: pip install aiosmtpd")
+
+
+def _git_tracks(rel_path: str) -> bool:
+    """Whether git tracks `rel_path` in this checkout.
+
+    Skips rather than fails where the `git` binary is absent: a minimal
+    container image has the source tree but no VCS tools, and a test that
+    cannot run its check should say so instead of reporting a defect. The
+    callers assert on the boolean, so an untracked file still fails.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed in this environment")
+    result = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", rel_path],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+@pytest.fixture
+def git_tracks() -> Callable[[str], bool]:
+    """Expose the git-tracking check, skipping when git is unavailable."""
+    return _git_tracks

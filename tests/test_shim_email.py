@@ -15,10 +15,13 @@ import pytest
 
 from effect_broker.broker import EffectBroker
 from effect_broker.lattice import Confidentiality, Integrity
+from effect_broker.ledger import LedgerVerdict
 from effect_broker.model import Capability, Task
 from effect_broker.shim_email import (
     EmailSecurityError,
+    PostAuthorizationFailure,
     RealEmailShim,
+    SMTPError,
 )
 
 
@@ -429,3 +432,235 @@ class TestShimEmailBrokerIntegration:
         # Nothing committed
         log = broker.store.effects_log
         assert len(log) == 0
+
+
+class TestDispatchMarker:
+    """P4-2: the IN_FLIGHT marker is written before the SMTP call.
+
+    Tested at the shim, not the ledger, because the property is ORDERING:
+    the marker must exist by the time the network call starts. If it were
+    written after delivery, a crash mid-send would leave no trace at all.
+    """
+
+    def test_marker_written_before_smtp_call(self, smtp_server) -> None:
+        broker = _make_broker()
+        shim = RealEmailShim(
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            smtp_host="127.0.0.1",
+            smtp_port=9025,
+        )
+        smtp_server.reset()
+
+        shim._smtp_probe = lambda sender, decl: (decl, decl, frozenset())  # type: ignore[method-assign]
+
+        # Capture the ledger state AT THE MOMENT delivery is attempted: this is
+        # the ordering claim. After the call it would be trivially true.
+        original_send = shim._smtp_send
+        dispatched_when_send_started: list[bool] = []
+
+        def spy_send(sender, recipients, raw_message):
+            dispatched_when_send_started.append(
+                broker.ledger.was_dispatched("email-test", nonce_holder[0])
+            )
+            return original_send(sender, recipients, raw_message)
+
+        # The shim computes the nonce internally; capture it via record_dispatched.
+        nonce_holder: list[str] = [""]
+        original_record = broker.ledger.record_dispatched
+
+        def spy_record(task_id, nonce, source="shim.dispatch"):
+            nonce_holder[0] = nonce
+            return original_record(task_id, nonce, source)
+
+        object.__setattr__(broker.ledger, "record_dispatched", spy_record)
+        shim._smtp_send = spy_send  # type: ignore[method-assign]
+
+        shim.send("user@corp.com", "internal@corp.com", "hello")
+
+        assert dispatched_when_send_started == [True], (
+            "IN_FLIGHT marker must exist before the SMTP call; "
+            "found it written after (a crash mid-send would leave no trace)"
+        )
+
+
+class TestEmailEvidence:
+    """COMMITTED for a send must rest on transport evidence.
+
+    The email path used to reach CONFIRMED_COMMITTED with no evidence at all:
+    the ledger inferred it from the `executor.apply` observation, which is the
+    executor asserting its own success. These tests pin the evidence down.
+    """
+
+    def _shim(self, broker: EffectBroker) -> RealEmailShim:
+        shim = RealEmailShim(
+            broker,
+            task_id="email-test",
+            tool_name="TestTool",
+            smtp_host="127.0.0.1",
+            smtp_port=9025,
+        )
+        shim._smtp_probe = lambda sender, decl: (  # type: ignore[method-assign]
+            decl,
+            decl,
+            frozenset(),
+        )
+        return shim
+
+    def test_successful_send_records_transport_evidence(
+        self, smtp_server
+    ) -> None:
+        """An allowed send carries evidence naming the transport reply."""
+        broker = _make_broker()
+        shim = self._shim(broker)
+        shim._smtp_send = lambda s, r, raw: (  # type: ignore[method-assign]
+            ["internal@corp.com"],
+            "data=250 OK",
+        )
+
+        shim.send("user@corp.com", "internal@corp.com", "hello")
+
+        evidence = broker.ledger.evidence_for("email-test", "send-cap")
+        assert evidence is not None, "a send must be backed by evidence"
+        assert evidence.outcome == "committed"
+        assert evidence.transport_response == "data=250 OK"
+        assert evidence.observed_targets == frozenset({"internal@corp.com"})
+        assert evidence.source == "shim_email.send.transport"
+
+    def test_transport_failure_is_unknown_not_committed(
+        self, smtp_server
+    ) -> None:
+        """A transport fault after ALLOW must not read as a confirmed commit."""
+        from effect_broker.ledger import OUTCOME_UNKNOWN
+
+        broker = _make_broker()
+        shim = self._shim(broker)
+
+        def failing_send(sender, recipients, raw):
+            raise SMTPError("connection refused")
+
+        shim._smtp_send = failing_send  # type: ignore[method-assign]
+
+        with pytest.raises(PostAuthorizationFailure):
+            shim.send("user@corp.com", "internal@corp.com", "hello")
+
+        evidence = broker.ledger.evidence_for("email-test", "send-cap")
+        assert evidence is not None, (
+            "a failed delivery must leave evidence; otherwise the "
+            "executor.apply observation reads as a commit"
+        )
+        assert evidence.outcome == "unknown"
+        assert evidence.transport_response is None
+        assert broker.ledger.outcome_of("email-test", "send-cap") == OUTCOME_UNKNOWN
+
+    def test_no_accepted_recipient_is_unknown_not_a_crash(
+        self, smtp_server
+    ) -> None:
+        """DATA accepted, nothing delivered: UNKNOWN with a readable error.
+
+        A commit claim with no observed target is not constructible, so this
+        path must classify as UNKNOWN rather than let the type's own guard
+        surface as an unhandled EvidenceInsufficient.
+        """
+        from effect_broker.model import EvidenceInsufficient
+
+        broker = _make_broker()
+        shim = self._shim(broker)
+        shim._smtp_send = lambda s, r, raw: (  # type: ignore[method-assign]
+            [],
+            "data=250 but no rcpt accepted",
+        )
+
+        with pytest.raises(PostAuthorizationFailure) as excinfo:
+            shim.send("user@corp.com", "internal@corp.com", "hello")
+
+        # A type error escaping here would be the bug this test pins down.
+        assert not isinstance(excinfo.value, EvidenceInsufficient)
+        assert "UNKNOWN" in str(excinfo.value)
+        evidence = broker.ledger.evidence_for("email-test", "send-cap")
+        assert evidence is not None
+        assert evidence.outcome == "unknown"
+
+
+class TestReadInboxLedger:
+    """A successful read_inbox must not be recorded as a failed apply.
+
+    The effect target `imap:<user>` was never resolvable in the store, so
+    apply_effect() returned False and the ledger read a completed read as
+    UNKNOWN(apply_failed) -- the store reporting a failure it did not have.
+    """
+
+    def _broker_and_shim(self) -> tuple[EffectBroker, RealEmailShim, str]:
+        broker = _make_broker()
+        # The shared helper's ceiling grants `send` only, so a read would be
+        # blocked by NoAmp before ever reaching IMAP. Register a read task.
+        broker.register_task(
+            Task(
+                task_id="read-test",
+                owner="User",
+                ceiling=Capability(
+                    owner="User",
+                    holder="EffectBroker",
+                    right="read",
+                    target="internal@corp.com",
+                    scope=frozenset({"internal"}),
+                    expiry=float("inf"),
+                    nonce="ceiling-read-test",
+                ),
+                flow_boundary=(Confidentiality.CONFIDENTIAL, Integrity.USER),
+            )
+        )
+        nonce = "TestTool:read:imap:internal@corp.com"
+        broker.capabilities[nonce] = Capability(
+            owner="User",
+            holder="TestTool",
+            right="read",
+            target="imap:internal@corp.com",
+            scope=frozenset({"internal"}),
+            expiry=float("inf"),
+            nonce=nonce,
+        )
+        shim = RealEmailShim(broker, task_id="read-test", tool_name="TestTool")
+        return broker, shim, nonce
+
+    def test_successful_read_is_committed_not_apply_failed(self) -> None:
+        broker, shim, nonce = self._broker_and_shim()
+        shim._imap_read_inbox = lambda u: (["1", "2"], 120)  # type: ignore[method-assign]
+
+        before = len(broker.store.effects_log)
+        shim.read_inbox("internal@corp.com")
+
+        # The store must actually record the read, not just return True.
+        recorded = broker.store.effects_log[before:]
+        assert recorded == [("read", "mailbox:imap:internal@corp.com")]
+
+        assert broker.ledger.outcome_of("read-test", nonce) != "failed"
+        assert broker.ledger.verify("read-test", nonce) is LedgerVerdict.CONFIRMED_COMMITTED
+
+    def test_successful_read_records_transport_evidence(self) -> None:
+        broker, shim, nonce = self._broker_and_shim()
+        shim._imap_read_inbox = lambda u: (["1"], 50)  # type: ignore[method-assign]
+
+        shim.read_inbox("internal@corp.com")
+
+        evidence = broker.ledger.evidence_for("read-test", nonce)
+        assert evidence is not None, "a completed read must be backed by evidence"
+        assert evidence.outcome == "committed"
+        assert evidence.observed_targets == frozenset({"imap:internal@corp.com"})
+        assert evidence.transport_response == "messages=1 bytes=50"
+
+    def test_imap_failure_records_unknown_evidence(self) -> None:
+        broker, shim, nonce = self._broker_and_shim()
+
+        def failing_read(user: str):
+            raise SMTPError("IMAP connection refused")
+
+        shim._imap_read_inbox = failing_read  # type: ignore[method-assign]
+
+        with pytest.raises(EmailSecurityError):
+            shim.read_inbox("internal@corp.com")
+
+        evidence = broker.ledger.evidence_for("read-test", nonce)
+        assert evidence is not None
+        assert evidence.outcome == "unknown"

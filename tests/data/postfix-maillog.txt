@@ -1,0 +1,20 @@
+Nov 12 04:33:24 ecac-mta postfix/postfix-script[3467]: starting the Postfix mail system
+Nov 12 04:33:24 ecac-mta postfix/master[3469]: daemon started -- version 3.7.11, configuration /etc/postfix
+Nov 12 04:33:24 ecac-mta postfix/smtpd[3473]: connect from unknown[127.0.0.1]
+Nov 12 04:33:24 ecac-mta postfix/smtpd[3473]: lost connection after CONNECT from unknown[127.0.0.1]
+Nov 12 04:33:24 ecac-mta postfix/smtpd[3473]: disconnect from unknown[127.0.0.1] commands=0/0
+Nov 12 04:33:24 ecac-mta postfix/smtpd[3473]: connect from unknown[127.0.0.1]
+Nov 12 04:33:24 ecac-mta postfix/smtpd[3473]: improper command pipelining after CONNECT from unknown[127.0.0.1]: EHLO capture\r\n
+Nov 12 04:33:24 ecac-mta postfix/smtpd[3473]: 7E8C638460D: client=unknown[127.0.0.1]
+Nov 12 04:33:24 ecac-mta postfix/cleanup[3477]: 7E8C638460D: message-id=<20261112043324.7E8C638460D@ecac-mta.test>
+Nov 12 04:33:24 ecac-mta postfix/smtpd[3473]: disconnect from unknown[127.0.0.1] ehlo=1 mail=1 rcpt=1 data=1 quit=1 commands=5
+Nov 12 04:33:24 ecac-mta postfix/smtpd[3475]: connect from unknown[127.0.0.1]
+Nov 12 04:33:24 ecac-mta postfix/smtpd[3475]: improper command pipelining after CONNECT from unknown[127.0.0.1]: EHLO capture\r\n
+Nov 12 04:33:24 ecac-mta postfix/qmgr[3471]: 7E8C638460D: from=<tool@corp.com>, size=321, nrcpt=1 (queue active)
+Nov 12 04:33:24 ecac-mta postfix/smtpd[3475]: 7F11038461F: client=unknown[127.0.0.1]
+Nov 12 04:33:24 ecac-mta postfix/cleanup[3477]: 7F11038461F: message-id=<20261112043324.7F11038461F@ecac-mta.test>
+Nov 12 04:33:24 ecac-mta postfix/qmgr[3471]: 7F11038461F: from=<tool@corp.com>, size=300, nrcpt=2 (queue active)
+Nov 12 04:33:24 ecac-mta postfix/smtpd[3475]: disconnect from unknown[127.0.0.1] ehlo=1 mail=1 rcpt=2 data=1 quit=1 commands=6
+Nov 12 04:33:24 ecac-mta postfix/smtp[3478]: 7E8C638460D: to=<internal@corp.com>, relay=none, delay=0.02, delays=0.01/0.01/0/0, dsn=4.4.3, status=deferred (Host or domain name not found. Name service error for name=corp.com type=MX: Host not found, try again)
+Nov 12 04:33:24 ecac-mta postfix/smtp[3478]: 7F11038461F: to=<internal@corp.com>, relay=none, delay=0.02, delays=0/0.01/0/0, dsn=4.4.3, status=deferred (Host or domain name not found. Name service error for name=corp.com type=MX: Host not found, try again)
+Nov 12 04:33:24 ecac-mta postfix/smtp[3478]: 7F11038461F: to=<attacker@evil.com>, relay=none, delay=0.02, delays=0/0.01/0/0, dsn=4.4.3, status=deferred (Host or domain name not found. Name service error for name=evil.com type=MX: Host not found, try again)

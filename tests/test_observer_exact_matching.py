@@ -15,6 +15,8 @@ effects it cannot verify ("unknown, not safe"). Specifically:
 
 from __future__ import annotations
 
+from conftest import commit_evidence
+
 from effect_broker.ledger import (
     IndependentEffectLedger,
     LedgerVerdict,
@@ -30,6 +32,9 @@ class TestEffectObserverExactMatching:
         ledger = IndependentEffectLedger()
         ledger.record_authorization("default", "cap:read", frozenset({"file:///reports"}))
         ledger.record_observation("default", "cap:read", frozenset({"file:///reports"}))
+        ledger.record_evidence(
+            "default", "cap:read", commit_evidence("cap:read", {"file:///reports"})
+        )
 
         verdict = ledger.verify("default", "cap:read")
         assert verdict == LedgerVerdict.CONFIRMED_COMMITTED
@@ -103,6 +108,8 @@ class TestEffectObserverExactMatching:
         ledger.record_authorization("task-B", "cap:read", frozenset({"file:///b"}))
         ledger.record_observation("task-A", "cap:read", frozenset({"file:///a"}))
         ledger.record_observation("task-B", "cap:read", frozenset({"file:///b"}))
+        ledger.record_evidence("task-A", "cap:read", commit_evidence("cap:read", {"file:///a"}))
+        ledger.record_evidence("task-B", "cap:read", commit_evidence("cap:read", {"file:///b"}))
 
         # Each task independently: 1 auth + 1 obs → exact match
         assert ledger.verify("task-A", "cap:read") == LedgerVerdict.CONFIRMED_COMMITTED

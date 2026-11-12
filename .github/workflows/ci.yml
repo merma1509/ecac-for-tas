@@ -48,8 +48,42 @@ jobs:
       - name: Type-check (mypy, strict)
         run: uv run mypy effect_broker
 
+      # ---- tests ----
+      # `ECAC_REQUIRE_CONFINEMENT=1` makes a confined executor refuse to start
+      # where no kernel mechanism is in effect. It is set here because a green
+      # suite must not be readable as evidence that confinement works: without
+      # it, every confinement test on a capable runner would degrade to the
+      # Python-level wrappers and still pass.
       - name: Test (pytest)
         run: uv run pytest
+        env:
+          ECAC_REQUIRE_CONFINEMENT: "1"
+
+      # ---- prove kernel confinement is actually in effect (P5-1) ----
+      # The confinement tests skip on hosts without Landlock, which would let a
+      # broken syscall sequence pass CI on a kernel that supports it. This step
+      # runs the real probe in the runner's own kernel and fails loudly if
+      # confinement cannot be established where it demonstrably can be.
+      - name: Verify kernel confinement (P5-1)
+        run: |
+          uv run python - <<'PY'
+          import sys
+          from effect_broker import executor_subprocess as sub
+
+          abi = sub._kernel_landlock_abi()
+          if abi < 1:
+              sys.exit(
+                  f"FAIL: the CI kernel reports no Landlock support (ABI {abi}). "
+                  "P5-1 cannot be verified on this runner; fix the runner rather "
+                  "than letting the confinement tests skip."
+              )
+          if not sub._activate_confinement():
+              sys.exit(
+                  f"FAIL: kernel Landlock ABI {abi} is available but the executor "
+                  "could not confine itself. The syscall sequence is broken."
+              )
+          print(f"OK: Landlock ABI {abi} active — {sub._get_confinement_status()}")
+          PY
 
       # ---- assert the expected blocker for every trace in the suite ----
       # Expectations live in scripts/verify_traces.sh so that CI and the
@@ -84,3 +118,22 @@ jobs:
       # ---- sealed evaluation gates (shared with the release pipeline) ----
       - name: Sealed evaluation (held-out + baseline + experiment)
         run: ./scripts/verify_eval.sh
+
+      # ---- regression tripwire on the metrics snapshot ----
+      # `tests/data/metrics_baseline.json` is the recorded reference; this diffs
+      # a live run against it. The script exits 1 on a correctness regression
+      # (defense rate down, false positives/negatives up, annotation burden up)
+      # and 2 if the scenario set changed, which makes the diff meaningless.
+      #
+      # TCB size and latency are printed but advisory — they move on correct
+      # changes and on noise, so they are argued in review rather than gated.
+      # See _ADVISORY in scripts/metrics_snapshot.py.
+      #
+      # The baseline lives under tests/data/ because docs/ is gitignored in this
+      # repository, and a reference file a fresh checkout cannot see would turn
+      # this gate into a no-op.
+      - name: Metrics regression gate
+        run: |
+          uv run python scripts/metrics_snapshot.py --out "${{ runner.temp }}/metrics.json"
+          uv run python scripts/metrics_snapshot.py --compare \
+            tests/data/metrics_baseline.json "${{ runner.temp }}/metrics.json"

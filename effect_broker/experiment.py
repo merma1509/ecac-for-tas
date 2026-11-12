@@ -36,6 +36,7 @@ from typing import Any, cast
 warnings.filterwarnings("ignore", message="SAME-PROCESS")
 
 from .broker import EffectBroker
+from .ledger import OutcomeCounts
 from .model import AGENT, BROKER, USER
 from .shim import FileShim, SecurityError
 
@@ -63,15 +64,75 @@ class ExperimentResult:
     shim_blocked: bool
     op_log_count: int
     effects_log_count: int
-    mediation_complete: bool
+    #: Whether mediation was actually CHECKED, and what the check said.
+    #:
+    #: `mediation_complete` used to be `bool`, filled in at most sites with
+    #: `not actual_allow` -- i.e. "the effect was blocked, so mediation must be
+    #: complete". Those are different propositions: a blocked effect says
+    #: nothing about whether some OTHER effect escaped unmediated. Some sites
+    #: never checked at all, and their True was pure assertion.
+    #:
+    #: Now: `None` means NOT EVALUATED. Reading it as "passed" is the bug this
+    #: field exists to prevent, so the aggregate in __main__ requires an explicit
+    #: check rather than a truthiness test.
+    mediation_complete: bool | None = None
+    #: True iff mediation_complete was produced by an actual
+    #: verify_complete_mediation() call rather than inferred from a block.
+    mediation_evaluated: bool = False
+    #: Failure descriptions from the verification (empty when it passed).
+    mediation_failures: tuple[str, ...] = ()
     replay_blocked: bool = False
+
+    def __post_init__(self) -> None:
+        # An evaluated result must actually carry a verdict; a verdict without
+        # evaluation is the false inference we are removing.
+        if self.mediation_evaluated and self.mediation_complete is None:
+            raise ValueError(
+                f"{self.name}: mediation_evaluated=True with mediation_complete=None "
+                f"is contradictory -- evaluation must produce a verdict"
+            )
+        if not self.mediation_evaluated and self.mediation_complete is not None:
+            raise ValueError(
+                f"{self.name}: mediation_complete set without mediation_evaluated -- "
+                f"this is the 'blocked implies complete' inference in disguise"
+            )
+
+_RUN_BROKERS: list[EffectBroker] | None = None
+_JOURNAL_PATH: str | None = None
+_JOURNAL_MAX_BYTES: int | None = None
+
+#: Rotated segments to retain besides the live file.
+_JOURNAL_KEEP: int = 1
 
 
 def _build_broker() -> EffectBroker:
     """Standard broker setup for all experiments."""
     from .traces import build
 
-    return build()
+    broker = build(
+        journal_path=_JOURNAL_PATH,
+        journal_max_bytes=_JOURNAL_MAX_BYTES,
+        journal_keep=_JOURNAL_KEEP,
+    )
+    if _RUN_BROKERS is not None:
+        _RUN_BROKERS.append(broker)
+    return broker
+
+
+def _mediation_verdict(broker: EffectBroker) -> tuple[bool | None, bool, tuple[str, ...]]:
+    """Ask the ledger whether mediation was complete. Never infer it.
+
+    Returns (mediation_complete, mediation_evaluated, failures).
+
+    `mediation_complete=None` is returned ONLY when the check itself could not
+    run. That is different from `False` (the check ran and found a hole) and
+    from a block having happened (which says nothing about other effects).
+    """
+    try:
+        failures = tuple(broker.verify_complete_mediation())
+    except Exception as exc:  # noqa: BLE001 - a broken check is not a pass
+        return None, False, (f"verification_error:{type(exc).__name__}:{exc}",)
+    return (len(failures) == 0), True, failures
 
 
 # ---- M1: Read tool performs an extra write to secrets ----
@@ -868,6 +929,8 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         op_log_count=len(shim.op_log),
         effects_log_count=len(broker.store.effects_log),
         mediation_complete=len(failures) == 0,
+        mediation_evaluated=True,
+        mediation_failures=tuple(failures),
     )
     assert len(failures) == 0, f"M1 mediation failure: {failures}"
 
@@ -896,6 +959,8 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         op_log_count=len(shim2.op_log),
         effects_log_count=len(broker2.store.effects_log),
         mediation_complete=len(failures2) == 0,
+        mediation_evaluated=True,
+        mediation_failures=tuple(failures2),
     )
 
     # ---- M3: forged capability (Auth block) ----
@@ -924,7 +989,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,  # M3 uses direct broker call
         op_log_count=0,
         effects_log_count=len(broker3.store.effects_log),
-        mediation_complete=not actual_allow and len(broker3.store.effects_log) == 0,
+        mediation_complete=_mediation_verdict(broker3)[0],
+        mediation_evaluated=_mediation_verdict(broker3)[1],
+        mediation_failures=_mediation_verdict(broker3)[2],
     )
     assert not actual_allow, "M3 broker should BLOCK (no effects in effects_log)"
     assert len(broker3.store.effects_log) == 0, "M3 should have no effects (BLOCKed)"
@@ -950,7 +1017,13 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=not m4_passed,
         op_log_count=len(shim4.op_log),
         effects_log_count=len(broker4.store.effects_log),
-        mediation_complete=m4_passed and len(shim4.verify_complete_mediation()) == 0,
+        # NOTE: m4_passed (did the benign tool succeed?) is reported via
+        # shim_blocked/actual_allow; mediation is a separate question and is
+        # asked separately. Conflating them let a tool failure mask a real
+        # mediation hole.
+        mediation_complete=_mediation_verdict(broker4)[0],
+        mediation_evaluated=_mediation_verdict(broker4)[1],
+        mediation_failures=_mediation_verdict(broker4)[2],
     )
     assert m4_passed, f"M4 paired success case FAILED: {m4_error}"
     failures4 = shim4.verify_complete_mediation()
@@ -983,7 +1056,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker5.store.effects_log),
-        mediation_complete=m5_replay_blocked,
+        mediation_complete=_mediation_verdict(broker5)[0],
+        mediation_evaluated=_mediation_verdict(broker5)[1],
+        mediation_failures=_mediation_verdict(broker5)[2],
         replay_blocked=True,  # replay attempt was correctly blocked by Fresh
     )
     assert m5_passed, f"M5 second commit should correctly block (Fresh) but tool raised: {m5_error}"
@@ -1013,7 +1088,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_h1.store.effects_log),
-        mediation_complete=not actual_allow_h1,
+        mediation_complete=_mediation_verdict(broker_h1)[0],
+        mediation_evaluated=_mediation_verdict(broker_h1)[1],
+        mediation_failures=_mediation_verdict(broker_h1)[2],
     )
     assert h1_passed, f"H1 path alias should BLOCK: {h1_error}"
 
@@ -1043,7 +1120,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_h2.store.effects_log),
-        mediation_complete=not actual_allow_h2,
+        mediation_complete=_mediation_verdict(broker_h2)[0],
+        mediation_evaluated=_mediation_verdict(broker_h2)[1],
+        mediation_failures=_mediation_verdict(broker_h2)[2],
     )
     assert h2_passed, f"H2 low-integrity should BLOCK: {h2_error}"
 
@@ -1072,7 +1151,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_h3.store.effects_log),
-        mediation_complete=not actual_allow_h3,
+        mediation_complete=_mediation_verdict(broker_h3)[0],
+        mediation_evaluated=_mediation_verdict(broker_h3)[1],
+        mediation_failures=_mediation_verdict(broker_h3)[2],
     )
     assert h3_passed, f"H3 forged capability should BLOCK: {h3_error}"
 
@@ -1101,7 +1182,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_t9.store.effects_log),
-        mediation_complete=not actual_allow_t9,  # blocked = safe
+        mediation_complete=_mediation_verdict(broker_t9)[0],
+        mediation_evaluated=_mediation_verdict(broker_t9)[1],
+        mediation_failures=_mediation_verdict(broker_t9)[2],
     )
     assert t9_passed, f"T9 hidden network should BLOCK: {t9_error}"
 
@@ -1132,7 +1215,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_t10.store.effects_log),
-        mediation_complete=not actual_allow_t10,
+        mediation_complete=_mediation_verdict(broker_t10)[0],
+        mediation_evaluated=_mediation_verdict(broker_t10)[1],
+        mediation_failures=_mediation_verdict(broker_t10)[2],
     )
     assert t10_passed, f"T10 direct bypass should BLOCK: {t10_error}"
 
@@ -1163,7 +1248,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_t11.store.effects_log),
-        mediation_complete=not actual_allow_t11,
+        mediation_complete=_mediation_verdict(broker_t11)[0],
+        mediation_evaluated=_mediation_verdict(broker_t11)[1],
+        mediation_failures=_mediation_verdict(broker_t11)[2],
     )
     assert t11_passed, f"T11 SSRF should BLOCK: {t11_error}"
 
@@ -1194,7 +1281,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_t12.store.effects_log),
-        mediation_complete=not actual_allow_t12,
+        mediation_complete=_mediation_verdict(broker_t12)[0],
+        mediation_evaluated=_mediation_verdict(broker_t12)[1],
+        mediation_failures=_mediation_verdict(broker_t12)[2],
     )
     assert t12_passed, f"T12 capability widening should BLOCK: {t12_error}"
 
@@ -1225,7 +1314,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_t15.store.effects_log),
-        mediation_complete=not actual_allow_t15,
+        mediation_complete=_mediation_verdict(broker_t15)[0],
+        mediation_evaluated=_mediation_verdict(broker_t15)[1],
+        mediation_failures=_mediation_verdict(broker_t15)[2],
     )
     assert t15_passed, f"T15 endorsement abuse should BLOCK: {t15_error}"
 
@@ -1256,7 +1347,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_t16.store.effects_log),
-        mediation_complete=not actual_allow_t16,
+        mediation_complete=_mediation_verdict(broker_t16)[0],
+        mediation_evaluated=_mediation_verdict(broker_t16)[1],
+        mediation_failures=_mediation_verdict(broker_t16)[2],
     )
     assert t16_passed, f"T16 parameter smuggling should BLOCK: {t16_error}"
 
@@ -1287,7 +1380,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_t17.store.effects_log),
-        mediation_complete=not actual_allow_t17,
+        mediation_complete=_mediation_verdict(broker_t17)[0],
+        mediation_evaluated=_mediation_verdict(broker_t17)[1],
+        mediation_failures=_mediation_verdict(broker_t17)[2],
     )
     assert t17_passed, f"T17 cross-task flow should BLOCK: {t17_error}"
 
@@ -1318,7 +1413,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_t19.store.effects_log),
-        mediation_complete=not actual_allow_t19,
+        mediation_complete=_mediation_verdict(broker_t19)[0],
+        mediation_evaluated=_mediation_verdict(broker_t19)[1],
+        mediation_failures=_mediation_verdict(broker_t19)[2],
     )
     assert t19_passed, f"T19 deep delegation should BLOCK: {t19_error}"
 
@@ -1349,7 +1446,9 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=len(broker_t20.store.effects_log),
-        mediation_complete=not actual_allow_t20,
+        mediation_complete=_mediation_verdict(broker_t20)[0],
+        mediation_evaluated=_mediation_verdict(broker_t20)[1],
+        mediation_failures=_mediation_verdict(broker_t20)[2],
     )
     assert t20_passed, f"T20 TOCTOU should BLOCK: {t20_error}"
 
@@ -1376,11 +1475,62 @@ def run_all_experiments() -> dict[str, ExperimentResult]:
         shim_blocked=False,
         op_log_count=0,
         effects_log_count=actual_sends_t18,
-        mediation_complete=True,  # rate limiting worked correctly
+        # Rate limiting working is not evidence about mediation; ask the ledger.
+        mediation_complete=_mediation_verdict(broker_t18)[0],
+        mediation_evaluated=_mediation_verdict(broker_t18)[1],
+        mediation_failures=_mediation_verdict(broker_t18)[2],
     )
     assert t18_passed, f"T18 send rate limit should BLOCK excess: {t18_error}"
 
     return results
+
+
+def collect_outcome_counts(
+    journal_path: str | None = None,
+    journal_max_bytes: int | None = None,
+    journal_keep: int = 1,
+) -> tuple[dict[str, ExperimentResult], OutcomeCounts]:
+    """Run the suite and tally every effect by outcome (P4-4).
+
+    Runs the experiments ONCE and returns both the per-scenario results and the
+    aggregate outcome counts. Callers that need both must use this rather than
+    run_all_experiments() plus a second run, otherwise the numbers describe two
+    different executions.
+
+    When journal_path is given, every broker built during the run persists its
+    in-flight markers there. journal_max_bytes bounds the file: once it reaches
+    that size the live file is rotated to `<path>.1` and replay follows the
+    segments in order. Left of None the journal grows without limit, which is
+    fine for a single run and wrong for a long-lived broker.
+    """
+    global _RUN_BROKERS, _JOURNAL_PATH, _JOURNAL_MAX_BYTES, _JOURNAL_KEEP
+    _RUN_BROKERS = []
+    _JOURNAL_PATH = journal_path
+    _JOURNAL_MAX_BYTES = journal_max_bytes
+    _JOURNAL_KEEP = journal_keep
+    try:
+        results = run_all_experiments()
+        totals = OutcomeCounts()
+        for broker in _RUN_BROKERS:
+            counts = broker.ledger.outcome_counts()
+            totals = OutcomeCounts(
+                committed=totals.committed + counts.committed,
+                failed=totals.failed + counts.failed,
+                unknown=totals.unknown + counts.unknown,
+                denied=totals.denied + counts.denied,
+                abandoned=totals.abandoned + counts.abandoned,
+            )
+        return results, totals
+    finally:
+        # Never leak the registry past the run: a later _build_broker() outside
+        # this function must not append to a stale list, nor inherit a journal
+        # path the caller did not ask for on this run.
+        _RUN_BROKERS = None
+        _JOURNAL_PATH = None
+        # Reset the bound too, or a bounded run would silently impose its limit
+        # on the next unbounded one.
+        _JOURNAL_MAX_BYTES = None
+        _JOURNAL_KEEP = 1
 
 
 def print_results(results: dict[str, ExperimentResult]) -> None:
@@ -1389,7 +1539,11 @@ def print_results(results: dict[str, ExperimentResult]) -> None:
     print("-" * 105)
     for _key, r in results.items():
         actual_str = "ALLOW" if r.actual_allow else "BLOCK"
-        status = "PASS" if r.mediation_complete else "FAIL"
+        # Three statuses, not two: an unevaluated result is neither.
+        if not r.mediation_evaluated:
+            status = "N/EVAL"
+        else:
+            status = "PASS" if r.mediation_complete else "FAIL"
         blocker_str = str(r.actual_blocker)[:22]
         print(f"{r.name:<45} {r.expected_blocker:<10} {actual_str:<10} {blocker_str:<22} {status}")
     # Predicate evidence summary for blocked scenarios
@@ -1402,6 +1556,28 @@ def print_results(results: dict[str, ExperimentResult]) -> None:
     sys.stdout.flush()  # ensure output is visible in make/non-interactive contexts
 
 
+def print_outcome_counts(counts: OutcomeCounts) -> None:
+    """Print the five-outcome tally (P4-4).
+
+    The footnote about `abandoned` is not decoration. It currently has no
+    producer -- capability expiry is caught by the gate as a denial, before
+    dispatch -- so a bare 0 would read as "we looked and found none" when it
+    means "this state cannot be reached yet". Same reasoning for a zero
+    `unknown`: the suite has no crashes, so nothing is dropped mid-flight.
+    """
+    print()
+    print("Effect outcomes (all scenarios):")
+    for name, value in counts.as_dict().items():
+        print(f"  {name:<10} {value}")
+    print(f"  {'total':<10} {counts.total}")
+    if counts.abandoned == 0:
+        print("  note: 'abandoned' has no producer yet - capability expiry is")
+        print("        denied at the gate, so nothing is authorized-then-given-up.")
+    if counts.unknown == 0:
+        print("  note: 'unknown' is 0 because no scenario crashes mid-operation;")
+        print("        it is produced by real failures, not by this suite.")
+
+
 # ---- CLI entry point ----
 # Allows: $ python -m effect_broker.experiment
 def _main() -> None:
@@ -1409,10 +1585,12 @@ def _main() -> None:
     import warnings
 
     warnings.filterwarnings("ignore", message="SAME-PROCESS", category=UserWarning)
-    results = run_all_experiments()
+    results, counts = collect_outcome_counts()
     print_results(results)
+    print_outcome_counts(counts)
     sys.stdout.flush()
-    all_passed = all(r.mediation_complete for r in results.values())
+    # Same rule as __main__.py: never checked is not the same as passed.
+    all_passed = all(r.mediation_evaluated and r.mediation_complete for r in results.values())
     sys.exit(0 if all_passed else 1)
 
 

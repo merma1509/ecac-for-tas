@@ -1,0 +1,29 @@
+{
+  "annotations": 7,
+  "attacks": 4,
+  "attacks_blocked": 4,
+  "defense_rate": 1.0,
+  "false_negatives": 0,
+  "false_positive_rate": 0.0,
+  "false_positives": 0,
+  "latency_p50_ms": 0.023000058718025684,
+  "latency_p95_ms": 0.03844714956358075,
+  "latency_p99_ms": 0.039922131691128016,
+  "legitimate": 2,
+  "per_mechanism": {
+    "Auth": 1,
+    "FlowOK": 1,
+    "Fresh": 1,
+    "NoAmp": 1
+  },
+  "session_taint": {
+    "blocked_sends_later_declassed": 1,
+    "false_denial_proxy": 1.0,
+    "reads_that_tainted": 1,
+    "sends_blocked_by_taint": 1,
+    "taint_rate": 1.0,
+    "total_reads": 1
+  },
+  "tcb_lines": 2163,
+  "total": 6
+}
