@@ -554,3 +554,98 @@ print("RESULT", result)
         assert result.get("legit_read") == "allowed", (
             f"the confined executor cannot read anything: not a usable sandbox ({result})"
         )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Landlock is Linux-only")
+class TestEtcIsNotOpenedWholesale:
+    """`/etc` must be granted file by file, not as a subtree.
+
+    Found by measurement, not review: a confined process in a container with
+    ABI 4 read `/etc/shadow` successfully while `_get_confinement_status()`
+    reported `restricted-open`. The cause was `/etc` appearing in
+    `_LANDLOCK_READ_DIRS`, and Landlock grants a subtree — so asking for
+    `hosts` and `resolv.conf` also granted `shadow` and `sudoers`.
+
+    That is the worst shape of this bug: the status string said a confinement
+    layer was active, and the one file a reader would ask about was readable
+    through it.
+    """
+
+    def test_etc_is_not_a_read_root(self) -> None:
+        """A subtree grant on `/etc` re-opens every secret it holds."""
+        assert "/etc" not in sub._LANDLOCK_READ_DIRS, (
+            "/etc is granted as a subtree, which also grants /etc/shadow and "
+            "/etc/sudoers. List the files that are needed in "
+            "_LANDLOCK_READ_FILES instead."
+        )
+
+    def test_the_needed_etc_files_are_named_individually(self) -> None:
+        """The narrow grant must still cover what a process needs to resolve."""
+        for needed in ("/etc/hosts", "/etc/resolv.conf"):
+            assert needed in sub._LANDLOCK_READ_FILES, (
+                f"{needed} is not granted, so name resolution breaks in the "
+                f"confined executor"
+            )
+
+    def test_secrets_are_not_named(self) -> None:
+        """The allowlist must not contain the files it exists to keep out."""
+        for secret in ("/etc/shadow", "/etc/sudoers", "/etc/gshadow"):
+            assert secret not in sub._LANDLOCK_READ_FILES, (
+                f"{secret} is on the read allowlist; that is the file the "
+                f"confinement is supposed to deny"
+            )
+
+    def test_a_confined_process_cannot_read_shadow(self) -> None:
+        """The property, observed in a process that is actually confined.
+
+        `/etc/shadow` is used rather than a canary because the canary would
+        prove nothing about the specific mistake: a canary outside every root
+        was already denied before this fix. What was wrong was a real file
+        inside a root that should never have been a root.
+        """
+        import subprocess
+
+        if not os.path.isfile("/etc/shadow"):
+            pytest.skip("/etc/shadow does not exist in this environment")
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        probe = f"""
+import os, sys
+sys.path.insert(0, {repo_root!r})
+from effect_broker import executor_subprocess as sub
+
+if not sub._activate_confinement():
+    print("NOT_CONFINED")
+    raise SystemExit(0)
+
+result = {{}}
+for path in ("/etc/shadow", "/etc/hosts"):
+    if not os.path.isfile(path):
+        result[path] = "absent"
+        continue
+    try:
+        fd = sub._real_os_open(path, os.O_RDONLY)
+        os.close(fd)
+        result[path] = "allowed"
+    except PermissionError:
+        result[path] = "denied"
+print("RESULT", result)
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120
+        )
+        out = proc.stdout.strip()
+        assert proc.returncode == 0, f"probe failed: {out}{proc.stderr}"
+        if "NOT_CONFINED" in out:
+            pytest.skip("kernel has no Landlock; read confinement cannot be shown")
+        result = eval(out.split("RESULT", 1)[1].strip())  # noqa: S307
+
+        assert result.get("/etc/shadow") == "denied", (
+            "a confined executor read /etc/shadow. /etc is being granted as a "
+            f"subtree, so every secret in it is readable (probe said {result})"
+        )
+        # And the narrow grant must not have closed the legitimate ones.
+        if result.get("/etc/hosts") != "absent":
+            assert result.get("/etc/hosts") == "allowed", (
+                f"the narrow /etc grant broke name resolution ({result})"
+            )

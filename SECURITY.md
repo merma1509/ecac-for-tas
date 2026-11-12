@@ -46,6 +46,15 @@ to start where no kernel mechanism exists (CI sets this; local development
 defaults off). On macOS the Python-level layers are a speed bump, not a
 security boundary — treat the platform as unconfined.
 
+**Read roots are granted per file where a directory would over-grant.** `/etc`
+was previously a read root, and because Landlock grants a subtree, that made
+`/etc/shadow` and `/etc/sudoers` readable to the confined process while the
+status string still reported confinement. `/etc` is no longer a root; the files
+that are actually needed (`hosts`, `resolv.conf`, `passwd`, the CA bundle) are
+listed individually. A file missing from that list is unreadable, which fails
+closed. As a corollary, `HOME` must sit outside the writable roots or the
+read-confinement selftest cannot run — see README.
+
 ---
 
 ## Reporting a vulnerability

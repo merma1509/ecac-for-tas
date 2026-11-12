@@ -48,8 +48,16 @@ jobs:
       - name: Type-check (mypy, strict)
         run: uv run mypy effect_broker
 
+      # ---- tests ----
+      # `ECAC_REQUIRE_CONFINEMENT=1` makes a confined executor refuse to start
+      # where no kernel mechanism is in effect. It is set here because a green
+      # suite must not be readable as evidence that confinement works: without
+      # it, every confinement test on a capable runner would degrade to the
+      # Python-level wrappers and still pass.
       - name: Test (pytest)
         run: uv run pytest
+        env:
+          ECAC_REQUIRE_CONFINEMENT: "1"
 
       # ---- prove kernel confinement is actually in effect (P5-1) ----
       # The confinement tests skip on hosts without Landlock, which would let a

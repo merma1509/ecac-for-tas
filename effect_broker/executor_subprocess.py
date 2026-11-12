@@ -406,6 +406,14 @@ def _interpreter_roots() -> tuple[str, ...]:
 #: key live there, and a read-confinement that re-opens `~` protects nothing.
 #: `ECAC_LANDLOCK_READ_ROOTS` lets a deployment add its own data roots (colon-
 #: separated), which is how a real workload gets its inputs.
+#:
+#: `/etc` is deliberately NOT here either. Landlock grants a subtree, so
+#: re-opening `/etc` to obtain `hosts` and `resolv.conf` also re-opened
+#: `shadow` and `sudoers`. Measured in a container with ABI 4, the confined
+#: process read `/etc/shadow` while the status reported `restricted-open` — a
+#: confinement claim that hid the one file it most obviously should deny. The
+#: handful of files that actually need reading are listed in
+#: `_LANDLOCK_READ_FILES` and granted individually.
 _LANDLOCK_READ_DIRS: tuple[str, ...] = tuple(
     os.environ.get("ECAC_LANDLOCK_READ_ROOTS", "").split(":")
 ) if os.environ.get("ECAC_LANDLOCK_READ_ROOTS") else (
@@ -414,11 +422,31 @@ _LANDLOCK_READ_DIRS: tuple[str, ...] = tuple(
     "/lib64",
     "/bin",
     "/sbin",
-    "/etc",
     "/dev",
     "/proc",
     "/sys",
 ) + _interpreter_roots()
+
+#: Individual files re-opened for reading, as an alternative to whole trees.
+#:
+#: These are the `/etc` entries a Python process plausibly needs: resolver
+#: configuration and host lookup. `passwd`/`group` carry no secrets and are
+#: needed for `os.getlogin`-style calls; they are listed explicitly rather than
+#: obtained by opening the directory that also holds `shadow`.
+#:
+#: A missing file is skipped, not fatal — a caller that needs one will see
+#: EACCES, which is the fail-closed direction.
+_LANDLOCK_READ_FILES: tuple[str, ...] = (
+    "/etc/hosts",
+    "/etc/host.conf",
+    "/etc/resolv.conf",
+    "/etc/nsswitch.conf",
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/localtime",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/ca-certificates.conf",
+)
 
 
 def _kernel_landlock_abi() -> int:
@@ -572,6 +600,32 @@ def _apply_landlock_sandbox() -> bool:
                     continue
             finally:
                 os.close(root_fd)
+
+        # Individual files, so that `/etc` need not be re-opened wholesale.
+        # A PATH_BENEATH rule on a regular file applies to that file alone.
+        for read_file in _LANDLOCK_READ_FILES:
+            if not os.path.isfile(read_file):
+                continue
+            try:
+                file_fd = _real_os_open(read_file, o_path | os.O_CLOEXEC)
+            except OSError:
+                continue
+            try:
+                file_attr = _PathBeneathAttr(
+                    allowed_access=_LANDLOCK_ACCESS_FS_READ_FILE,
+                    parent_fd=file_fd,
+                )
+                # Not fatal if refused: it only leaves that file unreadable,
+                # which is the fail-closed direction, same as a refused root.
+                libc.syscall(
+                    _SYS_LANDLOCK_ADD_RULE,
+                    ruleset_fd,
+                    _LANDLOCK_RULE_PATH_BENEATH,
+                    ctypes.byref(file_attr),
+                    0,
+                )
+            finally:
+                os.close(file_fd)
 
         # restrict_self requires PR_SET_NO_NEW_PRIVS first; without it the call
         # returns EPERM and no restriction is applied. This was the second
