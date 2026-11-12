@@ -25,7 +25,6 @@ None of this is visible from the number itself, which is why it is pinned here.
 from __future__ import annotations
 
 import ast
-import subprocess
 from pathlib import Path
 
 from effect_broker.metrics import _TCB_FILES, _count_code_lines, tcb_breakdown, tcb_size
@@ -47,24 +46,17 @@ def _imports(rel_path: str) -> set[str]:
 
 
 class TestTheDefinitionIsTracked:
-    def test_the_registry_is_tracked_by_git(self) -> None:
+    def test_the_registry_is_tracked_by_git(self, git_tracks) -> None:
         """`docs/` is ignored, so a definition living only there is not in CI.
 
         This is the defect that let the file set drift unobserved: the test that
         compared the metric against the document skipped, and green meant
         nothing.
         """
-        result = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", "effect_broker/tcb.py"],
-            cwd=_REPO_ROOT,
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, (
+        assert git_tracks("effect_broker/tcb.py"), (
             "effect_broker/tcb.py is not tracked by git, so CI cannot see the TCB "
-            f"definition. git said: {result.stderr.strip()}"
+            "definition and could not notice it changing"
         )
-
     def test_the_file_set_comes_from_the_registry(self) -> None:
         """`metrics._TCB_FILES` must not be a second, independently edited copy."""
         assert _TCB_FILES == TCB_FILES

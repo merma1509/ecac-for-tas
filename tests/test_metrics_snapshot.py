@@ -257,19 +257,11 @@ class TestTheBaselineIsUsableInCI:
     def test_the_baseline_exists(self) -> None:
         assert self.BASELINE.exists(), f"{self.BASELINE} is missing"
 
-    def test_the_baseline_is_tracked_by_git(self) -> None:
-        import subprocess
-
+    def test_the_baseline_is_tracked_by_git(self, git_tracks) -> None:
         rel = self.BASELINE.relative_to(Path(__file__).resolve().parent.parent)
-        result = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", str(rel)],
-            cwd=Path(__file__).resolve().parent.parent,
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, (
+        assert git_tracks(str(rel)), (
             f"{rel} is not tracked by git, so a CI checkout would not have it and "
-            f"the regression gate could not run. git said: {result.stderr.strip()}"
+            f"the regression gate could not run"
         )
 
     def test_the_baseline_is_a_complete_snapshot(self) -> None:

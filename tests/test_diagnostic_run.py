@@ -11,6 +11,7 @@ import json
 import subprocess
 import sys
 
+from effect_broker import metrics as metrics_module
 from effect_broker.metrics import diagnostic_report, trusted_boundary
 
 SEVEN_KEYS = (
@@ -96,3 +97,72 @@ class TestOutputForms:
         assert proc.returncode == 0, proc.stderr
         assert "Trusted boundary" in proc.stdout
         assert "UNKNOWN outcomes" in proc.stdout
+        assert "Complete mediation" in proc.stdout
+
+
+class TestMediationIsThreeValued:
+    """`evaluated=false` must not be readable as "mediation is broken".
+
+    Asks for this distinction explicitly, and it is the same one
+    `ExperimentResult` enforces: a verdict requires an evaluation, and an
+    unevaluated run has *no* verdict rather than a negative one. Collapsing
+    them is how the original suite reported completion it never measured.
+    """
+
+    def test_report_carries_a_mediation_block(self) -> None:
+        med = diagnostic_report()["mediation"]
+        assert set(med) == {"evaluated", "complete", "failures", "note"}
+
+    def test_a_running_check_reports_evaluated_not_none(self) -> None:
+        med = diagnostic_report()["mediation"]
+        assert med["evaluated"] is True
+        assert isinstance(med["complete"], bool)
+
+    def test_a_broken_check_is_not_evaluated(self) -> None:
+        """A check that raises has produced no verdict, so `complete` is None."""
+
+        class Broken:
+            def verify_complete_mediation(self):
+                raise RuntimeError("ledger unavailable")
+
+        metrics_module._SCENARIO_BROKERS.clear()
+        metrics_module._SCENARIO_BROKERS.append(Broken())
+        try:
+            med = metrics_module._mediation_status()
+        finally:
+            metrics_module._SCENARIO_BROKERS.clear()
+
+        assert med["evaluated"] is False
+        assert med["complete"] is None, (
+            "an unevaluated run claimed a verdict; False here would read as "
+            "'checked and found broken'"
+        )
+        assert any("verification_error" in f for f in med["failures"])
+
+    def test_a_hole_is_reported_as_false_not_none(self) -> None:
+        """Evaluated-and-failed is `False`; the two states must stay distinct."""
+
+        class Hole:
+            def verify_complete_mediation(self):
+                return ["authorized_not_observed:n-1"]
+
+        metrics_module._SCENARIO_BROKERS.clear()
+        metrics_module._SCENARIO_BROKERS.append(Hole())
+        try:
+            med = metrics_module._mediation_status()
+        finally:
+            metrics_module._SCENARIO_BROKERS.clear()
+
+        assert med["evaluated"] is True
+        assert med["complete"] is False
+        assert med["failures"] == ["authorized_not_observed:n-1"]
+
+    def test_the_stale_broker_list_is_cleared_per_run(self) -> None:
+        """A broker from a previous run must not answer for this one."""
+        diagnostic_report()
+        first = len(metrics_module._SCENARIO_BROKERS)
+        diagnostic_report()
+        assert len(metrics_module._SCENARIO_BROKERS) == first, (
+            "the scenario-broker list grew across runs, so mediation could be "
+            "asked of a broker that no longer belongs to the report"
+        )

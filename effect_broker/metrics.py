@@ -27,7 +27,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from effect_broker.lattice import Confidentiality, Integrity
 from effect_broker.model import (
@@ -552,6 +552,13 @@ def trusted_boundary() -> list[str]:
     ]
 
 
+#: The brokers the last `diagnostic_report()` committed against. Scoped to this
+#: module rather than passed around because `diagnostic_report` is the only
+#: producer and its callers want a dict, not a handle. Cleared at the top of each
+#: run so a stale broker cannot answer for a scenario that no longer runs.
+_SCENARIO_BROKERS: list[Any] = []
+
+
 def diagnostic_report() -> dict[str, object]:
     """The seven metrics from one run of the labeled scenario set."""
     import warnings
@@ -565,8 +572,14 @@ def diagnostic_report() -> dict[str, object]:
     approvals_expired_unused = 0
     false_denials: dict[str, int] = {}
 
+    # Kept so mediation can be asked of the brokers these effects were actually
+    # committed against. Inferring it from the block counts instead is the
+    # "denied implies complete" mistake this repository removed elsewhere.
+    _SCENARIO_BROKERS.clear()
+
     for sc in _build_scenarios():
         broker = build()
+        _SCENARIO_BROKERS.append(broker)
         task = _task(sc.ceiling_scope)
         before = len(broker.capabilities)
         effect = sc.builder(broker, task)
@@ -639,10 +652,55 @@ def diagnostic_report() -> dict[str, object]:
         },
         # 7. Trusted boundary: the reviewed list.
         "trusted_boundary": trusted_boundary(),
+        # 8. Whether complete mediation was actually EVALUATED, as distinct
+        # from evaluated-and-failed. Part E asks for this separately because a
+        # bare `false` reads as "we checked and it is broken", when the common
+        # case is "nothing asked the ledger, so there is no verdict". Collapsing
+        # the two is how the original suite reported completion it had never
+        # measured.
+        "mediation": _mediation_status(),
         # Context from the regression report.
         "attacks": m.attacks,
         "attacks_blocked": m.attacks_blocked,
         "false_negatives": m.attacks_missed,
+    }
+
+
+def _mediation_status() -> dict[str, object]:
+    """Three-valued mediation status: evaluated-pass, evaluated-fail, or neither.
+
+    `complete` is deliberately `None` rather than `False` when nothing was
+    evaluated — the same distinction `ExperimentResult` enforces with
+    `mediation_evaluated`, applied to this report so the two cannot drift.
+
+    The check is run by asking the brokers the scenarios were committed
+    against, not by inferring completion from the fact that blocks happened.
+    """
+    failures: list[str] = []
+    evaluated = False
+    for broker in _SCENARIO_BROKERS:
+        try:
+            failures.extend(broker.verify_complete_mediation())
+            evaluated = True
+        except Exception as exc:  # noqa: BLE001 - a broken check is not a pass
+            failures.append(f"verification_error:{type(exc).__name__}:{exc}")
+            evaluated = False
+
+    if not evaluated:
+        return {
+            "evaluated": False,
+            "complete": None,
+            "failures": failures,
+            "note": (
+                "the ledger check could not run, so complete mediation is not "
+                "claimed either way; this is not the same as 'false'"
+            ),
+        }
+    return {
+        "evaluated": True,
+        "complete": len(failures) == 0,
+        "failures": failures,
+        "note": None,
     }
 
 
@@ -698,6 +756,23 @@ def print_diagnostic_report() -> None:
     assert isinstance(tb, list)
     for component in tb:
         print(f"   - {component}")
+    med = r["mediation"]
+    assert isinstance(med, dict)
+    if not med["evaluated"]:
+        # Printed as its own state, with the note, because "not evaluated" and
+        # "evaluated and failed" lead to different actions and a reader who sees
+        # `False` for both would chase the wrong one.
+        print(
+            "8. Complete mediation:     NOT EVALUATED "
+            "(not the same as False — nothing asked the ledger)"
+        )
+        for failure in med["failures"]:
+            print(f"   ! {failure}")
+    else:
+        verdict = "pass" if med["complete"] else "FAIL"
+        print(f"8. Complete mediation:     evaluated={verdict}")
+        for failure in med["failures"]:
+            print(f"   ! {failure}")
     print("=" * 64)
     print(
         f"Context: attacks={r['attacks']} blocked={r['attacks_blocked']} "
