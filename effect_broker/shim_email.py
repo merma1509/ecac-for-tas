@@ -17,11 +17,12 @@ from __future__ import annotations
 import email.message
 import imaplib
 import smtplib
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from .lattice import Confidentiality, Integrity
-from .model import Data, Effect, EffectTarget
+from .model import Data, Effect, EffectEvidence, EffectTarget
 
 if TYPE_CHECKING:
     from .broker import EffectBroker
@@ -109,6 +110,55 @@ class RealEmailShim:
         """Canonicalize an email address: lowercase, strip whitespace."""
         return addr.strip().lower()
 
+    def _evidence_committed(
+        self,
+        nonce: str,
+        op_type: str,
+        started: float,
+        observed: frozenset[str],
+        transport_response: str,
+    ) -> EffectEvidence:
+        """Evidence, taken from the transport, that the delivery landed."""
+        return EffectEvidence(
+            effect_id=nonce,
+            outcome="committed",
+            source=f"shim_email.{op_type}.transport",
+            window=(started, time.monotonic()),
+            observed_targets=observed,
+            transport_response=transport_response,
+        )
+
+    def _evidence_transport_failed(
+        self,
+        nonce: str,
+        op_type: str,
+        started: float,
+        error: BaseException,
+        *,
+        reason: str | None = None,
+    ) -> EffectEvidence:
+        """Evidence for a transport fault after ALLOW.
+
+        `unknown`, never `committed` and never `denied`: an SMTP failure does
+        not establish that the message stayed put (a late DATA failure may
+        still have delivered), and the gate allowed it, so it is not a denial.
+        The error name lives in `source` rather than `transport_response`,
+        because it is not a reply from the transport.
+
+        `reason` overrides the error-derived source label for cases that are
+        not exceptions (e.g. a reply that accepted nothing), so the recorded
+        source never claims a fault that did not happen.
+        """
+        label = reason or f"transport_error:{type(error).__name__}"
+        return EffectEvidence(
+            effect_id=nonce,
+            outcome="unknown",
+            source=f"shim_email.{op_type}.{label}",
+            window=(started, time.monotonic()),
+            observed_targets=frozenset(),
+            transport_response=None,
+        )
+
     def _derive_domain(self, addr: str) -> str:
         """Derive the domain part of an email address."""
         canon = self._canonical_email(addr)
@@ -146,7 +196,13 @@ class RealEmailShim:
     def _build_message(
         self, sender: str, recipient: str, body: str, **extra: str
     ) -> tuple[bytes, str, int]:
-        """Build RFC 822 message. Returns (raw_bytes, subject, body_size)."""
+        """Build RFC 822 message. Returns (raw_bytes, subject, body_size).
+
+        `body_size` is diagnostic only. It is not a content binding: it changes
+        with date headers and MTA wrapping, and equal lengths say nothing about
+        equal content. The approval binds `body` itself, which `send()` puts on
+        the effect (B4).
+        """
         msg = email.message.EmailMessage()
         msg["From"] = sender
         msg["To"] = recipient
@@ -157,8 +213,14 @@ class RealEmailShim:
         raw = msg.as_bytes()
         return raw, msg["Subject"], len(raw)
 
-    def _smtp_send(self, sender: str, recipients: frozenset[str], raw_message: bytes) -> list[str]:
-        """Send raw bytes via real SMTP. Returns list of recipients accepted by MTA.
+    def _smtp_send(
+        self, sender: str, recipients: frozenset[str], raw_message: bytes
+    ) -> tuple[list[str], str]:
+        """Send raw bytes via real SMTP.
+
+        Returns the recipients the MTA accepted and the transport's own reply,
+        so the caller can record evidence that is a real answer rather than a
+        restatement of what we asked for.
 
         In multi-process mode (ipc_client set), routes through subprocess IPC.
         Otherwise uses direct smtplib calls (same-process mode).
@@ -172,7 +234,10 @@ class RealEmailShim:
                     raw_message.decode("utf-8", errors="replace"),
                 )
                 delivered: list[str] = result.get("delivered", [])
-                return delivered
+                reply = str(result.get("reply", ""))
+                if not reply:
+                    reply = f"accepted={len(delivered)}"
+                return delivered, reply
             except RuntimeError as ex:
                 raise SMTPError(f"SMTP IPC error: {ex}") from ex
 
@@ -191,11 +256,16 @@ class RealEmailShim:
                 server.mail(sender)
                 # RCPT TO for each — this is where BCC detection happens
                 rcpt_results = self._smtp_rcpt_to(server, recipients)
-                # DATA with full message
-                server.data(raw_message)
+                code, reply_text = server.data(raw_message)
+                # smtplib hands back bytes; decode before it reaches a log line.
+                reply_str = (
+                    reply_text.decode("utf-8", errors="replace")
+                    if isinstance(reply_text, bytes)
+                    else (reply_text or "")
+                )
                 # Collect accepted recipients (code 250 = OK)
-                delivered = [r for r, (code, _) in rcpt_results.items() if code == 250]
-                return delivered
+                delivered = [r for r, (c, _) in rcpt_results.items() if c == 250]
+                return delivered, f"data={code} {reply_str}".strip()
             finally:
                 server.quit()
         except smtplib.SMTPException as ex:
@@ -362,7 +432,9 @@ class RealEmailShim:
         extras_canon = frozenset(self._canonical_email(a) for a in extra_recipients.values())
         all_declared = frozenset({canon_recipient}) | extras_canon
 
-        # Build message once (for body_size / content analysis)
+        # Build message once (for body_size / content analysis).
+        # `body` is bound separately below — the framed message is not, because
+        # its bytes change with the date header and MTA wrapping (B4).
         raw_msg, subject, body_size = self._build_message(
             sender, canon_recipient, body, **extra_recipients
         )
@@ -404,15 +476,30 @@ class RealEmailShim:
 
         nonce = self._resolve_capability_nonce("send", canon_recipient, additional)
 
+        # Whose credentials carry this message. The SMTP login if the shim has
+        # one, otherwise the envelope sender; it is bound by the canonical
+        # request so an approval cannot be replayed under another identity.
+        acting_account = self.smtp_user or sender
+
         effect = Effect(
             etype="send",
             target=f"mailto:{canon_recipient}",
             metadata={
                 "extra_resources": list(additional),
                 "subject": subject,
+                # The body itself (B4). Without it the approval binds
+                # sha256("") and authorizes any payload at all. Bound as text,
+                # never as the framed RFC 822 message, so the digest is stable
+                # across date headers and MTA wrapping.
+                "body": body,
                 "body_size": body_size,
-                "bcc_detected": frozenset(),  # always empty at commit time
-                "mta_actual_recipients": list(actual_accepted),
+                # JSON-safe containers: this metadata crosses IPC in multi-process
+                # mode, where a frozenset is not serializable and aborts the commit.
+                "bcc_detected": [],
+                "mta_actual_recipients": sorted(actual_accepted),
+                # Identity the approval must bind to the actual recipient(s).
+                "sender": sender,
+                "acting_account": acting_account,
             },
             provenance=(
                 Data("shim-send", conf, integ),
@@ -435,7 +522,13 @@ class RealEmailShim:
                 f"[{self.tool_name}] task_id '{self.task_id}' not registered. "
                 f"Register task first with broker.register_task()."
             )
-        commit = Commit(effect=effect, task=task, tool_name=self.tool_name)
+        commit = Commit(
+            effect=effect,
+            task=task,
+            tool_name=self.tool_name,
+            # Real SMTP/IMAP below: the shim measures the transport, not the store.
+            store_is_external_state=False,
+        )
         allow, evidence = self.broker.executor.execute(commit)
 
         op = EmailOp(
@@ -460,15 +553,44 @@ class RealEmailShim:
             )
 
         # Phase 3 (ALLOW): real SMTP delivery via DATA.
-        #
-        # IN_FLIGHT marker, written BEFORE the network call. If the process dies
-        # between here and the outcome record, the ledger sees "dispatched, never
-        # observed" and reports OUTCOME_UNKNOWN instead of an ambiguous gap. The
-        # marker asserts only that we were about to try -- anyone can assert that
-        # -- so it can never on its own produce CONFIRMED_COMMITTED.
         self.broker.ledger.record_dispatched(self.task_id, nonce, source="shim_email.dispatch")
+        io_started = time.monotonic()
         try:
-            delivered = self._smtp_send(sender, actual_accepted, raw_msg)
+            delivered, transport_reply = self._smtp_send(
+                sender, actual_accepted, raw_msg
+            )
+            if not delivered:
+                self.broker.ledger.record_evidence(
+                    self.task_id,
+                    nonce,
+                    self._evidence_transport_failed(
+                        nonce,
+                        "send",
+                        io_started,
+                        SMTPError(f"no accepted recipient; reply={transport_reply}"),
+                        reason="no_accepted_recipient",
+                    ),
+                )
+                raise PostAuthorizationFailure(
+                    f"[{self.tool_name}] SMTP accepted the message but reported "
+                    f"no delivered recipient (reply={transport_reply}). Outcome "
+                    f"is UNKNOWN: the message may still have been queued.",
+                    effect_id=nonce,
+                )
+            # Evidence BEFORE the bookkeeping: without it the ledger calls this
+            # send `committed` on the strength of `executor.apply` alone, which
+            # is the executor asserting its own success.
+            self.broker.ledger.record_evidence(
+                self.task_id,
+                nonce,
+                self._evidence_committed(
+                    nonce,
+                    "send",
+                    io_started,
+                    observed=frozenset(delivered),
+                    transport_response=transport_reply,
+                ),
+            )
             op = EmailOp(
                 operation="send",
                 sender=sender,
@@ -484,11 +606,11 @@ class RealEmailShim:
             )
             self.ops.append(op)
         except SMTPError as ex:
-            # The gate authorized; the transport then failed. That is not a
-            # security event -- it is an unknown outcome. Raising
-            # EmailSecurityError here conflated "policy blocked you" with
-            # "the network was down", which is exactly the mislabelling that
-            # made auth>0/obs=0 unreadable in the ledger.
+            self.broker.ledger.record_evidence(
+                self.task_id,
+                nonce,
+                self._evidence_transport_failed(nonce, "send", io_started, ex),
+            )
             raise PostAuthorizationFailure(
                 f"[{self.tool_name}] SMTP delivery failed after ALLOW: {ex}. "
                 f"Outcome is UNKNOWN (the message may or may not have been "
@@ -534,7 +656,13 @@ class RealEmailShim:
                 f"[{self.tool_name}] task_id '{self.task_id}' not registered. "
                 f"Register task first with broker.register_task()."
             )
-        commit = Commit(effect=effect, task=task, tool_name=self.tool_name)
+        commit = Commit(
+            effect=effect,
+            task=task,
+            tool_name=self.tool_name,
+            # Real SMTP/IMAP below: the shim measures the transport, not the store.
+            store_is_external_state=False,
+        )
         allow, evidence = self.broker.executor.execute(commit)
 
         if not allow:
@@ -544,10 +672,35 @@ class RealEmailShim:
         # Phase 2 (ALLOW): real IMAP connection
         # In multi-process mode, routes through subprocess IPC.
         # In same-process mode, uses direct imaplib calls.
+        io_started = time.monotonic()
+        read_nonce = effect.capability_nonce or ""
         try:
             messages, total_size = self._imap_read_inbox(user)
         except SMTPError as ex:
+            self.broker.ledger.record_evidence(
+                self.task_id,
+                read_nonce,
+                self._evidence_transport_failed(
+                    read_nonce, "read_inbox", io_started, ex
+                ),
+            )
             raise EmailSecurityError(f"[{self.tool_name}] read_inbox failed: {ex}") from ex
+
+        # Evidence from what IMAP returned, not from the request: the target is
+        # the inbox that was actually selected and the count is what SEARCH
+        # listed. Without it the ledger would call this read `committed` on the
+        # strength of `executor.apply` alone.
+        self.broker.ledger.record_evidence(
+            self.task_id,
+            read_nonce,
+            self._evidence_committed(
+                read_nonce,
+                "read_inbox",
+                io_started,
+                observed=frozenset({effect.target}),
+                transport_response=f"messages={len(messages)} bytes={total_size}",
+            ),
+        )
 
         # Derive confidentiality from content
         if messages:

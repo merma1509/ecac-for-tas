@@ -41,29 +41,57 @@ class CordonBroker:
         self.proposals[nonce] = proposal
 
     def commit_effect(self, effect: Effect, task_id: str = "default") -> tuple[bool, dict]:
-        """
-        Cordon-style commit: revalidate proposal at commit time.
+        """Revalidate the proposal at commit time.
 
-        WEAKNESSES:
-        - Proposals can be replayed (nonce not reserved atomically)
-        - No session taint propagation
-        - No provenance checking
-        - Content hash not enforced
-        """
-        cap = self.proposals.get(effect.capability_nonce)
+        Cordon's mechanism is commit-time revalidation: authority is proposed
+        ahead of time, and at commit the broker re-checks that the proposal is
+        still valid (not expired, target still matches). This implementation
+        enforces exactly that, and nothing more:
 
-        if cap is None:
-            return True, {  # Allow by default - no strict check
+        - **Expiry is enforced** (T9 is a *stale* approval — Cordon catches it).
+        - **Target match is enforced**: a proposal for one target cannot
+          authorize a different one.
+        - **No session taint:** T1 passes.
+        - **No provenance/IFC:** T7 passes.
+        - **No recipient completeness:** T3 passes.
+        - **Replay is NOT prevented**: the nonce is recorded after commit, so a
+          second use within the process sees it; a nonce the broker never saw
+          (T4 arrives with an unreserved nonce) is allowed. Documented gap.
+        """
+        import time as _time
+
+        proposal = self.proposals.get(effect.capability_nonce)
+
+        if proposal is None:
+            # Cordon revalidates proposals it holds. With no proposal there is
+            # nothing to revalidate; it does not deny. Documented gap (T4).
+            return True, {
                 "blocker": None,
-                "reason": "Cordon: no proposal, allow",
+                "reason": "Cordon: no proposal to revalidate, allow",
                 "policy": "Cordon",
             }
 
-        # Weak check - proposal exists but no strict validation
-        # T4: replay not properly blocked (nonce added after commit, not before)
+        if proposal.expires_at < _time.time():
+            return False, {
+                "blocker": "Stale",
+                "reason": (
+                    f"Cordon: proposal {effect.capability_nonce!r} expired at {proposal.expires_at}"
+                ),
+                "policy": "Cordon",
+            }
+
+        if proposal.target != effect.target or proposal.etype != effect.etype:
+            return False, {
+                "blocker": "Auth",
+                "reason": (
+                    f"Cordon: proposal is for ({proposal.etype}, {proposal.target}), "
+                    f"effect is ({effect.etype}, {effect.target})"
+                ),
+                "policy": "Cordon",
+            }
 
         return True, {
             "blocker": None,
-            "reason": "Cordon: proposal exists",
+            "reason": "Cordon: proposal revalidated",
             "policy": "Cordon",
         }

@@ -317,8 +317,20 @@ class TestRealFileShimOSErrorHandling:
         with pytest.raises(OSError):
             shim.read(path)
 
+    @pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root ignores directory permission bits, so no OSError can occur; "
+        "this exercises the OS rejecting a write, not the gate",
+    )
     def test_write_to_readonly_location(self, cap_for_tool) -> None:
-        """Write to a readonly location raises OSError post-ALLOW (not SecurityError)."""
+        """Write to a readonly location raises OSError post-ALLOW (not SecurityError).
+
+        The premise is that the OS refuses. Under uid 0 it does not — a root
+        process writes into a mode-0o444 directory happily — so this test failed
+        in a container for a reason that has nothing to do with the code under
+        test. Skipping from a precondition failure is correct here; making the
+        test "pass" some other way would stop it testing the thing it names.
+        """
         b, tmpdir, task = cap_for_tool
 
         # Create a directory inside scope that is readonly at the OS level

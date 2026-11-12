@@ -10,6 +10,7 @@ live in the model rather than in the executor
 from __future__ import annotations
 
 import pytest
+from conftest import commit_evidence
 
 from effect_broker.model import (
     ALLOWED_TRANSITIONS,
@@ -259,6 +260,7 @@ class TestCrashBetweenDispatchAndRecord:
         led.record_authorization("t", "n", frozenset({"x"}), source="executor.execute")
         led.record_dispatched("t", "n")
         led.record_observation("t", "n", frozenset({"x"}), source="executor.apply")
+        led.record_evidence("t", "n", commit_evidence("n", {"x"}))
         assert led.verify("t", "n") is LedgerVerdict.CONFIRMED_COMMITTED
 
     def test_dispatch_does_not_rescue_an_unauthorized_effect(self) -> None:

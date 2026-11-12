@@ -51,6 +51,7 @@ if TYPE_CHECKING:
         LedgerVerdict,
         UnknownLedgerResult,
     )
+    from .model import EffectEvidence
 
 
 class LedgerRequest(Enum):
@@ -58,6 +59,8 @@ class LedgerRequest(Enum):
 
     RECORD_AUTHORIZATION = auto()
     RECORD_OBSERVATION = auto()
+    RECORD_EVIDENCE = auto()
+    EVIDENCE_FOR = auto()
     VERIFY = auto()
     VERIFY_ALL = auto()
     GET_ENTRIES = auto()
@@ -102,6 +105,18 @@ class LedgerBackend(ABC):
         source: str,
     ) -> None:
         """Record an observation event (effect was applied or blocked)."""
+
+    def record_evidence(self, task_id: str, nonce: str, evidence: EffectEvidence) -> None:
+        """Attach executor-produced evidence to an effect.
+
+        Not abstract: a backend may not support evidence yet, and verify() then
+        correctly reports `committed_without_evidence` rather than a commit.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not record evidence")
+
+    def evidence_for(self, task_id: str, nonce: str) -> EffectEvidence | None:
+        """The evidence backing an effect, or None when unsupported/unrecorded."""
+        return None
 
     @abstractmethod
     def verify(self, task_id: str, nonce: str) -> LedgerVerdict | UnknownLedgerResult:
@@ -162,6 +177,12 @@ class LocalLedgerBackend(LedgerBackend):
     ) -> None:
         self._ledger.record_observation(task_id, nonce, observed_targets, source)
 
+    def record_evidence(self, task_id: str, nonce: str, evidence: EffectEvidence) -> None:
+        self._ledger.record_evidence(task_id, nonce, evidence)
+
+    def evidence_for(self, task_id: str, nonce: str) -> EffectEvidence | None:
+        return self._ledger.evidence_for(task_id, nonce)
+
     def verify(self, task_id: str, nonce: str) -> LedgerVerdict | UnknownLedgerResult:
         return self._ledger.verify(task_id, nonce)
 
@@ -190,6 +211,36 @@ class LocalLedgerBackend(LedgerBackend):
 
 
 # ---- IPC wire format ----
+def _evidence_to_dict(evidence: EffectEvidence) -> dict[str, Any]:
+    """Serialize evidence for the socket. frozenset is not JSON-encodable."""
+    return {
+        "effect_id": evidence.effect_id,
+        "outcome": evidence.outcome,
+        "source": evidence.source,
+        "window": list(evidence.window),
+        "observed_bytes": evidence.observed_bytes,
+        "observed_targets": (
+            sorted(evidence.observed_targets) if evidence.observed_targets is not None else None
+        ),
+        "transport_response": evidence.transport_response,
+    }
+
+
+def _evidence_from_dict(raw: dict[str, Any]) -> EffectEvidence:
+    from .model import EffectEvidence
+
+    targets = raw.get("observed_targets")
+    return EffectEvidence(
+        effect_id=raw["effect_id"],
+        outcome=raw["outcome"],
+        source=raw["source"],
+        window=(raw["window"][0], raw["window"][1]),
+        observed_bytes=raw.get("observed_bytes"),
+        observed_targets=frozenset(targets) if targets is not None else None,
+        transport_response=raw.get("transport_response"),
+    )
+
+
 def _serialize_request(kind: LedgerRequest, payload: dict[str, Any]) -> bytes:
     # Length-prefixed format: "<length>\n<json>" — matches LedgerProcessServer._handle
     body = json.dumps({"kind": kind.name, "payload": payload}).encode()
@@ -281,6 +332,16 @@ class ProcessLedgerClient(LedgerBackend):
                 "source": source,
             },
         )
+
+    def record_evidence(self, task_id: str, nonce: str, evidence: EffectEvidence) -> None:
+        self._send(
+            LedgerRequest.RECORD_EVIDENCE,
+            {"task_id": task_id, "nonce": nonce, "evidence": _evidence_to_dict(evidence)},
+        )
+
+    def evidence_for(self, task_id: str, nonce: str) -> EffectEvidence | None:
+        raw = self._send(LedgerRequest.EVIDENCE_FOR, {"task_id": task_id, "nonce": nonce})
+        return _evidence_from_dict(raw) if raw else None
 
     def verify(self, task_id: str, nonce: str) -> LedgerVerdict | UnknownLedgerResult:
         from .ledger import LedgerVerdict, UnknownLedgerResult
@@ -508,6 +569,18 @@ class LedgerProcessServer:
                         payload["task_id"], payload["nonce"], obs, payload["source"]
                     )
                     return {"ok": True, "result": True}
+
+                case LedgerRequest.RECORD_EVIDENCE:
+                    ledger.record_evidence(
+                        payload["task_id"],
+                        payload["nonce"],
+                        _evidence_from_dict(payload["evidence"]),
+                    )
+                    return {"ok": True, "result": True}
+
+                case LedgerRequest.EVIDENCE_FOR:
+                    ev = ledger.evidence_for(payload["task_id"], payload["nonce"])
+                    return {"ok": True, "result": _evidence_to_dict(ev) if ev else None}
 
                 case LedgerRequest.VERIFY:
                     result = ledger.verify(payload["task_id"], payload["nonce"])

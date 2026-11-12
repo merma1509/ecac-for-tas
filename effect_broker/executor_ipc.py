@@ -29,11 +29,13 @@ The executor process deserializes, applies, returns observed_targets as a frozen
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
 import os
 import secrets
+import tempfile
 import threading
 import time
 from enum import Enum, auto
@@ -115,18 +117,38 @@ def dict_to_label_exception(d: dict[str, Any]) -> Any:
     )
 
 
+def _json_safe(value: Any) -> Any:
+    """Coerce a metadata value into something `json.dumps` can encode.
+
+    Metadata is assembled by shims and by tools, so it can hold sets, tuples or
+    bytes. `_sign_payload` json-dumps the whole payload: an unencodable value
+    raises there — after the gate has already authorized, aborting the commit
+    with a `TypeError` that looks like a crash rather than a denial. Normalizing
+    at serialization turns that into a deterministic wire format instead.
+    """
+    if isinstance(value, frozenset | set | tuple | list):
+        if isinstance(value, frozenset | set):
+            return [_json_safe(item) for item in sorted(value, key=repr)]
+        return [_json_safe(item) for item in value]
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    return value
+
+
 def effect_to_dict(effect: Any) -> dict[str, Any]:
     """Serialize an Effect to a plain dict for IPC."""
-    import base64
+    metadata = {k: _json_safe(v) for k, v in dict(effect.metadata).items()}
 
-    # Handle metadata with bytes content - convert to base64 for JSON safety
-    metadata = dict(effect.metadata)
-    if "content" in metadata and isinstance(metadata["content"], bytes):
-        metadata["content_b64"] = base64.b64encode(metadata["content"]).decode()
-        del metadata["content"]
-    elif "content" not in metadata and "content_b64" not in metadata:
-        # Ensure metadata is JSON-safe
-        pass  # Already handled
+    # Raw bytes travel as `content_b64`, which is the field the subprocess's
+    # hash check looks for. Encoding them in place as a base64 *string* in
+    # `content` would make the two sides hash different types and never agree
+    # (B3), so the rename is load-bearing, not cosmetic.
+    raw_content = effect.metadata.get("content")
+    if isinstance(raw_content, bytes):
+        metadata["content_b64"] = base64.b64encode(raw_content).decode()
+        metadata.pop("content", None)
 
     return {
         "etype": effect.etype,
@@ -180,9 +202,7 @@ def dict_to_effect(d: dict[str, Any]) -> Any:
         for p in d["provenance"]
     )
 
-    label_exceptions = tuple(
-        dict_to_label_exception(le) for le in d.get("label_exceptions", [])
-    )
+    label_exceptions = tuple(dict_to_label_exception(le) for le in d.get("label_exceptions", []))
 
     known_targets = None
     if d.get("known_targets"):
@@ -295,13 +315,52 @@ def send_and_receive(
 # ---- Executor IPC Payload Integrity (HMAC-SHA256 signing) ----
 # Shared secret key for HMAC signing. Both broker and subprocess must use
 # the same key. Key is stored in a file with restricted permissions.
+def _ipc_key_dir() -> Path:
+    """Directory holding the IPC signing key.
+
+    `Path.home()` is not a safe assumption: in a bare container running as a
+    uid with no home directory it resolves to `/`, and creating `/.ecac` fails
+    with EACCES — the executor then cannot start at all. The directory is
+    resolved once and passed to the subprocess through the environment, so
+    broker and executor always agree on the same key file.
+    """
+    configured = os.environ.get("ECAC_IPC_KEY_DIR")
+    if configured:
+        return Path(configured)
+
+    candidates = [Path.home() / ".ecac"]
+    try:
+        candidates.append(Path(tempfile.gettempdir()) / f".ecac-{os.getuid()}")
+    except OSError:
+        pass
+
+    for candidate in candidates:
+        # An existing key directory is usable by definition — the key is read,
+        # not written, by the confined side.
+        if (candidate / "ipc_secret.key").exists():
+            os.environ["ECAC_IPC_KEY_DIR"] = str(candidate)
+            return candidate
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        if os.access(candidate, os.W_OK):
+            os.environ["ECAC_IPC_KEY_DIR"] = str(candidate)
+            return candidate
+
+    raise RuntimeError(
+        "cannot locate a writable directory for the IPC signing key "
+        f"(tried {[str(c) for c in candidates]}); set ECAC_IPC_KEY_DIR"
+    )
+
+
 def _get_ipc_secret_key() -> bytes:
     """Get or create the IPC signing key.
 
-    Key is stored at: ~/.ecac/ipc_secret.key
-    File permissions: 0o600 (owner read/write only)
+    Key is stored in `_ipc_key_dir()` (normally `~/.ecac/ipc_secret.key`).
+    File permissions: 0o600 (owner read/write only).
     """
-    key_dir = Path.home() / ".ecac"
+    key_dir = _ipc_key_dir()
     key_file = key_dir / "ipc_secret.key"
 
     if key_file.exists():
@@ -310,11 +369,20 @@ def _get_ipc_secret_key() -> bytes:
         if len(key) >= 32:
             return key[:32]  # Use first 32 bytes
 
-    # Generate new key
-    key_dir.mkdir(parents=True, exist_ok=True)
+    # Generate new key. Created with O_EXCL so two processes starting at once
+    # cannot each write a different key and then disagree about signatures.
     key = secrets.token_bytes(32)  # 256-bit key for HMAC-SHA256
-    key_file.write_bytes(key)
-    os.chmod(key_file, 0o600)  # Restrict to owner only
+    try:
+        fd = os.open(str(key_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        existing = key_file.read_bytes()
+        if len(existing) >= 32:
+            return existing[:32]
+        raise
+    try:
+        os.write(fd, key)
+    finally:
+        os.close(fd)
     return key
 
 

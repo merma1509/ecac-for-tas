@@ -466,9 +466,12 @@ class RealFileShim:
         to each pass freshness checks independently.
         """
         base = self._base_capability_nonce(op_type, primary)
-        # Derive unique nonce: include op_type + last 40 chars of path for per-effect uniqueness
-        path_suffix = primary[7:] if primary.startswith("file://") else primary
-        return f"{base}|{op_type}|{path_suffix[-40:]}"
+        # Length-prefix the path: truncating to the last 40 chars made
+        # paths sharing a 40-char suffix collide into one nonce, so a replay
+        # of one path consumed the freshness of another.
+        path = primary[7:] if primary.startswith("file://") else primary
+        encoded = len(path).to_bytes(8, "big") + path.encode("utf-8")
+        return f"{base}|{op_type}|{encoded.hex()}"
 
     def _derive_nonce(self, right: str, primary: str, extras: frozenset[str]) -> str:
         """Derive a label key for this complete target set (for logging/tracking only)."""
@@ -688,6 +691,8 @@ class RealFileShim:
             task=task,
             tool_name=self.tool_name,
             authorized_content_hash=authorized_content_hash,
+            # Bytes land below, after commit(); the shim measures them itself.
+            store_is_external_state=False,
         )
         allow, evidence = self.broker.commit(commit)
 
@@ -718,9 +723,7 @@ class RealFileShim:
             # IN_FLIGHT marker, before the IPC call. Written before the
             # operation so a crash mid-write leaves "dispatched, unobserved"
             # rather than a silent gap. See ledger.record_dispatched().
-            self.broker.ledger.record_dispatched(
-                self.task_id, nonce, source="shim_real.dispatch"
-            )
+            self.broker.ledger.record_dispatched(self.task_id, nonce, source="shim_real.dispatch")
             # Opens at the dispatch marker, so evidence reports how long the
             # operation was in flight in the other process, not how long this
             # process spent on bookkeeping around it.

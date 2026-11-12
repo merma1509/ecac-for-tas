@@ -12,7 +12,223 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ## [Unreleased]
 
+### Changed
+
+- **The five non-blocking comparators now enforce their named mechanism
+  .** CaMeL, PACT, ChainCaps, Cordon and ArgProv each
+  returned `True` unconditionally: the docstring described a check that was
+  never wired to a return value, so they scored 0/20 and every comparative
+  claim resting on that number was unsupported — a comparison against a stub
+  measures the stub. Each now has a real deny path:
+
+  | Comparator | Enforces                                       | Still misses                  |
+  | ---------- | ---------------------------------------------- | ----------------------------- |
+  | CaMeL      | IFC: untrusted provenance at a publish sink    | taint, replay, scope, content |
+  | PACT       | capability scope covers (etype, target)        | taint, replay, content, BCC   |
+  | ChainCaps  | capability scope, EXPAND honored as documented | taint, replay, content        |
+  | Cordon     | proposal revalidation: expiry + target match   | taint, provenance, replay     |
+  | ArgProv    | argument provenance (untrusted denies)         | capability, scope, taint      |
+
+  Scores are now CaMeL 4/20, PACT 14/20, ChainCaps 3/20, Cordon 3/20,
+  ArgProv 6/20 against ECAC's 20/20. `COMPARATOR_MECHANISMS` states
+  enforced-versus-omitted per comparator, `tests/test_comparator_honesty.py`
+  pins both the counts and the table, and `docs/VERIFICATION.md` no longer
+  quotes the 0/20 stub figures. The dead ECAC-setup branch (which imported a
+  `_capability` helper that does not exist in `traces.py`) is gone.
+
 ### Added
+
+- **Mediation is reported as three states in the diagnostic run.**
+  `diagnostic_report()["mediation"]` is `{evaluated, complete, failures, note}`,
+  so `evaluated=false` is distinguishable from `false`: when the ledger check
+  cannot run, `complete` is `None` and the text form prints `NOT EVALUATED`
+  rather than a bare `False`, which would send a reader looking for a hole that
+  was never searched for.
+- **Diagnostic run** `scripts/diagnostic_run.py` and
+  `metrics.diagnostic_report()` emit all seven metrics: unauthorized effects,
+  legitimate completion, false denials by predicate, UNKNOWN outcomes,
+  approvals (granted/used/expired unused), wall-clock overhead (syscall counts
+  reported as `null` rather than invented) and the reviewed trusted boundary.
+  UNKNOWN is read from the ledger's own verdict, not inferred from gate
+  evidence, which carries none.
+- **Occurrence records.** `oracle.Occurrence` and
+  `count_occurrences` count repeats instead of collapsing them: two identical
+  writes are two occurrences, a write followed by a delete keeps both, a
+  repeated send is two, and an effect landing outside its window is flagged.
+- **Concurrent-ticket coverage in the multiprocess path (P6-3).** Ten threads
+  racing one nonce through subprocess `APPLY_COMMIT` yield exactly one commit.
+- **The oracle can read a real MTA log.** `oracle.smtp_log` has always carried
+  the comment "in a real deployment this is the MTA's mail log, read
+  out-of-band", but nothing read one: every caller filled the list in by hand
+  from the handler it had just written, which makes the independent observer a
+  listener to the sender's own account of itself. `mta_log.read_postfix_log()`
+  and `IndependentOracle.from_mta_log()` read the MTA's accounting instead, and
+  `hidden_recipients()` names recipients the broker never declared.
+  `tests/data/postfix-maillog.txt` was captured from a real Postfix 3.7.11
+  instance (`scripts/capture_mta_log.sh`) and holds one honest send and one
+  carrying an undeclared BCC. Not a trust boundary — a process that can write
+  the log can forge it — but the observations no longer come from the code being
+  observed.
+- **`oracle.reconcile_unknowns()` settles a crash-torn write from outside the
+  writer.** A write that lands and then loses its process stays UNKNOWN for the
+  ledger's whole life, because nothing in the write path returns to fill the gap.
+  The oracle checks the filesystem and records evidence attributed to
+  `oracle.reconcile`, leaving `authorized_not_observed` and absent or non-file
+  targets untouched.
+
+### Fixed
+
+- **`/etc` was confined as a subtree, so `/etc/shadow` was readable.** Landlock
+  grants a subtree, so listing `/etc` as a read root also granted `shadow`,
+  `gshadow` and `sudoers`. Measured in a container with ABI 4, a confined
+  process read `/etc/shadow` while `_get_confinement_status()` reported
+  `restricted-open` — the status string advertised a confinement layer, and the
+  one file a reader would ask about was readable through it. `/etc` is no longer
+  a root; `_LANDLOCK_READ_FILES` grants the individual files that are needed
+  (`hosts`, `resolv.conf`, `passwd`, the CA bundle, …). A file missing from that
+  list is unreadable, which fails closed.
+- **`ECAC_REQUIRE_CONFINEMENT` was documented as "on in CI" but no CI step set
+  it.** Every confinement test therefore ran unconfined and the suite was green
+  either way — the failure mode the flag exists to prevent, committed in the act
+  of documenting it. The `Test` step now sets it.
+- **Outcome counting contradicted the verdict about the same effect.**
+  `outcome_of()` classified an `executor.apply` observation as `committed`,
+  while `verify()` called the same effect `committed_without_evidence` and
+  returned UNKNOWN. `executor.apply` is recorded _before_ a real write reaches
+  the filesystem — a process killed in between leaves an observation for a write
+  that never happened — so the aggregate metrics reported as committed what the
+  audit path reported as unknown, and the metrics are the half people read.
+  `outcome_of()` now defers to `verify()`. Pinned by
+  `test_outcome_counts.py::test_outcome_of_never_disagrees_with_verify`.
+- **`target_for()` resolved an effect to its parent directory.**
+  `authorized_targets` records both a written file and its parent, so picking
+  `sorted(...)[0]` chose the directory — which always exists, so a check against
+  it "succeeded" and settled the effect against a path nobody authorized.
+  Ambiguity now returns `None` and the caller reports it. Found by
+  `test_oracle_reconcile.py::TestWhatItMustNotTouch`.
+- **Two tests reported defects that were preconditions.** The
+  read-only-location test fails under uid 0, which ignores directory mode bits,
+  and the git-tracking tests crashed where the `git` binary is absent. The first
+  now skips under root; the second uses a shared `git_tracks` fixture that skips
+  when git is unavailable and still fails an untracked file.
+- **Ambiguous request binding.** `CanonicalRequest`
+  (`effect_broker/model.py`) binds the full request — operation, acting
+  account, sender, complete recipients, attachment digests — and hashes it
+  over length-prefixed bytes, so `subject='a|b', body='c'` and
+  `subject='a', body='b|c'` no longer collide and a non-UTF-8 attachment
+  hashes identically in both processes. The subprocess's mirrored hashing
+  copy is gone; both sides call one helper. Attachment blobs now change the
+  `request_hash`.
+- **Nonce collision on long paths.** `_resolve_capability_nonce`
+  truncated the path to its last 40 characters, so two distinct paths
+  sharing a 40-char suffix derived the same nonce and a replay of one path
+  consumed the freshness of the other. The path is now length-prefixed.
+- **Landlock was reported active without ever being applied.**
+  `_apply_landlock_sandbox()` called `restrict_self` with the ruleset FD where
+  the flags argument belongs, added no rules, and ignored the result — then
+  reported `landlock` as an active confinement layer. The ruleset is now
+  created with the correct `linux/landlock.h` constants (444/445/446, not 451
+  for every call), a `PATH_BENEATH` rule re-opens writes only under
+  `ECAC_LANDLOCK_WRITE_ROOT`, and `landlock` appears in the confinement status
+  only after a selftest observes a write being denied. The selftest probes a
+  path the process can write and does not read an unrelated `EACCES` (the first
+  version probed `/etc` and mistook ordinary permissions for confinement).
+- **Unconfined execution can now be refused.** `ECAC_REQUIRE_CONFINEMENT=1`
+  makes the executor subprocess raise rather than run with no kernel mechanism,
+  instead of degrading silently on hosts (e.g. macOS) that cannot confine.
+- **Landlock confined writes but not reads.** `_landlock_handled_access()`
+  omitted `READ_FILE`, so the kernel left reads unconfined entirely:
+  `~/.ssh/id_rsa`, `~/.aws/credentials` and a signing key under `/tmp` all
+  opened through the real syscall while the status still reported `landlock`.
+  `READ_FILE` is now in the handled mask, with read roots limited to system
+  paths, the working directory and the IPC key directory — `~` is deliberately
+  unreadable. The selftest gained a two-way read probe: a canary under `$HOME`
+  must fail with `EACCES` while a legitimate read still succeeds, and the canary
+  is planted before the ruleset applies since afterwards `$HOME` is unwritable.
+  The read roots are derived from `sys.path`/`sys.executable` rather than
+  hardcoded to `/usr`, because an interpreter under `/opt` (as on the CI runner)
+  could otherwise not import the stdlib.
+- **Approvals were not bound to the request.** `ApprovedRequest.request_hash`
+  was declared but never populated by `grant_approval()` and never checked by
+  the gate, so the only binding that ran was `content_hash` — which covers
+  etype, targets and content but not the sender or acting account. An approval
+  granted for `alice@corp.com` authorized a send as `attacker@evil.com`, and a
+  swapped attachment blob with identical subject and body passed. Both sides now
+  derive the hash from one canonical definition.
+- **An email approval bound no body at all.** `RealEmailShim.send()` put
+  `subject` and `body_size` on the effect but never `body`, while
+  `_smtp_send()` transmitted a `raw_msg` built separately. With no body,
+  `compute_content_hash()` returned `sha256("")` for _every_ send, so the
+  `content-hash-mismatch` branch in the gate was unreachable for email: an
+  approval a human granted for "quarterly numbers are fine" authorized a wire
+  transfer, and `body_size` could not tell the two apart (equal-length bodies
+  collided by construction). The shim now carries the exact body text on the
+  effect, and the send also binds `sender` and `acting_account`, which the
+  canonical request had been reading from metadata that nothing populated.
+  `tests/test_email_body_binding.py` exercises the live shim rather than
+  hand-built effects — which is why the gap survived the earlier tests, whose
+  fixtures supplied `body` themselves.
+- **Multi-process email commits crashed after authorization.** The shim's
+  effect metadata held a `frozenset` (`bcc_detected`), and
+  `executor_ipc._sign_payload` `json.dumps` the whole payload: every email
+  commit in multi-process mode raised `TypeError: Object of type frozenset is
+not JSON serializable` — after the gate had already allowed the effect, and as
+  a crash rather than a denial, so no verdict was recorded. The metadata is now
+  JSON-safe, `effect_to_dict()` normalizes set/bytes values generally (not only
+  the two keys it happened to know about), and the `content`→`content_b64`
+  rename it documents is actually performed rather than assumed.
+- **The TCB metric measured the wrong code.** `_TCB_FILES` summed
+  `broker.py` and `model.py` while the architecture names the trusted core as
+  four modules. `executor.py` — the sole mutation path, i.e. the code an
+  attacker must defeat — was not counted, nor was `restricted_store.py`. The
+  published figure was ~45% low, and understating the TCB is the direction that
+  flatters the claim.
+- **The TCB definition lived where CI could not see it.** It sat only in
+  `docs/ARCHITECTURE.md`, and `docs/` is gitignored in this repository, so the
+  test comparing metric against document **skipped** in CI. The drift above was
+  invisible in the only place that runs on every change; green meant nothing.
+  The canonical list is now `effect_broker/tcb.py` — tracked, with a stated role
+  per module, an `assert_complete()` invoked at import, and tests that fail if
+  the registry stops being tracked by git.
+- **Docstrings were counted as executable code.** `_count_code_lines` dropped
+  comments and blank lines but not docstrings, so prose inside string literals
+  counted as logic: 1238 of the 3401 lines it summed were docstrings (+57%). It
+  was the same error the comment filter had been added to fix, in the form that
+  survived it. Module/class/function docstrings are now excluded by AST, with
+  the count falling back to the comment-only figure if a file will not parse.
+- **`python -m effect_broker.metrics` ran the wrong report.** The module had two
+  `if __name__ == "__main__"` blocks; the first won, so the regression report
+  the module is named for was unreachable from the command line and the
+  diagnostic table printed instead. There is now one entry point:
+  `print_report()` by default, `--diagnostic` for the seven metrics.
+- **`tcb_lines` failed the regression gate on every legitimate fix.** It was
+  listed as lower-is-better in `metrics_snapshot.py`, so a fix that adds a check
+  read as a regression and deleting a module read as an improvement. It is now
+  reported as `advisory` and no longer decides the exit code, while false
+  positives and false negatives still fail it.
+- **The metrics regression gate was never invoked.** `metrics_snapshot.py
+--compare` existed but no CI step ran it, so a regression could land unnoticed.
+  It is now a CI step, with its baseline in `tests/data/` — a reference file a
+  fresh checkout cannot see (`docs/`) would have made the gate a no-op.
+- **Latency percentiles are advisory, because they are not percentiles.** The
+  scenario set has 6 entries, so `p95` and `p99` _are_ the sample maximum. Over
+  8 re-snapshots of unchanged code, `p99` ranged 0.0342–0.0948 ms (2.8×) and the
+  old 25% tolerance failed 1 run in 8 on noise alone; on the GitHub runner the
+  same build reported p50 0.023 → 0.0407 ms (+77%). A gate that fires on noise
+  teaches re-running instead of reading. Latency is still printed in every diff.
+- **Send budget was oversubscribed by concurrent sends.** `send_count` was
+  incremented only after a successful apply and the gate only read it, so five
+  concurrent sends with `max_sends=1` all passed. The gate now reserves a
+  ticket in the same critical section as the nonce; the executor commits it on
+  success or releases it on failure. The reservation is in-process only —
+  concurrent sends across processes are not covered.
+
+### Added
+
+- **Comparator mechanisms table** (`baselines.COMPARATOR_MECHANISMS`). States,
+  per comparator, what is enforced and what is omitted. It exists so a
+  comparative number can be read against the mechanism that produced it rather
+  than against a name.
 
 - **Metrics tripwire** (`scripts/metrics_snapshot.py`). Compares two metric
   snapshots and exits non-zero on regression, so a change that slows the gate
@@ -90,7 +306,62 @@ whose current `pyproject.toml` version is `0.1.1`.
   the parent recovers. Five of its tests fail if journaling is switched off,
   which was checked by doing exactly that.
 
+- **No commit is reported without evidence** (`ledger.py`, `executor.py`,
+  `ipc.py`). `verify()` now returns `UNKNOWN` when an effect has an
+  authorization and an observation but no `EffectEvidence` behind it. Until now
+  "observed" was enough, and the observation was frequently the executor
+  agreeing with itself.
+
+  Which evidence is admissible depends on what actually holds the state, so
+  `Commit.store_is_external_state` states it rather than assuming it. For the
+  simulated `FileShim` and a plain `broker.commit()` the store _is_ the external
+  state -- `_do_write`/`_do_send` are documented NO-OPs -- so the executor's
+  record of the mutation is a real measurement and the flag defaults to `True`.
+  The real shims set it `False`: there the store only bookkeeps and the bytes
+  land later, in `shim_real.write()`, after `commit()` returns. Recording store
+  evidence for them put `evidence` in the journal _before_ `dispatched` --
+  proof preceding the operation it proves, caught by
+  `test_dispatch_precedes_evidence_in_the_file`.
+
+  The subprocess path records evidence from the IPC reply, which is the only
+  measurement the parent process can obtain; without it every multi-process
+  commit reported `committed_without_evidence`.
+
+- **`LedgerBackend` can carry evidence** (`ipc.py`). `record_evidence` /
+  `evidence_for` are on the interface and implemented by `LocalLedgerBackend`
+  and `ProcessLedgerClient`, with `RECORD_EVIDENCE` / `EVIDENCE_FOR` requests and
+  a serializer for `EffectEvidence` (`frozenset` is not JSON-encodable). They are
+  not abstract: a backend that does not support evidence then honestly yields
+  `committed_without_evidence` instead of failing to construct.
+
+- **`verify()` reports over-observation before missing evidence.** An extra
+  application on a nonce is a distinct finding, and answering it with "no
+  evidence" hid the thing worth knowing.
+
 ### Changed
+
+- **`mode_conventional_sandbox.py` renamed to `mode_path_allowlist.py`**, and
+  the comparator key `ConvSandbox` to `PathAllowlist`. The file compared strings
+  on `effect.target` while claiming "seccomp + landlock/SELinux"; the kernel was
+  never involved. this allows a comparator to either implement the named
+  mechanism or be renamed — this is the rename, since a real one needs kernel
+  enforcement (Landlock or seatbelt) and proof that a denied path fails with
+  `EACCES`. Trace decisions are unchanged. The `README.md` claims that rested on
+  the old name were corrected in the same commit.
+
+- **An observation alone is no longer a commit** -- see above. This changes test
+  expectations, not just code: sixteen tests recorded authorization and
+  observation straight into the ledger and asserted `CONFIRMED_COMMITTED`, which
+  is the contract P4-1 removes. They now record evidence via a
+  `commit_evidence()` helper in `tests/conftest.py`.
+
+  Two expectations were inverted rather than updated, because their premises
+  contradict an invariant: `EffectEvidence(outcome="committed")` cannot be
+  constructed without observed targets, so "wrong source + empty obs ⇒ COMMITTED"
+  can never be backed, and dispatch marks intent, which was never sufficient for
+  a commit. Both now assert the weaker true thing (the path refuses to
+  over-claim); the strong assertion lives in `test_io_evidence.py` and
+  `test_crash_harness.py`.
 
 - **TCB size counts code, not comments.** `_count_code_lines` strips comments
   and blank lines, so the reported TCB figure reflects logic rather than

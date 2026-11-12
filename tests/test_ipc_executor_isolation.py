@@ -21,6 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from conftest import commit_evidence
 
 
 class TestExecutorSubprocessIPC:
@@ -369,6 +370,10 @@ class TestLedgerReadsExecutorStore:
             source="test.broker",
         )
         ledger_client.record_observation("task-1", "audit-cap", obs_targets, source="executor.IPC")
+        # The IPC reply is the only measurement process A can get.
+        ledger_client.record_evidence(
+            "task-1", "audit-cap", commit_evidence("audit-cap", obs_targets, source="executor.IPC")
+        )
 
         # Verify: ledger can confirm the effect was applied
         from effect_broker.ledger import LedgerVerdict
@@ -442,6 +447,11 @@ class TestLedgerReadsExecutorStore:
         )
         ledger_client.record_observation(
             "default", "send-bob-cap", obs_targets, source="executor.IPC"
+        )
+        ledger_client.record_evidence(
+            "default",
+            "send-bob-cap",
+            commit_evidence("send-bob-cap", obs_targets, source="executor.IPC"),
         )
 
         # Step 3: Verify complete mediation

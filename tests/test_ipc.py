@@ -14,6 +14,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
+from conftest import commit_evidence
 
 from effect_broker.ipc import (
     LedgerProcessServer,
@@ -76,6 +77,7 @@ class TestLocalLedgerBackend:
         assert isinstance(result, UnknownLedgerResult)
 
         backend.record_observation("task1", "nonce1", targets, source="test")
+        backend.record_evidence("task1", "nonce1", commit_evidence("nonce1", targets))
         result = backend.verify("task1", "nonce1")
         assert result == LedgerVerdict.CONFIRMED_COMMITTED
 
@@ -95,6 +97,7 @@ class TestLocalLedgerBackend:
         backend.record_authorization("task1", "n1", frozenset({"a"}), source="test")
         backend.record_authorization("task2", "n2", frozenset({"b"}), source="test")
         backend.record_observation("task1", "n1", frozenset({"a"}), source="test")
+        backend.record_evidence("task1", "n1", commit_evidence("n1", {"a"}))
 
         records = {
             ("task1", "n1"): frozenset({"a"}),
@@ -201,6 +204,7 @@ class TestLedgerProcessServerDispatch:
             server._ledger = IndependentEffectLedger()
             server._ledger.record_authorization("t", "n", frozenset({"a"}), source="test")
             server._ledger.record_observation("t", "n", frozenset({"a"}), source="test")
+            server._ledger.record_evidence("t", "n", commit_evidence("n", {"a"}))
 
             resp = server._dispatch(
                 {
@@ -238,6 +242,7 @@ class TestLedgerProcessServerDispatch:
             server._ledger.record_authorization("t1", "n1", frozenset({"a"}), source="test")
             server._ledger.record_authorization("t2", "n2", frozenset({"b"}), source="test")
             server._ledger.record_observation("t1", "n1", frozenset({"a"}), source="test")
+            server._ledger.record_evidence("t1", "n1", commit_evidence("n1", {"a"}))
 
             resp = server._dispatch(
                 {
@@ -284,6 +289,7 @@ class TestLedgerProcessServerDispatch:
             assert resp_auth["result"] == 1
 
             server._ledger.record_observation("t", "n", frozenset({"a"}), source="test")
+            server._ledger.record_evidence("t", "n", commit_evidence("n", {"a"}))
             resp_obs = server._dispatch({"kind": "OBSERVATION_COUNT", "payload": {}})
             assert resp_obs["result"] == 1
 
@@ -381,6 +387,22 @@ class TestProcessLedgerClientIntegration:
                         },
                     ),
                     (
+                        "RECORD_EVIDENCE",
+                        {
+                            "task_id": "t1",
+                            "nonce": "n1",
+                            "evidence": {
+                                "effect_id": "n1",
+                                "outcome": "committed",
+                                "source": "test",
+                                "window": [0.0, 0.0],
+                                "observed_bytes": None,
+                                "observed_targets": ["file:///a"],
+                                "transport_response": "test",
+                            },
+                        },
+                    ),
+                    (
                         "VERIFY",
                         {"task_id": "t1", "nonce": "n1"},
                     ),
@@ -414,6 +436,7 @@ class TestProcessLedgerClientIntegration:
 
             client.record_authorization("task2", "nonce2", frozenset({"file:///b"}), source="test")
             client.record_observation("task2", "nonce2", frozenset({"file:///b"}), source="test")
+            client.record_evidence("task2", "nonce2", commit_evidence("nonce2", {"file:///b"}))
             assert client.authorization_count() == 2
             assert client.observation_count() == 2
             assert client.verify("task2", "nonce2") == LedgerVerdict.CONFIRMED_COMMITTED
@@ -476,8 +499,10 @@ class TestLedgerBackendInterface:
         # Wrong source — verify does NOT treat None as BLOCKED
         backend.record_observation("t", "n", None, source="wrong_source")
         result = backend.verify("t", "n")
-        # With wrong source: obs ⊆ auth → empty ⊆ {"a"} → CONFIRMED_COMMITTED
-        assert result == LedgerVerdict.CONFIRMED_COMMITTED
+        # A non-BLOCKED source must not read as BLOCKED. It is not a commit
+        # either: there are no observed targets and no evidence to back one.
+        assert result != LedgerVerdict.CONFIRMED_BLOCKED
+        assert isinstance(result, UnknownLedgerResult)
 
 
 # ---- IPC end-to-end: broker + ProcessLedgerClient ----

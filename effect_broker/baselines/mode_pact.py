@@ -35,55 +35,66 @@ class PACTActivity:
 
 
 class PACTBroker:
+    """PACT-style broker: capability scope enforced, provenance recorded.
+
+    What PACT actually does, in one sentence: an effect may proceed only if a
+    capability held by the caller covers the effect's (etype, target). The
+    capability's scope is the authority boundary; provenance is recorded for
+    audit but does not itself deny.
+
+    Deliberately absent (each is a trace this comparator does not block):
+
+    - No content-hash binding: T2, T9, T15 pass (modify after approval).
+    - No session taint: T1 passes.
+    - No replay prevention: T4 passes.
+    - No recipient completeness: T3 passes (hidden BCC outside scope is not
+      checked, because PACT scopes by the declared target only).
+    - No delegation-chain verification: T6, T16 pass.
     """
-    PACT-style broker: capabilities with provenance, NO content hash.
 
-    Key difference from ECAC:
-    - Tracks provenance (who did what)
-    - Allows scope narrowing (attenuation)
-    - No content hash binding
-    - No session taint
-
-    WEAKNESSES (these bypass PACT but not ECAC):
-    - No content hash: T2 passes (modify after approval)
-    - No session taint: T1 passes
-    - No ledger: T4 passes (replay)
-    - Attenuation only narrows (T5: widening passes)
-    """
-
-    def __init__(self):
+    def __init__(self) -> None:
         self.activities: list[PACTActivity] = []
+        #: holder -> {(right, target)}. In a real PACT deployment this is the
+        #: capability store; here it is populated by `grant`.
+        self.capabilities: dict[str, set[tuple[str, str]]] = {}
+
+    def grant(self, holder: str, right: str, target: str) -> None:
+        """Issue a capability. Attenuation only narrows (no widening path)."""
+        self.capabilities.setdefault(holder, set()).add((right, target))
 
     def commit_effect(self, effect: Effect, task_id: str = "default") -> tuple[bool, dict]:
-        """
-        PACT-style commit: capability + provenance check.
+        """Deny when no capability covers (etype, target); record provenance."""
+        holder = effect.capability_nonce
+        held = self.capabilities.get(holder, set())
 
-        WEAKNESSES (these bypass PACT but not ECAC):
-        - No content hash: T2 (modify after approval) passes
-        - No session taint: T1 passes
-        - No ledger: T4 (replay) passes
-        - Scope can be widened (T5 passes)
-        """
-        # Record activity (PACT-style)
-        activity = PACTActivity(
-            etype=effect.etype,
-            target=effect.target,
-            holder=effect.capability_nonce,
-            holder_conf=Confidentiality.INTERNAL,
-            scope=frozenset({effect.target}),
+        authorized = any(
+            (right == effect.etype or right == "*") and (tgt == effect.target or tgt == "*")
+            for right, tgt in held
         )
-        self.activities.append(activity)
 
-        # PACT checks:
-        # 1. Capability exists
-        # 2. Provenance is tracked
-        # But NOT:
-        # - Content hash (T2)
-        # - Session taint (T1)
-        # - Ledger (T4)
+        self.activities.append(
+            PACTActivity(
+                etype=effect.etype,
+                target=effect.target,
+                holder=holder,
+                holder_conf=(
+                    effect.provenance[0].confidentiality
+                    if effect.provenance
+                    else Confidentiality.INTERNAL
+                ),
+                scope=frozenset({effect.target}),
+            )
+        )
+
+        if not authorized:
+            return False, {
+                "blocker": "Auth",
+                "reason": f"PACT: no capability for ({effect.etype}, {effect.target})",
+                "policy": "PACT",
+            }
 
         return True, {
             "blocker": None,
-            "reason": "PACT: capability + provenance OK",
+            "reason": "PACT: capability covers effect",
             "policy": "PACT",
         }

@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .mediation import MediationVerdict
+from .model import EffectEvidence
 
 if TYPE_CHECKING:
     from .broker import EffectBroker, Evidence
@@ -235,12 +236,28 @@ class IsolatedExecutor:
                     self.ledger.record_observation(
                         actual_task_id, nonce, last_entry, source="executor.apply"
                     )
-                # Don't increment send_count on failure (budget preserved)
+                    self._record_store_evidence(
+                        actual_task_id, nonce, commit, gate_result.effect, last_entry
+                    )
+                # Consume the ticket reserved by the gate; release the budget on
+                # failure so a failed send does not spend it
                 if gate_result.effect.etype == "send":
                     session = gate_result.task.session
                     assert session is not None  # Task.__post_init__ always creates one
-                    session.increment_send_count()  # Only on success
+                    ticket = session.send_ticket_id(
+                        gate_result.task.task_id, gate_result.effect.capability_nonce
+                    )
+                    session.commit_send(ticket)
             else:
+                # Apply failed: give the budget back
+                if gate_result.effect.etype == "send":
+                    session = gate_result.task.session
+                    assert session is not None
+                    session.release_send(
+                        session.send_ticket_id(
+                            gate_result.task.task_id, gate_result.effect.capability_nonce
+                        )
+                    )
                 # Effect could NOT be applied ( resource not found).
                 # Record explicit FAILED observation — NOT a block, but a failure.
                 # This prevents auth > 0, obs = 0 → UNKNOWN (possible bypass).
@@ -258,6 +275,61 @@ class IsolatedExecutor:
             )
 
         return allow, evidence
+
+    def _record_store_evidence(
+        self,
+        task_id: str,
+        nonce: str,
+        commit: Commit,
+        effect: Effect,
+        observed: frozenset[str] | None,
+    ) -> None:
+        """Record evidence for an effect whose store IS the external state.
+
+        Only for commits carrying `store_is_external_state=True` (the simulated
+        FileShim, whose `_do_*` hooks are NO-OPs). For those, `apply_effect`
+        returning True and appending an identity entry *is* the measurement:
+        the mutation happened inside the store, and the log line is what it
+        recorded.
+
+        Deliberately not done for the real shims. There, `apply_effect` only
+        bookkeeps and the bytes land later in `shim_real.write()`; evidence
+        written here would be dated before the `dispatched` marker of the I/O
+        it claims to prove, and `evidence_for()` would then prefer this weaker
+        claim over the shim's own transport measurement.
+        """
+        if not commit.store_is_external_state:
+            return
+        if self.ledger.evidence_for(task_id, nonce) is not None:
+            return  # a shim already measured it; that measurement wins
+        if not observed:
+            # Nothing observable was recorded: say UNKNOWN rather than invent a
+            # target set to justify a commit claim.
+            self.ledger.record_evidence(
+                task_id,
+                nonce,
+                EffectEvidence(
+                    effect_id=nonce,
+                    outcome="unknown",
+                    source="executor.apply.store",
+                    window=(0.0, 0.0),
+                    observed_targets=frozenset(),
+                    transport_response=None,
+                ),
+            )
+            return
+        self.ledger.record_evidence(
+            task_id,
+            nonce,
+            EffectEvidence(
+                effect_id=nonce,
+                outcome="committed",
+                source="executor.apply.store",
+                window=(0.0, 0.0),
+                observed_targets=frozenset(observed),
+                transport_response=f"store={effect.etype}",
+            ),
+        )
 
     def apply_effect(self, effect: Effect, task: Task) -> bool:
         """Apply an effect to external state. THIS is the SOLE mutation point.
@@ -491,6 +563,22 @@ class SubprocessExecutor:
                 self.ledger.record_observation(
                     actual_task_id, nonce, identity_entry, source="subprocess.apply"
                 )
+                # B applied the effect in its own store; its reply is the only
+                # measurement A can get. Without this the commit rests on the
+                # observation alone.
+                if commit.store_is_external_state and obs_targets:
+                    self.ledger.record_evidence(
+                        actual_task_id,
+                        nonce,
+                        EffectEvidence(
+                            effect_id=nonce,
+                            outcome="committed",
+                            source="subprocess.apply.store",
+                            window=(0.0, 0.0),
+                            observed_targets=obs_targets,
+                            transport_response="subprocess=ok",
+                        ),
+                    )
             elif resp.get("status") == "blocked":
                 # Fresh check in B detected replay/revoked — block the commit
                 # This should be rare since A already checked Fresh, but provides
