@@ -121,13 +121,18 @@ not JSON serializable` — after the gate had already allowed the effect, and as
   the two keys it happened to know about), and the `content`→`content_b64`
   rename it documents is actually performed rather than assumed.
 - **The TCB metric measured the wrong code.** `_TCB_FILES` summed
-  `broker.py` and `model.py` while `docs/ARCHITECTURE.md` §2 defines the
-  trusted core as four files. `executor.py` — called out in that document as the
-  sole mutation path, i.e. the code an attacker must defeat — was not counted,
-  nor was `restricted_store.py`. The published figure was ~45% low, and
-  understating the TCB is the direction that flatters the claim.
-  `tests/test_tcb_measurement.py` parses the document and fails if the two sets
-  diverge, so they cannot drift again.
+  `broker.py` and `model.py` while the architecture names the trusted core as
+  four modules. `executor.py` — the sole mutation path, i.e. the code an
+  attacker must defeat — was not counted, nor was `restricted_store.py`. The
+  published figure was ~45% low, and understating the TCB is the direction that
+  flatters the claim.
+- **The TCB definition lived where CI could not see it.** It sat only in
+  `docs/ARCHITECTURE.md`, and `docs/` is gitignored in this repository, so the
+  test comparing metric against document **skipped** in CI. The drift above was
+  invisible in the only place that runs on every change; green meant nothing.
+  The canonical list is now `effect_broker/tcb.py` — tracked, with a stated role
+  per module, an `assert_complete()` invoked at import, and tests that fail if
+  the registry stops being tracked by git.
 - **Docstrings were counted as executable code.** `_count_code_lines` dropped
   comments and blank lines but not docstrings, so prose inside string literals
   counted as logic: 1238 of the 3401 lines it summed were docstrings (+57%). It
@@ -144,6 +149,16 @@ not JSON serializable` — after the gate had already allowed the effect, and as
   read as a regression and deleting a module read as an improvement. It is now
   reported as `advisory` and no longer decides the exit code, while false
   positives and false negatives still fail it.
+- **The metrics regression gate was never invoked.** `metrics_snapshot.py
+--compare` existed but no CI step ran it, so a regression could land unnoticed.
+  It is now a CI step, with its baseline in `tests/data/` — a reference file a
+  fresh checkout cannot see (`docs/`) would have made the gate a no-op.
+- **Latency percentiles are advisory, because they are not percentiles.** The
+  scenario set has 6 entries, so `p95` and `p99` _are_ the sample maximum. Over
+  8 re-snapshots of unchanged code, `p99` ranged 0.0342–0.0948 ms (2.8×) and the
+  old 25% tolerance failed 1 run in 8 on noise alone; on the GitHub runner the
+  same build reported p50 0.023 → 0.0407 ms (+77%). A gate that fires on noise
+  teaches re-running instead of reading. Latency is still printed in every diff.
 - **Send budget was oversubscribed by concurrent sends.** `send_count` was
   incremented only after a successful apply and the gate only read it, so five
   concurrent sends with `max_sends=1` all passed. The gate now reserves a
