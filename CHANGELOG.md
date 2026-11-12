@@ -98,6 +98,52 @@ whose current `pyproject.toml` version is `0.1.1`.
   granted for `alice@corp.com` authorized a send as `attacker@evil.com`, and a
   swapped attachment blob with identical subject and body passed. Both sides now
   derive the hash from one canonical definition.
+- **An email approval bound no body at all.** `RealEmailShim.send()` put
+  `subject` and `body_size` on the effect but never `body`, while
+  `_smtp_send()` transmitted a `raw_msg` built separately. With no body,
+  `compute_content_hash()` returned `sha256("")` for _every_ send, so the
+  `content-hash-mismatch` branch in the gate was unreachable for email: an
+  approval a human granted for "quarterly numbers are fine" authorized a wire
+  transfer, and `body_size` could not tell the two apart (equal-length bodies
+  collided by construction). The shim now carries the exact body text on the
+  effect, and the send also binds `sender` and `acting_account`, which the
+  canonical request had been reading from metadata that nothing populated.
+  `tests/test_email_body_binding.py` exercises the live shim rather than
+  hand-built effects — which is why the gap survived the earlier tests, whose
+  fixtures supplied `body` themselves.
+- **Multi-process email commits crashed after authorization.** The shim's
+  effect metadata held a `frozenset` (`bcc_detected`), and
+  `executor_ipc._sign_payload` `json.dumps` the whole payload: every email
+  commit in multi-process mode raised `TypeError: Object of type frozenset is
+not JSON serializable` — after the gate had already allowed the effect, and as
+  a crash rather than a denial, so no verdict was recorded. The metadata is now
+  JSON-safe, `effect_to_dict()` normalizes set/bytes values generally (not only
+  the two keys it happened to know about), and the `content`→`content_b64`
+  rename it documents is actually performed rather than assumed.
+- **The TCB metric measured the wrong code.** `_TCB_FILES` summed
+  `broker.py` and `model.py` while `docs/ARCHITECTURE.md` §2 defines the
+  trusted core as four files. `executor.py` — called out in that document as the
+  sole mutation path, i.e. the code an attacker must defeat — was not counted,
+  nor was `restricted_store.py`. The published figure was ~45% low, and
+  understating the TCB is the direction that flatters the claim.
+  `tests/test_tcb_measurement.py` parses the document and fails if the two sets
+  diverge, so they cannot drift again.
+- **Docstrings were counted as executable code.** `_count_code_lines` dropped
+  comments and blank lines but not docstrings, so prose inside string literals
+  counted as logic: 1238 of the 3401 lines it summed were docstrings (+57%). It
+  was the same error the comment filter had been added to fix, in the form that
+  survived it. Module/class/function docstrings are now excluded by AST, with
+  the count falling back to the comment-only figure if a file will not parse.
+- **`python -m effect_broker.metrics` ran the wrong report.** The module had two
+  `if __name__ == "__main__"` blocks; the first won, so the regression report
+  the module is named for was unreachable from the command line and the
+  diagnostic table printed instead. There is now one entry point:
+  `print_report()` by default, `--diagnostic` for the seven metrics.
+- **`tcb_lines` failed the regression gate on every legitimate fix.** It was
+  listed as lower-is-better in `metrics_snapshot.py`, so a fix that adds a check
+  read as a regression and deleting a module read as an improvement. It is now
+  reported as `advisory` and no longer decides the exit code, while false
+  positives and false negatives still fail it.
 - **Send budget was oversubscribed by concurrent sends.** `send_count` was
   incremented only after a successful apply and the gate only read it, so five
   concurrent sends with `max_sends=1` all passed. The gate now reserves a
