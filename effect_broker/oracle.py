@@ -27,7 +27,26 @@ production deployment target.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass(frozen=True)
+class ReconcileReport:
+    """What `reconcile_unknowns` settled, and what it could not.
+
+    `still_unknown` is a tuple of `task_id:nonce:reason` strings rather than a
+    count: a run that left three will be debugged by someone who needs to know
+    which three and why, and a number cannot answer either question.
+    """
+
+    settled: tuple[str, ...]
+    still_unknown: tuple[str, ...]
+
+    @property
+    def all_settled(self) -> bool:
+        return not self.still_unknown
 
 
 @dataclass(frozen=True)
@@ -95,8 +114,39 @@ class IndependentOracle:
     """
 
     # SMTP transaction log: list of (rcpt, data_bytes) tuples recorded by the MTA.
-    # In a real deployment this is the MTA's mail log / queue, read out-of-band.
+    # In a real deployment this is the MTA's mail log / queue, read out-of-band —
+    # see `mta_log.read_postfix_log` and `from_mta_log` below, which is how a
+    # caller gets these tuples without writing them by hand.
     smtp_log: list[tuple[str, bytes]] = field(default_factory=list)
+
+    @classmethod
+    def from_mta_log(cls, path: str) -> IndependentOracle:
+        """Build an oracle from a real MTA's log file.
+
+        The `smtp_log` field says "in a real deployment this is the MTA's mail
+        log, read out-of-band" while every caller filled it in by hand from the
+        handler it had just written — a self-report with extra steps. This reads
+        the MTA's own accounting instead.
+
+        Recipients from transactions whose `nrcpt` does not match the number of
+        `to=` lines are still included: a partial log is not a reason to report
+        a clean result, and `mta_log.hidden_recipients` surfaces the incompleteness
+        separately for callers that want to act on it.
+
+        The payload is empty for every entry, because Postfix logs the size and
+        the queue id but not the body. A caller comparing bodies must read the
+        queue file, which needs queue access and is out of scope here.
+        """
+        from .mta_log import read_postfix_log
+
+        transactions = read_postfix_log(path)
+        return cls(
+            smtp_log=[
+                (recipient, b"")
+                for transaction in transactions
+                for recipient in transaction.recipients
+            ]
+        )
 
     def verify_write(
         self, target_path: str, expected_bytes: bytes | None = None, claimed: bool = True
@@ -203,3 +253,84 @@ class IndependentOracle:
     def is_consistent(self, verdicts: list[OracleVerdict]) -> bool:
         """True iff every verdict's claim matches observed reality."""
         return all(v.matches for v in verdicts)
+
+    def reconcile_unknowns(
+        self,
+        ledger: Any,
+        *,
+        task_ids: Iterable[str] | None = None,
+    ) -> ReconcileReport:
+        """Settle `committed_without_evidence` from a source outside the writer.
+
+        A write that lands and then loses its process — SIGKILL between the
+        syscall and `record_evidence` — leaves the ledger saying
+        `committed_without_evidence`. That verdict is correct and it is also
+        permanent: nothing in the write path will ever come back to fill the gap,
+        so the outcome stays UNKNOWN even though the filesystem knows the answer.
+
+        This asks the filesystem. It does not upgrade the unknown by re-reading
+        the tool's claim — no claim is consulted here — and it does not touch any
+        unknown whose cause is something else. `authorized_not_observed` means
+        the authorization exists with no effect behind it, which is a different
+        finding and must not be overwritten by a file that happens to be present
+        from an earlier run.
+
+        Only verdicts whose evidence is absent AND whose target is now observable
+        are settled. Anything still unknown afterwards stays unknown: the report
+        names it rather than quietly dropping it.
+        """
+        settled: list[str] = []
+        still_unknown: list[str] = []
+
+        for task_id, nonce in list(ledger.unknown_keys()):
+            if task_ids is not None and task_id not in task_ids:
+                continue
+            verdict = ledger.verify(task_id, nonce)
+            reason = getattr(verdict, "reason", "")
+            if "committed_without_evidence" not in reason:
+                # Not the case this method exists for. Leaving it alone is
+                # deliberate: `authorized_not_observed` needs a decision about
+                # the *authorization*, not evidence manufactured for it.
+                still_unknown.append(f"{task_id}:{nonce}:{verdict}")
+                continue
+
+            target = ledger.target_for(task_id, nonce)
+            if target is None or not target.startswith("file://"):
+                still_unknown.append(f"{task_id}:{nonce}:no-file-target")
+                continue
+
+            path = target[len("file://") :]
+            observed = self.verify_write(path, claimed=True)
+            if not observed.observed:
+                # The write genuinely did not land. That is a finding in its own
+                # right, but it is not this method's to conclude: the ledger
+                # already says the outcome is unknown, and reporting "absent"
+                # from one poll of a filesystem is not the same as proving a
+                # crash-time absence.
+                still_unknown.append(f"{task_id}:{nonce}:target-absent")
+                continue
+
+            from .model import EffectEvidence
+
+            try:
+                size = os.stat(path).st_size
+            except OSError:  # pragma: no cover - vanished between check and stat
+                still_unknown.append(f"{task_id}:{nonce}:vanished")
+                continue
+
+            ledger.record_evidence(
+                task_id,
+                nonce,
+                EffectEvidence(
+                    effect_id=nonce,
+                    outcome="committed",
+                    source="oracle.reconcile",
+                    window=(0.0, float("inf")),
+                    observed_bytes=size,
+                    observed_targets=frozenset({target}),
+                    transport_response=f"oracle fsize={size}",
+                ),
+            )
+            settled.append(f"{task_id}:{nonce}")
+
+        return ReconcileReport(settled=tuple(settled), still_unknown=tuple(still_unknown))

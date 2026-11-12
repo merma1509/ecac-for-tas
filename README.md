@@ -103,11 +103,20 @@ Or via `dev.sh`:
 
 - **What is kernel-enforced, per platform.** On Linux 5.13+ with the Landlock LSM enabled, the
   executor subprocess applies a Landlock ruleset and _keeps_ the claim only if a selftest
-  observes a write outside `ECAC_LANDLOCK_WRITE_ROOT` being denied (`EACCES`). On macOS there is
+  observes a write outside the permitted directories (`/tmp`, `/var/tmp`, `/dev/shm`, or
+  `ECAC_LANDLOCK_WRITE_ROOT` when set) being denied (`EACCES`) **and** a write inside them
+  succeeding — a ruleset that denies everything would otherwise read as success. On macOS there is
   **no kernel confinement**: the Python-level restricted-open wrapper and import blocklist are
   hygiene, not a security boundary. `_get_confinement_status()` names what is actually in effect,
   and `ECAC_REQUIRE_CONFINEMENT=1` makes the executor refuse to start where no kernel mechanism
   exists (off by default for local development, on in CI).
+- **Read confinement is allowlisted per file, not per directory.** Landlock grants a subtree, so
+  listing `/etc` as a read root also granted `/etc/shadow` and `/etc/sudoers`. Measured in a
+  container, a confined process read `/etc/shadow` while the status said `restricted-open`. The
+  roots no longer include `/etc`; the individual files that are needed are granted by name. If you
+  run the executor with `ECAC_REQUIRE_CONFINEMENT=1`, note that **`HOME` must be outside the
+  permitted write roots** (`/tmp`, `/var/tmp`, `/dev/shm`): with `HOME=/tmp` the selftest cannot
+  observe a denied home read and the executor correctly refuses to start.
 - **All tests ≠ real confinement.** Regression evidence, not proven protected-effect confinement
 - **Same-process isolation is advisory.** Direct store mutation returns `UNKNOWN`. Use multi-process mode.
 - **Tool declarations require a trusted manifest.** The structural check is only as strong as

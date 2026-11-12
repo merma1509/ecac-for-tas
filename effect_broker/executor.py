@@ -239,12 +239,25 @@ class IsolatedExecutor:
                     self._record_store_evidence(
                         actual_task_id, nonce, commit, gate_result.effect, last_entry
                     )
-                # Don't increment send_count on failure (budget preserved)
+                # Consume the ticket reserved by the gate; release the budget on
+                # failure so a failed send does not spend it
                 if gate_result.effect.etype == "send":
                     session = gate_result.task.session
                     assert session is not None  # Task.__post_init__ always creates one
-                    session.increment_send_count()  # Only on success
+                    ticket = session.send_ticket_id(
+                        gate_result.task.task_id, gate_result.effect.capability_nonce
+                    )
+                    session.commit_send(ticket)
             else:
+                # Apply failed: give the budget back
+                if gate_result.effect.etype == "send":
+                    session = gate_result.task.session
+                    assert session is not None
+                    session.release_send(
+                        session.send_ticket_id(
+                            gate_result.task.task_id, gate_result.effect.capability_nonce
+                        )
+                    )
                 # Effect could NOT be applied ( resource not found).
                 # Record explicit FAILED observation — NOT a block, but a failure.
                 # This prevents auth > 0, obs = 0 → UNKNOWN (possible bypass).

@@ -13,7 +13,7 @@ Metrics:
                                breakdown a pass/fail report lacks
   - latency percentile    : p50 / p95 / p99 gate evaluation time
   - annotation burden     : number of explicit grants per allowed operation
-  - TCB size              : lines of code in the trusted core (broker+model)
+  - TCB size              : executable lines in the trusted core (see _TCB_FILES)
 
 Honesty note: these are REGRESSION metrics on supplied scenarios.
 They quantify how the current build behaves on a fixed set; they are not a
@@ -22,11 +22,12 @@ causal estimate of protection against adaptive/live attackers.
 
 from __future__ import annotations
 
+import ast
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from effect_broker.lattice import Confidentiality, Integrity
 from effect_broker.model import (
@@ -38,14 +39,24 @@ from effect_broker.model import (
     EffectTarget,
     Task,
 )
+from effect_broker.tcb import TCB_FILES, assert_complete
 from effect_broker.traces import build
+
+# A TCB that silently undercounts is worse than no figure, because it is quoted.
+assert_complete()
 
 if TYPE_CHECKING:
     from effect_broker.broker import EffectBroker
 
 # The trusted core: the code whose correctness the security argument rests on.
 # (Excludes shims, tests, baselines, and the evaluation harness.)
-_TCB_FILES = ("effect_broker/broker.py", "effect_broker/model.py")
+#
+# The list itself lives in `effect_broker/tcb.py`, which is tracked source.
+# It previously sat here as a literal holding only `broker.py` and `model.py`
+# while the architecture document named four files, so `executor.py` — the sole
+# mutation path — went uncounted and the figure read ~45% low. Keeping the
+# definition somewhere git tracks is what makes that drift observable in CI.
+_TCB_FILES = TCB_FILES
 
 
 class EvaluationReport(TypedDict, total=False):
@@ -307,26 +318,79 @@ def compute_metrics() -> EvaluationMetrics:
     return m
 
 
+def _docstring_line_numbers(text: str) -> set[int]:
+    """1-based line numbers occupied entirely by a module/class/function docstring.
+
+    A docstring is prose that happens to be a string literal: no attacker can
+    exploit it. Counting it as code inflated the trusted core by 1238 lines out
+    of 3401 (~36%), which is the same error the comment filter was added to fix,
+    in the form that survived it.
+
+    A line is excluded only if nothing but whitespace surrounds the literal on
+    it, so a single-line def whose body is a docstring still counts as the code
+    it is.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        # Mid-edit or generated file: skip the refinement rather than fail a
+        # metrics run. The result is then the (higher) comment-only figure.
+        return set()
+
+    lines = text.splitlines()
+    spans: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", ())
+        if not body:
+            continue
+        first = body[0]
+        if not (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            continue
+
+        literal = first.value
+        start = literal.lineno
+        end = literal.end_lineno or start
+        for line_no in range(start, end + 1):
+            if line_no > len(lines):
+                continue
+            line = lines[line_no - 1]
+            if line_no == start and line[: literal.col_offset].strip():
+                continue  # code precedes the literal on its first line
+            if line_no == end and line[literal.end_col_offset :].strip():
+                continue  # code follows the literal on its last line
+            spans.add(line_no)
+    return spans
+
+
 def _count_code_lines(text: str) -> int:
-    """Count non-blank, non-comment lines.
+    """Count lines that execute: non-blank, not a comment, not a docstring.
 
     Raw line count was misleading: documenting a decision grew the reported
     TCB by 171 lines without adding a single executable statement. The metric
-    exists to size what must be CORRECT, so comments and blank lines -- which
-    no attacker can exploit -- must not inflate it.
+    exists to size what must be CORRECT, so comments, docstrings and blank
+    lines -- none of which an attacker can exploit -- must not inflate it.
     """
+    docstring_lines = _docstring_line_numbers(text)
     return sum(
         1
-        for line in text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
+        for line_no, line in enumerate(text.splitlines(), start=1)
+        if line.strip() and not line.strip().startswith("#") and line_no not in docstring_lines
     )
 
 
 def tcb_size() -> int:
-    """Executable lines in the trusted core (broker + model).
+    """Executable lines in the trusted core (`_TCB_FILES`).
 
-    Counts code lines only; see _count_code_lines. Use this as the trend
-    metric: an increase means more logic the security argument depends on.
+    Counts lines that execute only; see `_count_code_lines`. Use this as the
+    trend metric: an increase means more logic the security argument depends
+    on. `tcb_breakdown()` gives the per-file split, which is what a reader
+    checking the figure against `docs/ARCHITECTURE.md` needs.
     """
     root = Path(__file__).resolve().parent.parent
     total = 0
@@ -337,18 +401,18 @@ def tcb_size() -> int:
     return total
 
 
-def tcb_size_raw() -> int:
-    """Raw line count of the trusted core, for reference only.
+def tcb_breakdown() -> dict[str, int]:
+    """Per-file executable line counts, in `_TCB_FILES` order.
 
-    Retained because earlier reports quoted this number; it is NOT the metric
-    to track. `tcb_size()` is.
+    Reported alongside the total so a divergence from the documented TCB is
+    visible where it happens rather than only in the sum.
     """
     root = Path(__file__).resolve().parent.parent
-    return sum(
-        len((root / rel).read_text().splitlines())
-        for rel in _TCB_FILES
-        if (root / rel).exists()
-    )
+    breakdown: dict[str, int] = {}
+    for rel in _TCB_FILES:
+        path = root / rel
+        breakdown[Path(rel).name] = _count_code_lines(path.read_text()) if path.exists() else 0
+    return breakdown
 
 
 def session_taint_metrics() -> dict[str, object]:
@@ -488,6 +552,13 @@ def trusted_boundary() -> list[str]:
     ]
 
 
+#: The brokers the last `diagnostic_report()` committed against. Scoped to this
+#: module rather than passed around because `diagnostic_report` is the only
+#: producer and its callers want a dict, not a handle. Cleared at the top of each
+#: run so a stale broker cannot answer for a scenario that no longer runs.
+_SCENARIO_BROKERS: list[Any] = []
+
+
 def diagnostic_report() -> dict[str, object]:
     """The seven metrics from one run of the labeled scenario set."""
     import warnings
@@ -501,8 +572,14 @@ def diagnostic_report() -> dict[str, object]:
     approvals_expired_unused = 0
     false_denials: dict[str, int] = {}
 
+    # Kept so mediation can be asked of the brokers these effects were actually
+    # committed against. Inferring it from the block counts instead is the
+    # "denied implies complete" mistake this repository removed elsewhere.
+    _SCENARIO_BROKERS.clear()
+
     for sc in _build_scenarios():
         broker = build()
+        _SCENARIO_BROKERS.append(broker)
         task = _task(sc.ceiling_scope)
         before = len(broker.capabilities)
         effect = sc.builder(broker, task)
@@ -575,10 +652,55 @@ def diagnostic_report() -> dict[str, object]:
         },
         # 7. Trusted boundary: the reviewed list.
         "trusted_boundary": trusted_boundary(),
+        # 8. Whether complete mediation was actually EVALUATED, as distinct
+        # from evaluated-and-failed. Part E asks for this separately because a
+        # bare `false` reads as "we checked and it is broken", when the common
+        # case is "nothing asked the ledger, so there is no verdict". Collapsing
+        # the two is how the original suite reported completion it had never
+        # measured.
+        "mediation": _mediation_status(),
         # Context from the regression report.
         "attacks": m.attacks,
         "attacks_blocked": m.attacks_blocked,
         "false_negatives": m.attacks_missed,
+    }
+
+
+def _mediation_status() -> dict[str, object]:
+    """Three-valued mediation status: evaluated-pass, evaluated-fail, or neither.
+
+    `complete` is deliberately `None` rather than `False` when nothing was
+    evaluated — the same distinction `ExperimentResult` enforces with
+    `mediation_evaluated`, applied to this report so the two cannot drift.
+
+    The check is run by asking the brokers the scenarios were committed
+    against, not by inferring completion from the fact that blocks happened.
+    """
+    failures: list[str] = []
+    evaluated = False
+    for broker in _SCENARIO_BROKERS:
+        try:
+            failures.extend(broker.verify_complete_mediation())
+            evaluated = True
+        except Exception as exc:  # noqa: BLE001 - a broken check is not a pass
+            failures.append(f"verification_error:{type(exc).__name__}:{exc}")
+            evaluated = False
+
+    if not evaluated:
+        return {
+            "evaluated": False,
+            "complete": None,
+            "failures": failures,
+            "note": (
+                "the ledger check could not run, so complete mediation is not "
+                "claimed either way; this is not the same as 'false'"
+            ),
+        }
+    return {
+        "evaluated": True,
+        "complete": len(failures) == 0,
+        "failures": failures,
+        "note": None,
     }
 
 
@@ -613,9 +735,7 @@ def print_diagnostic_report() -> None:
     print("ECAC DIAGNOSTIC RUN")
     print("=" * 64)
     print(f"1. Unauthorized effects:   {r['unauthorized_effects']}")
-    print(
-        f"2. Legitimate completion:  {r['legitimate_completion']}/{r['legitimate_total']}"
-    )
+    print(f"2. Legitimate completion:  {r['legitimate_completion']}/{r['legitimate_total']}")
     print(f"3. False denials:          {r['false_denials_total']} {r['false_denials']}")
     print(f"4. UNKNOWN outcomes:       {r['unknown_outcomes']}")
     ap = r["approvals"]
@@ -636,13 +756,52 @@ def print_diagnostic_report() -> None:
     assert isinstance(tb, list)
     for component in tb:
         print(f"   - {component}")
+    med = r["mediation"]
+    assert isinstance(med, dict)
+    if not med["evaluated"]:
+        # Printed as its own state, with the note, because "not evaluated" and
+        # "evaluated and failed" lead to different actions and a reader who sees
+        # `False` for both would chase the wrong one.
+        print(
+            "8. Complete mediation:     NOT EVALUATED "
+            "(not the same as False — nothing asked the ledger)"
+        )
+        for failure in med["failures"]:
+            print(f"   ! {failure}")
+    else:
+        verdict = "pass" if med["complete"] else "FAIL"
+        print(f"8. Complete mediation:     evaluated={verdict}")
+        for failure in med["failures"]:
+            print(f"   ! {failure}")
     print("=" * 64)
-    print(f"Context: attacks={r['attacks']} blocked={r['attacks_blocked']} "
-          f"missed={r['false_negatives']}")
+    print(
+        f"Context: attacks={r['attacks']} blocked={r['attacks_blocked']} "
+        f"missed={r['false_negatives']}"
+    )
 
 
-if __name__ == "__main__":
-    print_diagnostic_report()
+def main(argv: list[str] | None = None) -> int:
+    """Entry point: the regression report, or `--diagnostic` for the seven metrics.
+
+    Previously this module had two `if __name__ == "__main__"` blocks, so the
+    first one won and `print_report()` was unreachable from the command line —
+    `python -m effect_broker.metrics` silently printed the diagnostic table
+    instead of the regression metrics the module is named for.
+    """
+    import sys
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] in {"-h", "--help"}:
+        print("usage: python -m effect_broker.metrics [--diagnostic]")
+        return 0
+    if args and args[0] == "--diagnostic":
+        print_diagnostic_report()
+        return 0
+    if args:
+        print(f"unknown argument: {args[0]}", file=sys.stderr)
+        return 2
+    print_report()
+    return 0
 
 
 def print_report() -> None:
@@ -665,7 +824,9 @@ def print_report() -> None:
         f"{r['latency_p95_ms']:.2f} / {r['latency_p99_ms']:.2f} ms"
     )
     print(f"Annotations:          {r['annotations']} explicit grants across scenarios")
-    print(f"TCB size:             {r['tcb_lines']} lines (broker.py + model.py)")
+    breakdown = tcb_breakdown()
+    detail = ", ".join(f"{name}={n}" for name, n in breakdown.items())
+    print(f"TCB size:             {r['tcb_lines']} executable lines ({detail})")
     st = r.get("session_taint", {})
     if st:
         print("Session-taint (honest:")
@@ -685,4 +846,4 @@ def print_report() -> None:
 
 
 if __name__ == "__main__":
-    print_report()
+    raise SystemExit(main())

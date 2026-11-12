@@ -797,6 +797,25 @@ class IndependentEffectLedger:
         # which is the optimistic direction -- exactly wrong for this metric. A
         # new source string added elsewhere must fall into `unknown` until
         # somebody decides what it means.
+        #
+        # BUT the source list alone cannot decide, because `executor.apply` is
+        # recorded BEFORE a real file write reaches the filesystem. A process
+        # killed between that record and the syscall leaves an
+        # `executor.apply` observation for a write that never happened, and
+        # scoring it `committed` here directly contradicted `verify()` — which
+        # asks for evidence and says UNKNOWN. Two functions in one ledger giving
+        # different answers about the same effect means the aggregate metrics
+        # (which read this one) counted as committed what the audit path
+        # reported as unknown.
+        #
+        # So: ask verify() first. It is the authoritative verdict; this function
+        # only exists to bucket the cases verify() has already settled.
+        if isinstance(self.verify(task_id, nonce), UnknownLedgerResult):
+            if any(e.source in _FAILED_SOURCES for e in obs_entries):
+                # Attempted and reported as not completing. Kept distinct from a
+                # silent gap, but still not a commit.
+                return OUTCOME_FAILED
+            return OUTCOME_UNKNOWN
         if any(e.source in _COMMITTING_SOURCES for e in obs_entries):
             return OUTCOME_COMMITTED
         if any(e.source in _FAILED_SOURCES for e in obs_entries):
@@ -826,6 +845,55 @@ class IndependentEffectLedger:
     @property
     def authorization_count(self) -> int:
         return sum(len(v) for v in self._authorizations.values())
+
+    def unknown_keys(self) -> list[tuple[str, str]]:
+        """Every (task_id, nonce) the ledger cannot speak for.
+
+        The universe is the union of authorizations and observations, so an
+        effect that was observed without ever being authorized is included — it
+        is unknown, not absent, and dropping it would remove a finding from the
+        accounting.
+        """
+        keys = set(self._authorizations) | set(self._observations)
+        unknown: list[tuple[str, str]] = []
+        for task_id, nonce in keys:
+            if self.outcome_of(task_id, nonce) in ("unknown", "abandoned"):
+                unknown.append((task_id, nonce))
+        return unknown
+
+    def target_for(self, task_id: str, nonce: str) -> str | None:
+        """The single target recorded for an effect, when it is unambiguous.
+
+        Returns None when nothing recorded a target, or when more than one
+        candidate survives. That second case is not hypothetical: a scoped write
+        records both the file and its parent directory as authorized targets, so
+        picking `sorted(...)[0]` chose the directory — which exists, so a check
+        against it "succeeded" and settled the unknown with the wrong path and
+        the wrong size. Guessing here produces a confident answer about a
+        resource nobody asked about, so ambiguity returns None and the caller
+        reports it.
+
+        Directories are excluded from candidacy for the same reason: the
+        question being asked is about a file effect, and a directory always
+        exists, which is how the wrong target looked settled.
+        """
+        key = (task_id, nonce)
+        candidates: set[str] = set()
+        for entry in self._authorizations.get(key, []):
+            candidates.update(entry.authorized_targets or ())
+        for entry in self._observations.get(key, []):
+            candidates.update(entry.observed_targets or ())
+
+        # Drop the parent directory a scoped effect also records, and anything
+        # that is not addressable as a file:// path.
+        files = {
+            uri
+            for uri in candidates
+            if uri.startswith("file://") and not os.path.isdir(uri[len("file://") :])
+        }
+        if len(files) != 1:
+            return None
+        return files.pop()
 
     @property
     def observation_count(self) -> int:

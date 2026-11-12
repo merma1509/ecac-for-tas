@@ -21,6 +21,24 @@ from effect_broker.ledger import (
     IndependentEffectLedger,
     OutcomeCounts,
 )
+from effect_broker.model import EffectEvidence
+
+
+def _commit_evidence(nonce: str) -> EffectEvidence:
+    """Evidence shaped like what the executor writes for a store effect.
+
+    Counted as committed only when this exists, because `verify()` requires a
+    measurement. An observation alone is the executor saying it applied
+    something it had not yet applied.
+    """
+    return EffectEvidence(
+        effect_id=nonce,
+        outcome="committed",
+        source="executor.apply.store",
+        window=(0.0, 0.0),
+        observed_targets=frozenset({"x"}),
+        transport_response="store=test",
+    )
 
 
 @pytest.fixture
@@ -34,7 +52,41 @@ class TestOutcomeOf:
     ) -> None:
         ledger.record_authorization("t", "n", frozenset({"x"}), source="executor.execute")
         ledger.record_observation("t", "n", frozenset({"x"}), source="executor.apply")
+        assert ledger.outcome_of("t", "n") == OUTCOME_UNKNOWN, (
+            "an unbacked apply observation was counted as committed while "
+            "verify() called the same effect unknown"
+        )
+
+    def test_observed_with_evidence_is_committed(
+        self, ledger: IndependentEffectLedger
+    ) -> None:
+        """Commit requires evidence, not just an `executor.apply` observation.
+
+        `executor.apply` is recorded BEFORE the effect reaches external state —
+        for a real file write it lands before the file is opened. A process
+        killed in between leaves an observation for a write that never happened.
+        """
+        ledger.record_authorization("t", "n", frozenset({"x"}), source="executor.execute")
+        ledger.record_observation("t", "n", frozenset({"x"}), source="executor.apply")
+        ledger.record_evidence("t", "n", _commit_evidence("n"))
         assert ledger.outcome_of("t", "n") == OUTCOME_COMMITTED
+
+    def test_outcome_of_never_disagrees_with_verify(
+        self, ledger: IndependentEffectLedger
+    ) -> None:
+        """The two functions answer the same question and must not differ.
+
+        They did: `outcome_counts()` said committed for a crash-torn write that
+        `verify()` reported as `committed_without_evidence`. Whichever one an
+        operator reads, they must read the same thing.
+        """
+        from effect_broker.ledger import UnknownLedgerResult
+
+        ledger.record_authorization("t", "torn", frozenset({"x"}), source="executor.execute")
+        ledger.record_observation("t", "torn", frozenset({"x"}), source="executor.apply")
+
+        assert isinstance(ledger.verify("t", "torn"), UnknownLedgerResult)
+        assert ledger.outcome_of("t", "torn") == OUTCOME_UNKNOWN
 
     def test_gate_block_is_denied(self, ledger: IndependentEffectLedger) -> None:
         ledger.record_authorization("t", "n", frozenset({"x"}), source="executor.execute")
@@ -93,10 +145,11 @@ class TestUnauthorizedNeverReadsAsDenied:
     def test_known_committing_sources_are_recognised(
         self, ledger: IndependentEffectLedger
     ) -> None:
-        """The allow-list must actually cover both commit paths."""
+        """The allow-list must actually cover both commit paths, with evidence."""
         for source in ("executor.apply", "subprocess.apply"):
             ledger.record_authorization("t", source, frozenset({"x"}), source="executor.execute")
             ledger.record_observation("t", source, frozenset({"x"}), source=source)
+            ledger.record_evidence("t", source, _commit_evidence(source))
             assert ledger.outcome_of("t", source) == OUTCOME_COMMITTED
 
     def test_known_denying_sources_are_recognised(
@@ -118,6 +171,7 @@ class TestOutcomeCounts:
         """Every effect lands in exactly one bucket; the totals must agree."""
         ledger.record_authorization("t", "ok", frozenset({"x"}), source="executor.execute")
         ledger.record_observation("t", "ok", frozenset({"x"}), source="executor.apply")
+        ledger.record_evidence("t", "ok", _commit_evidence("ok"))
 
         ledger.record_authorization("t", "blocked", frozenset({"x"}), source="executor.execute")
         ledger.record_observation("t", "blocked", None, source="executor.execute:BLOCKED")
@@ -225,3 +279,4 @@ class TestNoStaleRegistry:
         """The older entry point must not depend on the registry."""
         results = run_all_experiments()
         assert len(results) == 18
+

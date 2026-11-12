@@ -196,7 +196,13 @@ class RealEmailShim:
     def _build_message(
         self, sender: str, recipient: str, body: str, **extra: str
     ) -> tuple[bytes, str, int]:
-        """Build RFC 822 message. Returns (raw_bytes, subject, body_size)."""
+        """Build RFC 822 message. Returns (raw_bytes, subject, body_size).
+
+        `body_size` is diagnostic only. It is not a content binding: it changes
+        with date headers and MTA wrapping, and equal lengths say nothing about
+        equal content. The approval binds `body` itself, which `send()` puts on
+        the effect (B4).
+        """
         msg = email.message.EmailMessage()
         msg["From"] = sender
         msg["To"] = recipient
@@ -426,7 +432,9 @@ class RealEmailShim:
         extras_canon = frozenset(self._canonical_email(a) for a in extra_recipients.values())
         all_declared = frozenset({canon_recipient}) | extras_canon
 
-        # Build message once (for body_size / content analysis)
+        # Build message once (for body_size / content analysis).
+        # `body` is bound separately below — the framed message is not, because
+        # its bytes change with the date header and MTA wrapping (B4).
         raw_msg, subject, body_size = self._build_message(
             sender, canon_recipient, body, **extra_recipients
         )
@@ -468,15 +476,30 @@ class RealEmailShim:
 
         nonce = self._resolve_capability_nonce("send", canon_recipient, additional)
 
+        # Whose credentials carry this message. The SMTP login if the shim has
+        # one, otherwise the envelope sender; it is bound by the canonical
+        # request so an approval cannot be replayed under another identity.
+        acting_account = self.smtp_user or sender
+
         effect = Effect(
             etype="send",
             target=f"mailto:{canon_recipient}",
             metadata={
                 "extra_resources": list(additional),
                 "subject": subject,
+                # The body itself (B4). Without it the approval binds
+                # sha256("") and authorizes any payload at all. Bound as text,
+                # never as the framed RFC 822 message, so the digest is stable
+                # across date headers and MTA wrapping.
+                "body": body,
                 "body_size": body_size,
-                "bcc_detected": frozenset(),  # always empty at commit time
-                "mta_actual_recipients": list(actual_accepted),
+                # JSON-safe containers: this metadata crosses IPC in multi-process
+                # mode, where a frozenset is not serializable and aborts the commit.
+                "bcc_detected": [],
+                "mta_actual_recipients": sorted(actual_accepted),
+                # Identity the approval must bind to the actual recipient(s).
+                "sender": sender,
+                "acting_account": acting_account,
             },
             provenance=(
                 Data("shim-send", conf, integ),
