@@ -78,6 +78,20 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ### Fixed
 
+- **A shim was judged against the `default` task's mandate, not its own.**
+  `FileShim._commit_op()` built `Commit(effect=effect, task=None, ...)`, and
+  `gate()` resolves a `None` task by substituting `broker.tasks["default"]`. A
+  shim bound to a task whose ceiling covered only `file:///allowed` therefore
+  read `file:///secret/creds.txt` whenever that unrelated default task allowed
+  it. The shim now resolves and passes its own `Task`, and `_require_task()`
+  raises rather than inheriting another task's authority.
+- **A capability could be used by a holder it was not issued to.**
+  `_find_capability()` ended with a "last resort" scan matching on
+  `(right, target)` and ignoring `holder`, while `Auth._check_derivation()`
+  proves only that a capability is legitimate and never compares its `holder` to
+  the acting tool. A capability issued to `admin` for a specific secret file was
+  usable by an unrelated tool. Lookup is now restricted to credentials the tool
+  may hold, and a miss returns an unresolvable nonce so Auth fails closed.
 - **`/etc` was confined as a subtree, so `/etc/shadow` was readable.** Landlock
   grants a subtree, so listing `/etc` as a read root also granted `shadow`,
   `gshadow` and `sudoers`. Measured in a container with ABI 4, a confined

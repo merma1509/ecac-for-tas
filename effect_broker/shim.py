@@ -40,6 +40,7 @@ from .executor import IsolatedExecutor
 
 if TYPE_CHECKING:
     from .broker import EffectBroker
+    from .model import Task
     from .tool_registry import ToolRegistry
 
 T = TypeVar("T")
@@ -250,6 +251,32 @@ class FileShim:
         return self.verify_complete_mediation()
 
     # ---- private: the shim enforcement logic ----
+    def _require_task(self) -> Task:
+        """Resolve this shim's OWN task — never fall back to another one.
+
+        The shim is constructed with a task_id, and `IsolatedExecutor` is given
+        the same id, but the Commit used to carry `task=None`. `gate()` resolves
+        a None task by substituting `broker.tasks["default"]`, so every shim call
+        was judged against the DEFAULT task's ceiling instead of its own.
+
+        The consequence was a mandate escape: a shim bound to a task whose
+        ceiling covers only `file:///allowed` could read `file:///secret/...` as
+        long as the *default* task was allowed to (or as long as any capability
+        the fuzzy `_find_capability` lookup below happened to return was
+        accepted under the default ceiling).
+
+        Failing closed here is the point: a shim bound to an unregistered task
+        must not silently inherit somebody else's authority.
+        """
+        task = self.broker.tasks.get(self.task_id)
+        if task is None:
+            raise SecurityError(
+                f"[{self.tool_name}] task_id '{self.task_id}' is not registered. "
+                f"Refusing to fall back to another task's mandate — register the "
+                f"task first with broker.register_task()."
+            )
+        return task
+
     def _commit_op(
         self,
         op: ShimOp,
@@ -288,7 +315,7 @@ class FileShim:
             known_targets=known_targets,
         )
 
-        commit = Commit(effect=effect, task=None, tool_name=self.tool_name)
+        commit = Commit(effect=effect, task=self._require_task(), tool_name=self.tool_name)
 
         # Execute through the IsolatedExecutor (the ONLY path to both broker
         # gate AND store mutation). This calls broker.commit() + store.apply_effect().
@@ -331,38 +358,44 @@ class FileShim:
     ) -> str:
         """Find a capability covering (right, target) and return its ACTUAL nonce.
 
-        Lookup priority:
-          1. Exact (right, target) match
-          2. Wildcard: capability with target="*" covers any target
-          3. Domain-level: for email targets, find capability whose target
-             is a domain pattern or "*" covering the same domain label
+        Lookup order — every step is restricted to credentials this tool may
+        actually hold:
+          1. Exact (holder, right, target) match
+          2. (holder, right, target="*") wildcard match
+          3. (holder="EffectBroker", ...) — the shim acting on the broker's behalf
 
-        The returned nonce is the actual registered nonce in broker.capabilities.
-        This nonce must exist in broker.capabilities for Auth to succeed.
+        The returned nonce must exist in broker.capabilities for Auth to succeed.
 
-        BCC extras are validated by NoAmp's extra-target check, NOT by
-        nonce differentiation. The capability nonce identifies the CAPABILITY,
-        not the specific BCC variant.
+        There used to be a fourth step: "last resort: any capability with a
+        matching (right, target)", ignoring `holder` entirely. Combined with the
+        fact that Auth's `_check_derivation()` never compares `capability.holder`
+        to the acting tool, that step let ANY tool run on ANY other holder's
+        authority — a capability issued to `admin` for a specific secret file was
+        silently usable by `malicious-tool`. Attenuation without attenuation.
+
+        A capability is a credential for a named holder. Looking one up by target
+        alone is not a lookup, it is a guess — and a guess that grants authority.
+        Removed; a miss now yields an unresolvable nonce and Auth refuses it.
+
+        BCC extras are validated by NoAmp's extra-target check, NOT by nonce
+        differentiation. The nonce identifies the CAPABILITY, not the variant.
         """
-        # Primary: exact (holder, right, target) match
-        for nonce, cap in self.broker.capabilities.items():
-            if cap.holder == self.tool_name and cap.right == right and cap.target == target:
-                return nonce
-        # Fallback: EffectBroker holder (shim acts as broker for tool)
-        for nonce, cap in self.broker.capabilities.items():
-            if cap.holder == "EffectBroker" and cap.right == right and cap.target == target:
-                return nonce
-        # Wildcard match: capability with target="*" covers any target
-        for nonce, cap in self.broker.capabilities.items():
-            if cap.holder == self.tool_name and cap.right == right and cap.target == "*":
-                return nonce
-        for nonce, cap in self.broker.capabilities.items():
-            if cap.holder == "EffectBroker" and cap.right == right and cap.target == "*":
-                return nonce
-        # Last resort: any capability with matching (right, target)
-        for nonce, cap in self.broker.capabilities.items():
-            if cap.right == right and cap.target == target:
-                return nonce
+        candidates = (
+            (self.tool_name, right, target),
+            (self.tool_name, right, "*"),
+            ("EffectBroker", right, target),
+            ("EffectBroker", right, "*"),
+        )
+        for holder, want_right, want_target in candidates:
+            for nonce, cap in self.broker.capabilities.items():
+                if (
+                    cap.holder == holder
+                    and cap.right == want_right
+                    and cap.target == want_target
+                ):
+                    return nonce
+        # No credential this tool actually holds covers the request. Return a
+        # nonce that cannot resolve, so Auth fails closed.
         return f"no-cap-{right}-{target}"
 
     def _do_read(self, path: str) -> str:
