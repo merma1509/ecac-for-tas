@@ -226,12 +226,16 @@ class TestBCCSameProcess:
         assert actual_ret == declared  # MTA accepted all
         assert bcc_ret == frozenset()  # no BCC
 
-    def test_bcc_bypass_detected_and_blocked(self, smtp_server: Any) -> None:
-        """Simulated BCC bypass: MTA accepts extra recipient not in declared set.
+    def test_bcc_block_wiring_same_process(self, smtp_server: Any) -> None:
+        """Wiring only: a probe that reports BCC makes send() fail closed.
 
-        The shim patches _smtp_probe to return BCC detected. Should raise
-        EmailSecurityError before broker.commit is called. The ledger records
-        the BCC block as CONFIRMED_BLOCKED (shim-level block, no auth entry needed).
+        The probe is monkeypatched to return an address the shim never asked
+        about — something the real probe cannot do, since it can only probe the
+        addresses it is given. That makes this a test of the *block*, not of the
+        *discovery*. Undeclared recipients are confined by NoAmp and the
+        capability scope; see `test_bcc_envelope_check_cannot_fire` in
+        `tests/test_bcc_rejection_not_bypass.py` for what the envelope check
+        does and does not do on its own.
         """
         from effect_broker.ledger import LedgerVerdict
         from effect_broker.shim_email import EmailSecurityError, RealEmailShim
@@ -470,12 +474,13 @@ class TestBCCMultiProcess:
             if socket_path.exists():
                 socket_path.unlink()
 
-    def test_bcc_detection_blocks_before_commit(self, smtp_server: Any) -> None:
-        """BCC detected → EmailSecurityError raised before broker.commit.
+    def test_bcc_block_wiring_multi_process(self, smtp_server: Any) -> None:
+        """Wiring only: a patched probe reporting BCC blocks before commit.
 
-        This tests the same-process path with patched _smtp_probe.
-        The key security property: no message is queued before BCC check.
-        The ledger records the BCC block as CONFIRMED_BLOCKED
+        Same caveat as `test_bcc_block_wiring_same_process`: the probe is
+        replaced with one that invents an address, so this pins that the block
+        runs before `broker.commit` and reaches the ledger — not that the real
+        probe discovers anything.
         """
         from effect_broker.ledger import LedgerVerdict
         from effect_broker.shim_email import EmailSecurityError, RealEmailShim

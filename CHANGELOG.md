@@ -99,20 +99,29 @@ whose current `pyproject.toml` version is `0.1.1`.
   is restricted to credentials the tool may actually hold (`tool_name`, then
   `EffectBroker`), and a miss returns an unresolvable nonce so Auth fails
   closed.
-- **A rejected recipient was reported as a BCC bypass, and a real BCC was
-  invisible.** Two halves of one confusion about what "BCC detected" means.
+- **A rejected recipient was reported as a BCC bypass.**
   `executor_subprocess.py` (`real_smtp_probe`) filled `bcc_detected` with the
   addresses the MTA _refused_ while probing only the declared set, so an
   ordinary delivery failure — no such mailbox, greylisting — became an incident
   and the send was refused before delivery, with an error naming an address the
-  tool _had_ declared. `shim_email.py` avoided the inversion but computed
-  `actual_accepted - declared_set` against a probe that only ever asked about
-  `declared_set`, a difference that is empty by construction: it read like a
-  check and could never fire. The definition now lives in `send()` and is the
-  envelope's — accepted minus declared — with the probe reporting acceptances
-  and rejections separately. Pinned by
-  `tests/test_bcc_rejection_not_bypass.py`, which drives both modes against a
-  real MTA.
+  tool _had_ declared. The probe now reports acceptances and rejections
+  separately and never claims to detect BCC: it can only ask about addresses it
+  was given, so an undeclared recipient is "not asked", not "rejected". Pinned
+  by `tests/test_bcc_rejection_not_bypass.py`, which drives both modes against a
+  real MTA and asserts that a refused CC delivers.
+- **The `send()` envelope check could not fire, and two tests said otherwise.**
+  `shim_email.py` computed `actual_accepted - all_declared` against a probe that
+  only ever asks about `all_declared`, so the difference was empty by
+  construction. A BCC to a wildcard-scoped capability therefore delivered;
+  measured against a live aiosmtpd accepting every recipient. Two tests in
+  `tests/test_smtp_real_bcc.py` passed regardless, because they monkeypatch
+  `_smtp_probe` to return an address the shim never asked about — they pin the
+  wiring, not the discovery, and are now named `..._wiring_...` to say so.
+  **Undeclared recipients are confined by `NoAmp` and the capability scope, not
+  by this envelope arithmetic.** The check is kept as defence in depth against a
+  compromised or lying probe, and
+  `test_bcc_envelope_check_cannot_fire` records that it stays silent for an
+  honest one.
 - **A blocked read still transferred the file into the broker process.**
   `RealFileShim._stat_pre()` opened every regular file and read it in full to
   derive provenance labels, and it ran _before_ `broker.commit()`. A read of a
