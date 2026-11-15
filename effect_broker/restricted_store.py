@@ -446,6 +446,23 @@ class RestrictedResourceStore:
             self.identity_log.append(all_targets_frozen)
             return True
 
+        elif effect.etype in ("stat", "exists", "listdir") and isinstance(resource, File):
+            # Metadata-only filesystem operations. The broker gates and logs them
+            # exactly like content reads (they still reveal existence, size and
+            # names), but they mutate nothing, so there is no state to change —
+            # only the audit entry to write.
+            #
+            # Without this branch the same-process path raised
+            # ValueError("effect type stat not applicable to File") AFTER the gate
+            # had already ALLOWed, while the multi-process path handled these ops
+            # in the subprocess. Same mandate, same verdict: a mode difference in
+            # what a shim can call is a mode difference in what it can be trusted
+            # with. Note the metadata ops are logged, never treated as content
+            # reads, so they never taint the session (PLAN_2 S4).
+            self.effects_log.append((effect.etype, f"file:{target_id}"))
+            self.identity_log.append(all_targets_frozen)
+            return True
+
         elif effect.etype == "send" and isinstance(resource, Email):
             self._deliver_to_targets(
                 effect,

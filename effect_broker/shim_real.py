@@ -28,7 +28,6 @@ import hashlib
 import os
 import pathlib
 import re
-import stat
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -202,19 +201,25 @@ class RealFileShim:
         return f"file://{self._canonical_path(path)}"
 
     def _stat_pre(self, path: str, canon: str) -> tuple[bool, bytes | None]:
-        """Get pre-operation OS state. Returns (exists, content_or_none)."""
+        """Probe pre-operation OS state — METADATA ONLY, never file contents.
+
+        Returns (exists, None). The content element is always None by design.
+
+        This runs BEFORE the broker authorizes the operation. Reading the bytes
+        here meant an out-of-mandate file had its full contents pulled into the
+        broker process even when the effect was then BLOCKED: a denied `read` of
+        a file outside the capability scope still transferred all 4096 bytes of
+        it across the boundary. Confinement that leaks the payload on rejection
+        is not confinement.
+
+        Content is read only AFTER the gate returns ALLOW — see the read branch
+        of `_op`, where the bytes are the operation itself.
+        """
         try:
-            st = os.stat(canon)
-            is_file = stat.S_ISREG(st.st_mode)
-            if is_file:
-                # Read content for integrity/confidentiality derivation
-                with open(canon, "rb") as f:
-                    return True, f.read()
-            return True, None
-        except FileNotFoundError:
+            os.stat(canon)
+        except (FileNotFoundError, PermissionError):
             return False, None
-        except PermissionError:
-            return False, None
+        return True, None
 
     def _stat_post(self, path: str, canon: str) -> tuple[bool, bytes | None]:
         """Get post-operation OS state. Returns (exists, content_or_none)."""
@@ -402,6 +407,31 @@ class RealFileShim:
         elif any(kw in text for kw in ["internal", "not for distribution"]):
             return Confidentiality.INTERNAL
         return Confidentiality.PUBLIC
+
+    def _taint_session_for_content_upgrade(
+        self, canon: str, upgraded: Confidentiality
+    ) -> None:
+        """Taint the session when post-authorization content outranks the label.
+
+        Called only after the gate ALLOWED a read whose bytes turned out to be
+        more confidential than the path/permission bits suggested (e.g. a
+        world-readable file containing "api_key"). The read itself is already
+        authorized and cannot be un-done; the point is that the SECRET now lives
+        in the task's context, so any later send must see a tainted session.
+        """
+        task = self.broker.tasks.get(self.task_id)
+        if task is None or task.session is None:
+            return
+        if upgraded < Confidentiality.CONFIDENTIAL:
+            return
+        uri = self._file_uri(canon)
+        task.session.taint_for_send(
+            resource=uri,
+            reason=f"read-content-confidential({uri})",
+        )
+        metrics = getattr(self.broker, "_taint_metrics", None)
+        if metrics is not None:
+            metrics.reads_that_tainted += 1
 
     def _derive_extra_targets(
         self,
@@ -716,6 +746,20 @@ class RealFileShim:
                 f"No OS state changed."
             )
 
+        # ---- POST-AUTHORIZATION content label refresh (read only) ----
+        # The pre-probe deliberately reads no bytes, so the label that went into
+        # the gate came from path/permission bits alone. A world-readable file
+        # whose CONTENT says "password" or "api_key" is still secret; once the
+        # operation is authorized, the bytes that the operation itself returns
+        # are scored and the session is tainted if they outrank the label.
+        #
+        # Enforcement is not retroactive (the gate already said ALLOW) — but the
+        # secret is now in the task context, so it cannot leave afterwards
+        # without a declassification.
+        #
+        # Note: the scoring reuses the bytes the read branch already has. An
+        # extra `open()` here would transfer every allowed payload twice.
+
         # ALLOWed: route through IPC in multi-process mode, local fallback otherwise
         if self.ipc_client is not None:
             # IPC mode: real I/O happens in the isolated subprocess
@@ -796,6 +840,26 @@ class RealFileShim:
                     # session_update carries taint from CONFIDENTIAL read
                     if result.get("session_update"):
                         self._sync_session_from_subprocess(result["session_update"])
+                    # Evidence, measured on the bytes the subprocess actually
+                    # sent back. Without this the ledger has an authorization and
+                    # a dispatch marker but no observation, so verify() returns
+                    # UNKNOWN(committed_without_evidence) for every legitimate
+                    # read — an audit trail that cannot confirm the commonest
+                    # operation is not an audit trail.
+                    delivered = len(data)
+                    self.broker.ledger.record_evidence(
+                        self.task_id,
+                        nonce,
+                        self._evidence_after_io(
+                            nonce,
+                            op_type,
+                            canon,
+                            io_started,
+                            observed=frozenset({uri}),
+                            transport_response=f"subprocess read {delivered} bytes",
+                            observed_bytes=delivered,
+                        ),
+                    )
                     op.post_exists = True
                     op.post_content = data
                     self.ops.append(op)
@@ -806,6 +870,21 @@ class RealFileShim:
                     stat_result = os.stat(canon)  # local fallback for os.stat_result type
                     if result.get("session_update"):
                         self._sync_session_from_subprocess(result["session_update"])
+                    self.broker.ledger.record_evidence(
+                        self.task_id,
+                        nonce,
+                        self._evidence_after_io(
+                            nonce,
+                            op_type,
+                            canon,
+                            io_started,
+                            observed=frozenset({uri}),
+                            transport_response=(
+                                f"subprocess st_size={stat_result.st_size}"
+                            ),
+                            observed_bytes=stat_result.st_size,
+                        ),
+                    )
                     op.post_exists = post_exists
                     op.post_content = post_content
                     self.ops.append(op)
@@ -814,6 +893,18 @@ class RealFileShim:
                 elif op_type == "listdir":
                     result = self.ipc_client.real_file_listdir(canon, self.task_id)
                     entries = result.get("entries", [])
+                    self.broker.ledger.record_evidence(
+                        self.task_id,
+                        nonce,
+                        self._evidence_after_io(
+                            nonce,
+                            op_type,
+                            canon,
+                            io_started,
+                            observed=frozenset({uri}),
+                            transport_response=f"subprocess {len(entries)} entries",
+                        ),
+                    )
                     op.post_exists = post_exists
                     op.post_content = post_content
                     self.ops.append(op)
@@ -821,6 +912,20 @@ class RealFileShim:
 
                 elif op_type == "exists":
                     exists_result = os.path.exists(canon)
+                    self.broker.ledger.record_evidence(
+                        self.task_id,
+                        nonce,
+                        self._evidence_after_io(
+                            nonce,
+                            op_type,
+                            canon,
+                            io_started,
+                            observed=frozenset({uri}),
+                            transport_response=(
+                                "exists" if exists_result else "absent"
+                            ),
+                        ),
+                    )
                     op.post_exists = exists_result
                     op.post_content = post_content
                     self.ops.append(op)
@@ -942,21 +1047,86 @@ class RealFileShim:
             elif op_type == "read":
                 with open(canon, "rb") as f:
                     data = f.read()
+                # Post-authorization content upgrade, scored on the bytes this
+                # operation returns (no second read). A world-readable file whose
+                # content is a secret taints the session: the secret is in the
+                # task context now, whatever the permission bits claimed.
+                content_conf = self._derive_content_confidentiality(data)
+                if content_conf > conf:
+                    self._taint_session_for_content_upgrade(canon, content_conf)
+                # Observation for the same reason as the IPC branch above: an
+                # authorized read with no observation verifies as UNKNOWN.
+                delivered = len(data)
+                self.broker.ledger.record_evidence(
+                    self.task_id,
+                    nonce,
+                    self._evidence_after_io(
+                        nonce,
+                        op_type,
+                        canon,
+                        io_started,
+                        observed=frozenset({uri}),
+                        transport_response=f"read {delivered} bytes",
+                        observed_bytes=delivered,
+                    ),
+                )
+                op.post_exists = True
+                op.post_content = data
                 self.ops.append(op)
                 return cast(T, data)
 
             elif op_type == "stat":
                 stat_result = os.stat(canon)
+                # Metadata ops mutate nothing, so the "observation" is simply
+                # that the metadata was delivered. Without it an authorized stat
+                # verifies as UNKNOWN(committed_without_evidence).
+                self.broker.ledger.record_evidence(
+                    self.task_id,
+                    nonce,
+                    self._evidence_after_io(
+                        nonce,
+                        op_type,
+                        canon,
+                        io_started,
+                        observed=frozenset({uri}),
+                        transport_response=f"st_size={stat_result.st_size}",
+                        observed_bytes=stat_result.st_size,
+                    ),
+                )
                 self.ops.append(op)
                 return cast(T, stat_result)
 
             elif op_type == "listdir":
                 entries = os.listdir(canon)
+                self.broker.ledger.record_evidence(
+                    self.task_id,
+                    nonce,
+                    self._evidence_after_io(
+                        nonce,
+                        op_type,
+                        canon,
+                        io_started,
+                        observed=frozenset({uri}),
+                        transport_response=f"{len(entries)} entries",
+                    ),
+                )
                 self.ops.append(op)
                 return cast(T, entries)
 
             elif op_type == "exists":
                 exists_result = os.path.exists(canon)
+                self.broker.ledger.record_evidence(
+                    self.task_id,
+                    nonce,
+                    self._evidence_after_io(
+                        nonce,
+                        op_type,
+                        canon,
+                        io_started,
+                        observed=frozenset({uri}),
+                        transport_response="exists" if exists_result else "absent",
+                    ),
+                )
                 self.ops.append(op)
                 return cast(T, exists_result)
 

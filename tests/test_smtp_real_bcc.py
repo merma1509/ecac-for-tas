@@ -226,12 +226,16 @@ class TestBCCSameProcess:
         assert actual_ret == declared  # MTA accepted all
         assert bcc_ret == frozenset()  # no BCC
 
-    def test_bcc_bypass_detected_and_blocked(self, smtp_server: Any) -> None:
-        """Simulated BCC bypass: MTA accepts extra recipient not in declared set.
+    def test_bcc_block_wiring_same_process(self, smtp_server: Any) -> None:
+        """Wiring only: a probe that reports BCC makes send() fail closed.
 
-        The shim patches _smtp_probe to return BCC detected. Should raise
-        EmailSecurityError before broker.commit is called. The ledger records
-        the BCC block as CONFIRMED_BLOCKED (shim-level block, no auth entry needed).
+        The probe is monkeypatched to return an address the shim never asked
+        about — something the real probe cannot do, since it can only probe the
+        addresses it is given. That makes this a test of the *block*, not of the
+        *discovery*. Undeclared recipients are confined by NoAmp and the
+        capability scope; see `test_bcc_envelope_check_cannot_fire` in
+        `tests/test_bcc_rejection_not_bypass.py` for what the envelope check
+        does and does not do on its own.
         """
         from effect_broker.ledger import LedgerVerdict
         from effect_broker.shim_email import EmailSecurityError, RealEmailShim
@@ -470,12 +474,13 @@ class TestBCCMultiProcess:
             if socket_path.exists():
                 socket_path.unlink()
 
-    def test_bcc_detection_blocks_before_commit(self, smtp_server: Any) -> None:
-        """BCC detected → EmailSecurityError raised before broker.commit.
+    def test_bcc_block_wiring_multi_process(self, smtp_server: Any) -> None:
+        """Wiring only: a patched probe reporting BCC blocks before commit.
 
-        This tests the same-process path with patched _smtp_probe.
-        The key security property: no message is queued before BCC check.
-        The ledger records the BCC block as CONFIRMED_BLOCKED
+        Same caveat as `test_bcc_block_wiring_same_process`: the probe is
+        replaced with one that invents an address, so this pins that the block
+        runs before `broker.commit` and reaches the ledger — not that the real
+        probe discovers anything.
         """
         from effect_broker.ledger import LedgerVerdict
         from effect_broker.shim_email import EmailSecurityError, RealEmailShim
@@ -748,9 +753,44 @@ class TestBCCRealSMTPIntegration:
             handler.data_log.clear()
             handler.rcpt_log.clear()
 
-            # KEY TEST: send() with BCC recipient not declared in capability
-            # should raise EmailSecurityError. The capability only allows
-            # internal@corp.com, but we're adding attacker@evil.com as BCC.
+            # KEY TEST: send() with an external BCC recipient must raise
+            # EmailSecurityError. The capability is scoped to the internal
+            # domain only, so attacker@evil.com (domain=external) has no mandate.
+            #
+            # NOTE: this capability was previously scope={"*"}, i.e. a mandate
+            # that covers every domain. The block below then came from NoAmp
+            # mangling the wildcard into a literal string rather than from any
+            # real confinement — the assertion passed for the wrong reason. The
+            # scope is now actually restrictive, so NoAmp blocks on merit.
+            restrictive_broker = EffectBroker(mode="same-process")
+            restrictive_broker.store._unsafe_bootstrap_email(
+                "mailto:internal@corp.com", Domain.INTERNAL
+            )
+            internal_only = Capability(
+                owner="User",
+                holder="test-tool",
+                right="send",
+                target="*",
+                scope=frozenset({"internal"}),  # internal domain only
+                expiry=float("inf"),
+                nonce="cap-send-internal",
+            )
+            restrictive_broker.tasks["default"] = Task(
+                task_id="default",
+                owner="User",
+                ceiling=internal_only,
+                flow_boundary=(Confidentiality.CONFIDENTIAL, Integrity.USER),
+            )
+            restrictive_broker.capabilities["cap-send-internal"] = internal_only
+
+            bcc_test_shim = RealEmailShim(
+                broker=restrictive_broker,
+                task_id="default",
+                tool_name="test-tool",
+                smtp_host="127.0.0.1",
+                smtp_port=port,
+            )
+
             with pytest.raises(EmailSecurityError):
                 bcc_test_shim.send(
                     "user@corp.com",
@@ -766,10 +806,10 @@ class TestBCCRealSMTPIntegration:
                 f"data_log has {len(handler.data_log)} entries"
             )
 
-            # Verify ledger records the block (blocker may be NoAmp or BCC)
-            ledger = broker.ledger
-            obs_keys = list(ledger._observations.keys())
-            assert len(obs_keys) >= 1, "Block must be recorded to ledger"
+            # Verify the block was recorded in the restrictive broker's ledger,
+            # i.e. the refusal went through mediation rather than raising early.
+            ledger = restrictive_broker.ledger
+            assert len(ledger._observations) >= 1, "Block must be recorded to ledger"
 
         finally:
             controller.stop()
