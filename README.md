@@ -69,7 +69,11 @@ Or via `dev.sh`:
 - **Single mutation path.** `RestrictedResourceStore.apply_effect()` is the only call site
   for `_apply_effect()`. Both `broker.commit()` and shim callers unify in `executor.execute()`.
 - **TCOBB (multi-process).** RealFileShim/RealEmailShim derive effects from real OS/SMTP state.
-- **Real SMTP BCC detection.** `RCPT TO` probe → RSET → no message queued before commit.
+- **Real SMTP probe, honest about its reach.** `RCPT TO` probe → RSET → no message
+  queued before commit. The probe reports which declared recipients the MTA accepts;
+  it cannot see an address it was never asked about, so an undeclared recipient is
+  confined by NoAmp and the capability scope, not by the probe. A hidden BCC that
+  reached the MTA is caught after the fact by the oracle reading the MTA log.
 - **NoAmp ≠ Auth.** A forged capability that passes Auth still fails NoAmp (`owner ≠ "User"`)
 - **Session Taint Mode.** `read(CONFIDENTIAL file)` taints the session; FlowOK blocks
   subsequent `send` unless a broker-recorded declass exists.
@@ -118,6 +122,11 @@ Or via `dev.sh`:
   permitted write roots** (`/tmp`, `/var/tmp`, `/dev/shm`): with `HOME=/tmp` the selftest cannot
   observe a denied home read and the executor correctly refuses to start.
 - **All tests ≠ real confinement.** Regression evidence, not proven protected-effect confinement
+- **No pre-send discovery of an undeclared email recipient.** The RSET probe can only ask about
+  recipients the tool declared, so the shim cannot refuse a BCC on its own evidence; the envelope
+  arithmetic `accepted - declared` is empty by construction and stays silent for an honest probe.
+  Confinement rests on NoAmp plus the capability scope, and a hidden BCC that reached the MTA is
+  detected after the fact by the oracle reading the MTA log, not prevented.
 - **Same-process isolation is advisory.** Direct store mutation returns `UNKNOWN`. Use multi-process mode.
 - **Tool declarations require a trusted manifest.** The structural check is only as strong as
   the trust placed in the tool schema
