@@ -1813,16 +1813,33 @@ class EffectBroker:
           When a read effect reads a CONFIDENTIAL file, the session is marked
           as tainted. This prevents subsequent send effects without declass.
 
+        ORDER: the effect is applied FIRST; taint and read-provenance are derived
+        from the post-apply store state. The store creates file resources lazily
+        inside apply_effect(), so any pre-apply resolve() of a not-yet-known path
+        returns None and silently skips the taint.
+
         Returns:
             True if the effect was applied successfully.
             False if the effect could NOT be applied (e.g., resource not found).
             The caller MUST handle False and must NOT record CONFIRMED_COMMITTED
             to the ledger in this case.
         """
+        # ---- Apply FIRST, then derive taint/provenance from the applied state ----
+        # Ordering is load-bearing. The store only registers a file resource when
+        # apply_effect() creates it (dynamic file:// resolution). Deriving taint
+        # BEFORE applying therefore called store.resolve() on a path the store had
+        # never heard of, got None, and skipped the taint entirely — so a same-
+        # process read of a CONFIDENTIAL file left the session untainted and the
+        # subsequent read→send exfiltration was ALLOWED. Multi-process mode masked
+        # this because taint arrives via the subprocess session_update instead.
+        applied = self.store.apply_effect(effect)
+        if not applied:
+            return False
+
         # ---- Session taint: taint the SPECIFIC read resource on CONFIDENTIAL read ----
-        # PLAN_2 S2 — per-resource taint (keyed by the file URI), not a global flag.
-        # PLAN_2 S4 — only a `read` (content) taints; a `stat` (metadata) does NOT.
-        # PLAN_2 S3 — taint-rate: counts reads that taint vs total reads.
+        # per-resource taint (keyed by the file URI), not a global flag.
+        # only a `read` (content) taints; a `stat` (metadata) does NOT.
+        # taint-rate: counts reads that taint vs total reads.
         if effect.etype == "read" and task.session is not None:
             m = self._taint_metrics
             if m is not None:
@@ -1838,7 +1855,7 @@ class EffectBroker:
                         m.reads_that_tainted += 1
 
         # Register read effect output in the trusted provenance chain.
-        # PLAN_2 S1: the entry is bound to the authorizing capability's scope
+        # the entry is bound to the authorizing capability's scope
         # (scope_hash) so a provenance_id cannot be replayed under a different
         # capability. content=None because the broker stores content="" (would be
         # large) — the content binding degrades to "not bound" for read outputs.
@@ -1869,8 +1886,9 @@ class EffectBroker:
                 # FlowOK will call task.session.verify_effect_provenance(effect)
                 # which checks the Data items in effect.provenance have valid IDs.
 
-        # Pass through the store's success/failure indicator
-        return self.store.apply_effect(effect)
+        # Already applied at the top of this method, before the taint/provenance
+        # derivation that needs the post-apply resource to exist.
+        return True
 
     def apply_effect(self, commit_or_effect: Commit | Effect, task: Task | None = None) -> None:
         """Apply an effect to external state. CALLER must verify gate first.
