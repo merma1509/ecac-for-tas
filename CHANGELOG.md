@@ -127,6 +127,15 @@ whose current `pyproject.toml` version is `0.1.1`.
   meant the BCC-blocking test passed for the wrong reason, measuring the
   mangling rather than confinement; that test now uses a genuinely restrictive
   scope so the refusal comes from NoAmp on merit.
+- **`stat`, `exists` and `listdir` raised after the gate had already allowed
+  them.** `RestrictedResourceStore._apply_effect_inner` handled only
+  write/read/send/network/delete for `File`, so the metadata operations fell
+  through to `ValueError("effect type stat not applicable to File")`. In
+  same-process mode the shim calls the store directly, so they blew up _after_
+  ALLOW; in multi-process mode the work happens in the subprocess and succeeded.
+  A mode difference in which shim calls work is a mode difference in what a tool
+  can be trusted with. These ops mutate nothing, so the store records the audit
+  entry and returns, and they never taint.
 - **`/etc` was confined as a subtree, so `/etc/shadow` was readable.** Landlock
   grants a subtree, so listing `/etc` as a read root also granted `shadow`,
   `gshadow` and `sudoers`. Measured in a container with ABI 4, a confined
