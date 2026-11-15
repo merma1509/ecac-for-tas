@@ -117,6 +117,16 @@ whose current `pyproject.toml` version is `0.1.1`.
   wrong — but an audit trail that cannot confirm the commonest operation is not
   an audit trail.
   > > > > > > > ec8ccd1 (docs: changelog for pre-auth read and session taint)
+- **A wildcard mandate covered the primary target and not its copies.**
+  `_check_no_amplification()` read `"*"` in `capability.scope` as a literal
+  string when validating `known_targets.additional`, but as a wildcard for the
+  primary target a few lines above — so a capability scoped `{"*"}` could
+  address a message and never copy or blind-copy anyone:
+  `extra-target-outside-scope(bcc@corp.com not under cap-scope={'*'})`. The
+  mandate said "everything" and the enforcement said "nothing extra". It also
+  meant the BCC-blocking test passed for the wrong reason, measuring the
+  mangling rather than confinement; that test now uses a genuinely restrictive
+  scope so the refusal comes from NoAmp on merit.
 - **`/etc` was confined as a subtree, so `/etc/shadow` was readable.** Landlock
   grants a subtree, so listing `/etc` as a read root also granted `shadow`,
   `gshadow` and `sudoers`. Measured in a container with ABI 4, a confined
