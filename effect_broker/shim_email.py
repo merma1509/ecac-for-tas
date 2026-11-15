@@ -407,7 +407,16 @@ class RealEmailShim:
                 server.rset()
             finally:
                 server.quit()
-            bcc_detected = actual_accepted - declared_set
+            # BCC means "the MTA accepted an address the tool never declared".
+            # Probing only `declared_set` means an accepted address is by
+            # construction a member of it, so this difference is always empty.
+            #
+            # It used to be spelled `actual_accepted - declared_set`, which reads
+            # like a real check and can never fire — worse than no check, because
+            # it advertises a guarantee the shim does not provide. The real
+            # cross-check against undeclared recipients happens in send(), which
+            # compares the MTA-accepted set with the envelope the shim built.
+            bcc_detected = frozenset[str]()
             return declared_set, actual_accepted, bcc_detected
         except (smtplib.SMTPException, OSError, SMTPError) as ex:
             raise SMTPError(f"BCC probe failed: {ex}") from ex
@@ -439,12 +448,10 @@ class RealEmailShim:
             sender, canon_recipient, body, **extra_recipients
         )
 
-        # Phase 1: SMTP RSET-only probe — discovers ACTUAL MTA recipients
+        # Phase 1: SMTP RSET-only probe — discovers ACTUAL MTA recipients.
         # RSET after RCPT TO means NO message is queued or delivered here.
-        # Any recipient accepted by the MTA (code 250) that is NOT in
-        # all_declared is a BCC attempt.
         try:
-            declared_from_smtp, actual_accepted, bcc_detected = self._smtp_probe(
+            declared_from_smtp, actual_accepted, bcc_reported = self._smtp_probe(
                 sender, all_declared
             )
         except SMTPError as ex:
@@ -452,8 +459,21 @@ class RealEmailShim:
                 f"[{self.tool_name}] SMTP BCC probe failed: {ex}. Failing closed — no email sent."
             ) from ex
 
-        # Fail closed: if MTA accepted recipients the tool did NOT declare,
+        # Fail closed: if the MTA accepted recipients the tool did NOT declare,
         # this is a BCC bypass attempt. Block BEFORE broker.commit.
+        #
+        # Derive the set here rather than trusting the probe's own verdict. The
+        # probe can only ask about addresses it was given, so any BCC it reports
+        # is at best a subset of what was actually accepted; and a peer that
+        # reported MTA *rejections* under this name would turn an ordinary
+        # "no such mailbox" into a security incident. The definition is the
+        # envelope's: accepted minus declared.
+        bcc_detected = frozenset(actual_accepted) - all_declared
+        if bcc_reported - bcc_detected:
+            # Defence in depth: a probe claiming BCC that the accepted set does
+            # not support would otherwise be silently dropped.
+            bcc_detected = bcc_detected | (bcc_reported - all_declared)
+
         if bcc_detected:
             # Record to ledger so CONFIRMED_BLOCKED verdict is meaningful for shim-blocks
             bcc_nonce = f"bcc-blocked-{canon_recipient}"

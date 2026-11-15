@@ -1580,10 +1580,28 @@ class ExecutorServer:
             elif op == "real_smtp_probe":
                 # RSET-only probe for BCC detection — happens ENTIRELY in subprocess.
                 # No message is queued; this just discovers actual MTA recipients.
+                #
+                # BCC is "the MTA accepted an address the tool did NOT declare".
+                # It is NOT "the MTA rejected an address the tool declared".
+                #
+                # This probe used to fill `bcc_detected` with the REJECTIONS
+                # (non-250 replies) while probing only the declared set, which
+                # made it structurally blind to a real BCC *and* reported ordinary
+                # delivery failures as attacks. A CC to a mailbox the MTA does not
+                # know came back as "BCC bypass detected" naming an address the
+                # tool had declared, and the send was refused before delivery.
+                #
+                # Since the probe can only ask about addresses it is given, its
+                # honest answer for an undeclared recipient is "not asked" — the
+                # real cross-check happens against the envelope the shim builds.
+                # What this probe legitimately reports is which declared
+                # recipients the MTA will accept, so that the effect carries the
+                # true delivery set. Rejections are reported as rejected, not as
+                # BCC.
                 sender = payload["sender"]
                 recipients = payload["recipients"]
                 actual_accepted: list[str] = []
-                bcc_detected = []
+                rejected: list[str] = []
                 smtp = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
                 try:
                     smtp.ehlo()
@@ -1593,7 +1611,7 @@ class ExecutorServer:
                         if code == 250:
                             actual_accepted.append(rcpt)
                         else:
-                            bcc_detected.append(rcpt)
+                            rejected.append(rcpt)
                     smtp.rset()  # Abort — no message queued
                 finally:
                     smtp.quit()
@@ -1601,7 +1619,11 @@ class ExecutorServer:
                     "ok": True,
                     "declared": recipients,
                     "actual_accepted": actual_accepted,
-                    "bcc_detected": bcc_detected,
+                    "rejected": rejected,
+                    # A probe cannot see an address it never asked about, so it
+                    # never reports BCC. Kept for wire compatibility; the field is
+                    # derived below, not from rejections.
+                    "bcc_detected": [],
                 }
 
             elif op == "real_imap_read_inbox":

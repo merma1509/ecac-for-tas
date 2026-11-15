@@ -136,6 +136,17 @@ whose current `pyproject.toml` version is `0.1.1`.
   A mode difference in which shim calls work is a mode difference in what a tool
   can be trusted with. These ops mutate nothing, so the store records the audit
   entry and returns, and they never taint.
+- **A rejected recipient was reported as a BCC bypass, and a real BCC was
+  invisible.** Two halves of one confusion. `executor_subprocess.py`
+  (`real_smtp_probe`) filled `bcc_detected` with the addresses the MTA _refused_
+  while probing only the declared set, so an ordinary delivery failure became a
+  security incident and the send was refused before delivery, with an error
+  naming an address the tool _had_ declared. `shim_email.py` avoided the
+  inversion but computed `actual_accepted - declared_set` against a probe that
+  only ever asked about `declared_set` — a difference empty by construction,
+  which read like a check and could never fire. The definition now lives in
+  `send()` and is the envelope's: accepted minus declared, with the probe
+  reporting acceptances and rejections separately.
 - **`/etc` was confined as a subtree, so `/etc/shadow` was readable.** Landlock
   grants a subtree, so listing `/etc` as a read root also granted `shadow`,
   `gshadow` and `sudoers`. Measured in a container with ABI 4, a confined
