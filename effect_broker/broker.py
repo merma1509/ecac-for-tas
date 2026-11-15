@@ -1207,7 +1207,18 @@ class EffectBroker:
         # The capability scope defines which domains (scopes) the capability covers.
         # Extra targets outside this scope are not authorized — for both email
         # (domain label check) AND non-email targets (scope inclusion check).
-        if effect.known_targets is not None and effect.known_targets.additional:
+        #
+        # A "*" entry in the capability scope means "covers everything" — the
+        # same reading given to it for the PRIMARY target above. Treating it as a
+        # literal string here rejected every extra target as
+        # "extra-target-outside-scope(... not in cap-scope={'*'})", so a wildcard
+        # capability could address a message but never copy anyone on it.
+        extra_scope_wildcard = "*" in capability.scope
+        if (
+            not extra_scope_wildcard
+            and effect.known_targets is not None
+            and effect.known_targets.additional
+        ):
             for extra_target in effect.known_targets.additional:
                 if "@" in extra_target:
                     # Email extra target: check domain label against cap scope

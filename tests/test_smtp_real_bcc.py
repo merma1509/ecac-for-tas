@@ -748,9 +748,44 @@ class TestBCCRealSMTPIntegration:
             handler.data_log.clear()
             handler.rcpt_log.clear()
 
-            # KEY TEST: send() with BCC recipient not declared in capability
-            # should raise EmailSecurityError. The capability only allows
-            # internal@corp.com, but we're adding attacker@evil.com as BCC.
+            # KEY TEST: send() with an external BCC recipient must raise
+            # EmailSecurityError. The capability is scoped to the internal
+            # domain only, so attacker@evil.com (domain=external) has no mandate.
+            #
+            # NOTE: this capability was previously scope={"*"}, i.e. a mandate
+            # that covers every domain. The block below then came from NoAmp
+            # mangling the wildcard into a literal string rather than from any
+            # real confinement — the assertion passed for the wrong reason. The
+            # scope is now actually restrictive, so NoAmp blocks on merit.
+            restrictive_broker = EffectBroker(mode="same-process")
+            restrictive_broker.store._unsafe_bootstrap_email(
+                "mailto:internal@corp.com", Domain.INTERNAL
+            )
+            internal_only = Capability(
+                owner="User",
+                holder="test-tool",
+                right="send",
+                target="*",
+                scope=frozenset({"internal"}),  # internal domain only
+                expiry=float("inf"),
+                nonce="cap-send-internal",
+            )
+            restrictive_broker.tasks["default"] = Task(
+                task_id="default",
+                owner="User",
+                ceiling=internal_only,
+                flow_boundary=(Confidentiality.CONFIDENTIAL, Integrity.USER),
+            )
+            restrictive_broker.capabilities["cap-send-internal"] = internal_only
+
+            bcc_test_shim = RealEmailShim(
+                broker=restrictive_broker,
+                task_id="default",
+                tool_name="test-tool",
+                smtp_host="127.0.0.1",
+                smtp_port=port,
+            )
+
             with pytest.raises(EmailSecurityError):
                 bcc_test_shim.send(
                     "user@corp.com",
@@ -766,10 +801,10 @@ class TestBCCRealSMTPIntegration:
                 f"data_log has {len(handler.data_log)} entries"
             )
 
-            # Verify ledger records the block (blocker may be NoAmp or BCC)
-            ledger = broker.ledger
-            obs_keys = list(ledger._observations.keys())
-            assert len(obs_keys) >= 1, "Block must be recorded to ledger"
+            # Verify the block was recorded in the restrictive broker's ledger,
+            # i.e. the refusal went through mediation rather than raising early.
+            ledger = restrictive_broker.ledger
+            assert len(ledger._observations) >= 1, "Block must be recorded to ledger"
 
         finally:
             controller.stop()
