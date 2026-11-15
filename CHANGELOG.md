@@ -80,43 +80,83 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 - **A shim was judged against the `default` task's mandate, not its own.**
   `FileShim._commit_op()` built `Commit(effect=effect, task=None, ...)`, and
-  `gate()` resolves a `None` task by substituting `broker.tasks["default"]`. A
-  shim bound to a task whose ceiling covered only `file:///allowed` therefore
-  read `file:///secret/creds.txt` whenever that unrelated default task allowed
-  it. The shim now resolves and passes its own `Task`, and `_require_task()`
-  raises rather than inheriting another task's authority.
+  `gate()` resolves a `None` task by substituting `broker.tasks["default"]`. The
+  `task_id` the shim was constructed with reached `IsolatedExecutor` and never
+  reached the gate. A shim bound to a task whose ceiling covered only
+  `file:///allowed` therefore read `file:///secret/creds.txt` successfully
+  whenever the unrelated default task allowed it — the tool's mandate silently
+  replaced by another task's. The shim now resolves and passes its own `Task`,
+  and `_require_task()` raises `SecurityError` for an unregistered task instead
+  of inheriting somebody else's authority. Pinned by
+  `tests/test_shim_task_and_holder.py`.
 - **A capability could be used by a holder it was not issued to.**
   `_find_capability()` ended with a "last resort" scan matching on
-  `(right, target)` and ignoring `holder`, while `Auth._check_derivation()`
-  proves only that a capability is legitimate and never compares its `holder` to
-  the acting tool. A capability issued to `admin` for a specific secret file was
-  usable by an unrelated tool. Lookup is now restricted to credentials the tool
-  may hold, and a miss returns an unresolvable nonce so Auth fails closed.
+  `(right, target)` and ignoring `holder` entirely, while
+  `Auth._check_derivation()` proves only that a capability is _legitimate_
+  (root-anchored and monotonically attenuated) and never compares its `holder`
+  to the acting tool. Together, a capability issued to `admin` for a specific
+  secret file was usable by an unrelated tool. The fallback is removed; lookup
+  is restricted to credentials the tool may actually hold (`tool_name`, then
+  `EffectBroker`), and a miss returns an unresolvable nonce so Auth fails
+  closed.
+- **A rejected recipient was reported as a BCC bypass, and a real BCC was
+  invisible.** Two halves of one confusion about what "BCC detected" means.
+  `executor_subprocess.py` (`real_smtp_probe`) filled `bcc_detected` with the
+  addresses the MTA _refused_ while probing only the declared set, so an
+  ordinary delivery failure — no such mailbox, greylisting — became an incident
+  and the send was refused before delivery, with an error naming an address the
+  tool _had_ declared. `shim_email.py` avoided the inversion but computed
+  `actual_accepted - declared_set` against a probe that only ever asked about
+  `declared_set`, a difference that is empty by construction: it read like a
+  check and could never fire. The definition now lives in `send()` and is the
+  envelope's — accepted minus declared — with the probe reporting acceptances
+  and rejections separately. Pinned by
+  `tests/test_bcc_rejection_not_bypass.py`, which drives both modes against a
+  real MTA.
 - **A blocked read still transferred the file into the broker process.**
   `RealFileShim._stat_pre()` opened every regular file and read it in full to
   derive provenance labels, and it ran _before_ `broker.commit()`. A read of a
   file outside the capability scope was refused correctly — after all 4096 bytes
-  of it had crossed into the process doing the refusing. Measured on the denied
-  path: 4096 bytes before, 0 after. The pre-probe is now metadata-only and
-  content is read only after ALLOW; the keyword heuristic survives as a
-  post-authorization upgrade, because the secret is in the task context
-  regardless of what the permission bits claimed.
+  of it had crossed the boundary into the process doing the refusing.
+  Confinement that hands over the secret when it says no is not confinement.
+  The pre-probe is now metadata-only (`os.stat`, no `open`) and content is read
+  only after the gate returns ALLOW. The keyword heuristic it existed for
+  survives as a _post_-authorization upgrade: a world-readable file whose bytes
+  say `api_key` still taints the session, because the secret is now in the task
+  context regardless of what the permission bits claimed. Pinned by
+  `tests/test_no_preauth_content_read.py`, which measures bytes moved on the
+  denied path.
 - **A CONFIDENTIAL read did not taint the session in same-process mode.**
-  `_apply_effect()` derived taint before `store.apply_effect()`, but the
-  restricted store registers file resources lazily inside it, so the pre-apply
-  `resolve()` returned `None` and the taint was skipped. A read of a 0o600 file
-  left `session.tainted == False` and the follow-up read→send exfiltration
-  passed FlowOK. Multi-process mode masked it — taint arrives there via the
-  subprocess `session_update` — and every same-process test called
-  `taint_for_send()` by hand, so nothing pinned the broken path.
+  `broker._apply_effect()` derived session taint _before_ calling
+  `store.apply_effect()`, but the restricted store registers file resources
+  lazily inside `apply_effect()`. A pre-apply `store.resolve()` on a path the
+  store had never seen returned `None`, the guard was false, and the taint was
+  skipped — so a read of a 0o600 file left `session.tainted == False` and the
+  follow-up read→send exfiltration passed FlowOK. Multi-process mode masked it,
+  because taint arrives there via the subprocess `session_update`; the old suite
+  exercised taint only on that path and every same-process test called
+  `taint_for_send()` by hand, so neither pinned the broken one. `apply_effect()`
+  now applies first and derives taint from the post-apply state. Both modes must
+  agree, and `tests/test_session_taint_same_process.py` holds them to it.
 - **An authorized read left no observation, so it verified as UNKNOWN.**
   `RealFileShim` recorded a dispatch marker for `read` and never recorded
-  evidence afterwards. `ledger.verify()` therefore returned
-  `committed_without_evidence` for _every_ legitimate read: a real bypass and a
-  normal read produced the same verdict. The invariant held, so nothing looked
-  wrong — but an audit trail that cannot confirm the commonest operation is not
-  an audit trail.
-  > > > > > > > ec8ccd1 (docs: changelog for pre-auth read and session taint)
+  evidence afterwards — unlike `write` and `delete`. `ledger.verify()` therefore
+  returned `committed_without_evidence` for _every_ legitimate read, which meant
+  a real bypass and a normal read produced the same verdict. The invariant
+  ("authorized without observation → UNKNOWN, never safe") held, so nothing
+  looked wrong; but an audit trail that cannot confirm the commonest operation
+  is not an audit trail. Evidence is now recorded in both branches, measured on
+  the bytes actually delivered. Pinned by `tests/test_read_evidence.py`.
+- **`stat`, `exists` and `listdir` raised after the gate had already allowed
+  them.** `RestrictedResourceStore._apply_effect_inner` handled only
+  write/read/send/network/delete for `File`, so the metadata operations fell
+  through to `ValueError("effect type stat not applicable to File")`. In
+  same-process mode the shim calls the store directly, so those calls blew up
+  _after_ ALLOW, while in multi-process mode the work happens in the subprocess
+  and succeeded. A mode difference in which shim calls work is a mode difference
+  in what a tool can be trusted with. The store now records the audit entry and
+  returns; these ops mutate nothing and are never treated as content reads, so
+  they never taint. Pinned by `tests/test_metadata_ops_parity.py`.
 - **A wildcard mandate covered the primary target and not its copies.**
   `_check_no_amplification()` read `"*"` in `capability.scope` as a literal
   string when validating `known_targets.additional`, but as a wildcard for the
@@ -124,29 +164,10 @@ whose current `pyproject.toml` version is `0.1.1`.
   address a message and never copy or blind-copy anyone:
   `extra-target-outside-scope(bcc@corp.com not under cap-scope={'*'})`. The
   mandate said "everything" and the enforcement said "nothing extra". It also
-  meant the BCC-blocking test passed for the wrong reason, measuring the
-  mangling rather than confinement; that test now uses a genuinely restrictive
-  scope so the refusal comes from NoAmp on merit.
-- **`stat`, `exists` and `listdir` raised after the gate had already allowed
-  them.** `RestrictedResourceStore._apply_effect_inner` handled only
-  write/read/send/network/delete for `File`, so the metadata operations fell
-  through to `ValueError("effect type stat not applicable to File")`. In
-  same-process mode the shim calls the store directly, so they blew up _after_
-  ALLOW; in multi-process mode the work happens in the subprocess and succeeded.
-  A mode difference in which shim calls work is a mode difference in what a tool
-  can be trusted with. These ops mutate nothing, so the store records the audit
-  entry and returns, and they never taint.
-- **A rejected recipient was reported as a BCC bypass, and a real BCC was
-  invisible.** Two halves of one confusion. `executor_subprocess.py`
-  (`real_smtp_probe`) filled `bcc_detected` with the addresses the MTA _refused_
-  while probing only the declared set, so an ordinary delivery failure became a
-  security incident and the send was refused before delivery, with an error
-  naming an address the tool _had_ declared. `shim_email.py` avoided the
-  inversion but computed `actual_accepted - declared_set` against a probe that
-  only ever asked about `declared_set` — a difference empty by construction,
-  which read like a check and could never fire. The definition now lives in
-  `send()` and is the envelope's: accepted minus declared, with the probe
-  reporting acceptances and rejections separately.
+  meant a BCC-blocking test passed for the wrong reason, measuring the mangling
+  rather than confinement; that test now uses a genuinely restrictive scope, so
+  the block comes from NoAmp on merit rather than from the bug. Pinned by
+  `tests/test_wildcard_scope_extra_targets.py`.
 - **`/etc` was confined as a subtree, so `/etc/shadow` was readable.** Landlock
   grants a subtree, so listing `/etc` as a read root also granted `shadow`,
   `gshadow` and `sudoers`. Measured in a container with ABI 4, a confined
