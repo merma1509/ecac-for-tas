@@ -92,6 +92,31 @@ whose current `pyproject.toml` version is `0.1.1`.
   the acting tool. A capability issued to `admin` for a specific secret file was
   usable by an unrelated tool. Lookup is now restricted to credentials the tool
   may hold, and a miss returns an unresolvable nonce so Auth fails closed.
+- **A blocked read still transferred the file into the broker process.**
+  `RealFileShim._stat_pre()` opened every regular file and read it in full to
+  derive provenance labels, and it ran _before_ `broker.commit()`. A read of a
+  file outside the capability scope was refused correctly — after all 4096 bytes
+  of it had crossed into the process doing the refusing. Measured on the denied
+  path: 4096 bytes before, 0 after. The pre-probe is now metadata-only and
+  content is read only after ALLOW; the keyword heuristic survives as a
+  post-authorization upgrade, because the secret is in the task context
+  regardless of what the permission bits claimed.
+- **A CONFIDENTIAL read did not taint the session in same-process mode.**
+  `_apply_effect()` derived taint before `store.apply_effect()`, but the
+  restricted store registers file resources lazily inside it, so the pre-apply
+  `resolve()` returned `None` and the taint was skipped. A read of a 0o600 file
+  left `session.tainted == False` and the follow-up read→send exfiltration
+  passed FlowOK. Multi-process mode masked it — taint arrives there via the
+  subprocess `session_update` — and every same-process test called
+  `taint_for_send()` by hand, so nothing pinned the broken path.
+- **An authorized read left no observation, so it verified as UNKNOWN.**
+  `RealFileShim` recorded a dispatch marker for `read` and never recorded
+  evidence afterwards. `ledger.verify()` therefore returned
+  `committed_without_evidence` for _every_ legitimate read: a real bypass and a
+  normal read produced the same verdict. The invariant held, so nothing looked
+  wrong — but an audit trail that cannot confirm the commonest operation is not
+  an audit trail.
+  > > > > > > > ec8ccd1 (docs: changelog for pre-auth read and session taint)
 - **`/etc` was confined as a subtree, so `/etc/shadow` was readable.** Landlock
   grants a subtree, so listing `/etc` as a read root also granted `shadow`,
   `gshadow` and `sudoers`. Measured in a container with ABI 4, a confined
