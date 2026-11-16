@@ -41,7 +41,10 @@ SUBCONFINEMENT (arbitrary code execution):
   ✓ Module import blocking (builtins.__import__ hook)
   ✓ restricted-open for filesystem writes
   ~ Landlock sandbox — Linux only, and only when the selftest passes
-  ✓ Network blocking (except local IPC socket)
+  ✗ Network blocking — NOT implemented. `socket`, `smtplib` and `imaplib` stay
+    importable because the real shims need them, and no seccomp/BPF program
+    exists to stop a raw socket() call. This banner previously read
+    "✓ Network blocking (except local IPC socket)"; that was untrue.
 
 What "Landlock" means here: on Linux 5.13+ with the LSM enabled, a ruleset is
 applied and `_selftest_confinement()` confirms a write outside

@@ -45,8 +45,8 @@ held-out: ## Run held-out evaluator (8 sealed traces)
 	@echo "=== HELD-OUT EVALUATION (8 traces) ==="
 	@uv run python bin/eval-held-out
 
-comparative: ## Run baseline comparison (ECAC vs 7 baselines on 20 traces)
-	@echo "=== BASELINE COMPARISON (20 traces, 8 baselines) ==="
+comparative: ## Run baseline comparison (ECAC vs 9 baselines on 20 traces)
+	@echo "=== BASELINE COMPARISON (20 traces, 9 baselines) ==="
 	@uv run python bin/eval-baseline
 
 experiment: ## Run real adversarial tool experiment (M1-M5, H1-H3, T9-T20)

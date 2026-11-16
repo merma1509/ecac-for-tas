@@ -378,7 +378,8 @@ class SubprocessExecutor:
       - execute() is reentrant: gate() uses per-task locks for atomic Fresh.
 
     SUBCONCESS ISOLATION SCOPE (IMPORTANT — what IS and IS NOT confined):
-      The subprocess has THREE layers of active confinement:
+      The subprocess has TWO layers of active confinement (plus Landlock on
+      Linux when its self-test passes):
 
       LAYER 1 — Import blocking (builtins.__import__ hook):
         - BLOCKED: exec, eval, compile, pickle, marshal, shelve
@@ -394,25 +395,26 @@ class SubprocessExecutor:
         - Kernel-enforced filesystem restrictions, applied before any Python runs
         - Defense-in-depth: cannot be bypassed from Python
 
-      LAYER 3b — Seccomp BPF filter (Linux kernel-level):
-        - BLOCKED: socket(), connect(), accept(), execve(), clone(), ptrace()
-        - ALLOWED: read, write, open, close, stat, socketpair(AF_UNIX IPC only)
-        - Enforced by the Linux kernel — cannot be bypassed from Python
+      NO SYSCALL FILTERING. There is no seccomp/BPF program anywhere in this
+      codebase. An earlier revision of this docstring claimed a "Layer 3b —
+      Seccomp BPF filter" blocking socket()/connect()/execve()/clone()/ptrace().
+      It never existed, and `socket`/`smtplib` are deliberately importable
+      because the real shims need them. The claim is corrected, not implemented.
 
-      WHAT THIS MEANS (confirmed):
+      WHAT THIS MEANS:
         ✓ Broker's file/SMTP I/O via RealFileShim/RealEmailShim IS confined
         ✓ Dynamic code execution (eval/compile/pickle) IS blocked by Layer 1
-        ✓ Arbitrary network connections ARE blocked by seccomp (Layer 3b)
-        ✓ Filesystem writes OUTSIDE /tmp ARE blocked by restricted-open (Layer 2)
+        ✗ Arbitrary network connections are NOT blocked at the kernel level
+        ✓ Filesystem writes OUTSIDE /tmp ARE blocked (Landlock, or restricted-open)
         ✓ Content hash binding (HMAC-signed IPC) prevents gate→execute coupling gap
 
       REMAINING GAP (documented limitation, Option A fixes this):
         The subprocess still has access to standard library: os, smtplib, imaplib,
         pathlib, threading, etc. A compromised subprocess could:
-          1. Use smtplib to connect to ANY SMTP server (not just the configured one)
+          1. Use smtplib or a raw socket to reach ANY host, not just the
+             configured SMTP server — nothing at the kernel level stops this
           2. Read ANY file in allowed read directories (/etc, /home, etc.)
-          3. Spawn threads (but no new processes — seccomp blocks clone/execve)
-          4. Use imaplib for any IMAP connection (not just configured server)
+          3. Spawn threads and, absent a kernel exec restriction, processes
 
         To FULLY confine arbitrary tool code (Option A — recommended):
           1. Run tool in a SEPARATE subprocess with its own broker/shim

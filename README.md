@@ -50,7 +50,7 @@ OS/SMTP state** — the tool cannot forge outcomes.
 make all          # lint + typecheck + test + held-out + comparative + experiment
 make test         # pytest suite
 make held-out     # 8 sealed adversarial traces
-make comparative  # ECAC vs 8 baselines
+make comparative  # ECAC vs 9 baselines
 make experiment   # M1–M5, H1–H3, T9–T20
 make run          # T1–T20 + R1 traces
 ```
@@ -96,8 +96,14 @@ Or via `dev.sh`:
   target paths and hosts by string comparison. It was previously named
   `mode_conventional_sandbox.py` and described as "seccomp/landlock-style"; it never enforced
   either, so the claim was removed and the file renamed rather than the mechanism implemented.
-  There is currently **no faithful conventional-sandbox comparator** — a real one needs Landlock
-  or a seatbelt profile enforced by the kernel, proven by a denied path failing with `EACCES`.
+- **Kernel-enforced sandbox baseline.** `baselines/mode_os_sandbox.py` is the faithful
+  conventional-sandbox comparator the rename above left owing: it applies a Landlock ruleset
+  (Linux) or a seatbelt profile (macOS) and lets the kernel decide, so a denied path fails
+  with the kernel's own errno (`EPERM` on seatbelt, `EACCES` on Landlock) rather than a string
+  mismatch. It scores **4/20** — it denies the protected paths and permits every non-file
+  effect, because a file sandbox has no notion of recipient, provenance or replay. Where the
+  host cannot confine it reports `mechanism="none"` and blocks nothing instead of claiming a
+  protection it never observed.
   Every comparator's enforced and omitted mechanisms are listed in
   `baselines.COMPARATOR_MECHANISMS`.
 - **Mechanism-level attack regressions.** Each named predicate (Auth/FlowOK/NoAmp/Fresh) is

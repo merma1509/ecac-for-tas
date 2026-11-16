@@ -22,6 +22,9 @@ from .mode_chaincaps import ChainCapsBroker
 from .mode_cordon import CordonBroker
 from .mode_ecac import ECACBaselineBroker
 from .mode_forge import ForgeBroker
+from .mode_os_sandbox import MECHANISMS as OS_SANDBOX_MECHANISMS
+from .mode_os_sandbox import NOT_IMPLEMENTED as OS_SANDBOX_OMITS
+from .mode_os_sandbox import OSSandboxBroker
 from .mode_pact import PACTBroker
 from .mode_path_allowlist import PathAllowlistBroker
 
@@ -33,6 +36,7 @@ __all__ = [
     "ChainCapsBroker",
     "CordonBroker",
     "PathAllowlistBroker",
+    "OSSandboxBroker",
     "ForgeBroker",
     "AllowlistBroker",
     "ArgumentProvenanceBroker",
@@ -71,8 +75,10 @@ COMPARATOR_MECHANISMS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "session taint (T1 passes)",
             "replay prevention (T4 passes)",
             "recipient completeness (T3 passes)",
-            "content binding (T2, T9, T15 pass)",
-            "delegation-chain verification (T6, T16 pass)",
+            "content binding (T2 passes; T9/T15 are blocked only by missing "
+            "coverage, not by a content check)",
+            "delegation-chain verification (T6/T16 blocked only by missing "
+            "coverage, not by chain verification)",
         ),
     ),
     "ChainCaps": (
@@ -130,6 +136,9 @@ COMPARATOR_MECHANISMS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "replay prevention",
         ),
     ),
+    # The real thing: the kernel enforces this one. Entries are taken from the
+    # module itself so the table cannot drift from the code that runs.
+    "OS_Sandbox": (OS_SANDBOX_MECHANISMS, OS_SANDBOX_OMITS),
 }
 
 
@@ -144,6 +153,7 @@ def run_comparison() -> dict[str, list[dict]]:
         "ChainCaps": ChainCapsBroker(),
         "Cordon": CordonBroker(),
         "PathAllowlist": PathAllowlistBroker(),
+        "OS_Sandbox": OSSandboxBroker(),
         "FORGE": ForgeBroker(),
         "Allowlist": AllowlistBroker(),
         "ArgProv": ArgumentProvenanceBroker(),
@@ -226,23 +236,34 @@ def run_comparison() -> dict[str, list[dict]]:
 
     results = {name: [] for name in baselines}
 
-    for trace in ADVERSARIAL_TRACES:
-        effect = trace["effect"]
-        task_id = trace["task_id"]
-        name = trace["name"]
+    try:
+        for trace in ADVERSARIAL_TRACES:
+            effect = trace["effect"]
+            task_id = trace["task_id"]
+            name = trace["name"]
 
-        for baseline_name, broker in baselines.items():
-            if baseline_name != "ECAC":
-                setup_baseline(broker, baseline_name)
+            for baseline_name, broker in baselines.items():
+                if baseline_name != "ECAC":
+                    setup_baseline(broker, baseline_name)
 
-            blocked, evidence = broker.commit_effect(effect, task_id=task_id)
-            results[baseline_name].append(
-                {
-                    "name": name,
-                    "blocked": not blocked,  # True = blocked (allowed = False)
-                    "reason": evidence.get("reason", ""),
-                    "policy": evidence.get("policy", ""),
-                }
-            )
+                blocked, evidence = broker.commit_effect(effect, task_id=task_id)
+                results[baseline_name].append(
+                    {
+                        "name": name,
+                        "blocked": not blocked,  # True = blocked (allowed = False)
+                        "reason": evidence.get("reason", ""),
+                        "policy": evidence.get("policy", ""),
+                    }
+                )
+    finally:
+        # The sandbox comparator owns a temporary fixture; without this the
+        # comparison table leaks a directory per call, and `run_comparison()`
+        # is called by several tests.
+        sandbox_broker = baselines.get("OS_Sandbox")
+        close = getattr(sandbox_broker, "close", None)
+        if callable(close):
+            close()
 
     return results
+
+

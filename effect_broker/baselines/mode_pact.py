@@ -42,14 +42,21 @@ class PACTBroker:
     capability's scope is the authority boundary; provenance is recorded for
     audit but does not itself deny.
 
-    Deliberately absent (each is a trace this comparator does not block):
+    Deliberately absent (each is a trace this comparator does not block *by the
+    named mechanism*; several are still denied by missing coverage — see below):
 
-    - No content-hash binding: T2, T9, T15 pass (modify after approval).
+    - No content-hash binding: T2 passes (modify after approval).
     - No session taint: T1 passes.
     - No replay prevention: T4 passes.
     - No recipient completeness: T3 passes (hidden BCC outside scope is not
       checked, because PACT scopes by the declared target only).
-    - No delegation-chain verification: T6, T16 pass.
+
+    Coverage, not mechanism. T5, T6, T9, T10, T15 and T16 are reported BLOCKED,
+    but each with `no capability for (etype, target)` — they are denied because
+    `setup_baseline()` issues no grant covering their target, not because PACT
+    verifies delegation chains, staleness or content. Counting those as
+    "PACT catches it" would overstate the comparator, so the module keeps them
+    out of the list above while `run_comparison()` still reports the block.
     """
 
     def __init__(self) -> None:

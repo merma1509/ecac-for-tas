@@ -437,6 +437,44 @@ not JSON serializable` — after the gate had already allowed the effect, and as
   application on a nonce is a distinct finding, and answering it with "no
   evidence" hid the thing worth knowing.
 
+### Added
+
+- **`OS_Sandbox` comparator: kernel-enforced confinement, actually run.**
+  `mode_path_allowlist.py` was renamed because it compared strings while
+  claiming a sandbox; the rename left the mechanism itself unimplemented. This
+  adds it. `effect_broker/baselines/mode_os_sandbox.py` applies a Landlock
+  ruleset (Linux) or a seatbelt profile (macOS) and lets the kernel decide, so
+  the verdict comes from an attempted operation rather than a `startswith`.
+
+  Its result is 4/20, and the number is the point: it denies writes and reads
+  under `/secrets` and permits everything else, because a file sandbox has no
+  notion of recipient, provenance, replay or freshness. A comparator that
+  blocked all 20 would be trivially correct and would measure a misconfigured
+  fixture rather than a mechanism.
+
+  `verified` is True only when a self-test observed both directions — a write
+  inside the sandbox root succeeding **and** a write outside it refused by the
+  kernel, plus a planted secret being unreadable. The inside-write observation
+  is not optional: a ruleset that denies everything also satisfies the other
+  two. Where the host cannot confine, `mechanism` is `"none"` and nothing is
+  blocked, so the table reports an absent mechanism instead of a score.
+
+  Three defects were found by testing rather than by review, and each now has a
+  regression test that fails when it is reintroduced:
+  - a read-deny covering the whole fixture root also hid the probe script the
+    confined child must read to start, so every observation read as "denied"
+    while nothing was being measured;
+  - `/secrets` mapped onto the protected directory itself, so the write failed
+    with `EISDIR` — a refusal any filesystem would produce with no sandbox at
+    all, which the comparison would have credited to the kernel;
+  - the refusal reason hard-coded `EACCES`, but seatbelt returns `EPERM` and
+    Landlock returns `EACCES`; the reason now quotes the observed errno.
+
+  `tests/test_os_sandbox_comparator.py` (`24` tests) covers all of the above.
+  Tests needing confinement skip on a host without it, so an unconfined run is
+  never mistaken for a passing one — except on macOS, where the presence of
+  `sandbox-exec` makes a failed self-test a failure rather than a skip.
+
 ### Changed
 
 - **`mode_conventional_sandbox.py` renamed to `mode_path_allowlist.py`**, and
