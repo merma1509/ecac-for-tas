@@ -33,6 +33,19 @@ def _blocked_counts() -> dict[str, int]:
     return {name: sum(1 for t in traces if t["blocked"]) for name, traces in results.items()}
 
 
+def _host_can_confine() -> bool:
+    """Whether this host actually has a kernel sandbox the comparator can use.
+
+    Read from the comparator's own self-test rather than inferred from the
+    platform: presence of Landlock syscalls in the kernel does not mean they are
+    permitted here — a container can expose the syscall number and still refuse
+    it, which is exactly what happens inside `python:3.12-slim`.
+    """
+    from effect_broker.baselines.mode_os_sandbox import selftest
+
+    return selftest().verified
+
+
 class TestComparatorTableMatchesBehaviour:
     """The table must describe the code that actually runs."""
 
@@ -63,8 +76,22 @@ class TestComparatorTableMatchesBehaviour:
 
         Otherwise the claim is a description of intent, not of behaviour, and any
         comparative number against it is meaningless.
+
+        One exemption, and it is checked rather than assumed: a comparator whose
+        mechanism is enforced *by the host* blocks nothing when the host cannot
+        confine. `OS_Sandbox` on a kernel without Landlock (or in a container
+        without the syscall) reports `mechanism="none"` and blocks 0 traces by
+        design — the module's own self-test says so. Treating that as a false
+        claim would push the comparator toward simulating a deny, which is the
+        dishonesty this file exists to prevent.
+
+        The exemption is narrow on purpose: it applies only when the self-test
+        actually reports no mechanism. On a host that *can* confine, the
+        assertion still applies in full, so a comparator that silently lost its
+        deny path still fails here.
         """
         counts = _blocked_counts()
+        host_confines = _host_can_confine()
         dishonest = [
             name
             for name, (enforces, omits) in COMPARATOR_MECHANISMS.items()
@@ -72,10 +99,27 @@ class TestComparatorTableMatchesBehaviour:
             and not any(NOTHING_BLOCKED in o for o in omits)
             and name != "ECAC"
             and counts[name] == 0
+            # Host-dependent enforcement with no mechanism in effect is an
+            # absent mechanism, not an unimplemented one.
+            and not (name == "OS_Sandbox" and not host_confines)
         ]
         assert not dishonest, (
             f"Comparators that claim enforced mechanisms but block nothing: "
             f"{dishonest}. Mark them '{NOTHING_BLOCKED}' or implement the mechanism."
+        )
+
+    def test_host_exemption_is_not_a_blanket_escape(self) -> None:
+        """The OS_Sandbox exemption must track the host, not silence the check.
+
+        If this host can confine, `OS_Sandbox` must block something. This is the
+        guard that keeps the exemption above from becoming a permanent pass.
+        """
+        if not _host_can_confine():
+            pytest.skip("host cannot confine: OS_Sandbox legitimately blocks nothing")
+        counts = _blocked_counts()
+        assert counts["OS_Sandbox"] > 0, (
+            "OS_Sandbox reports a verified mechanism on this host but blocked no "
+            "trace — its deny path is unreachable."
         )
 
     def test_ecac_claims_no_omissions(self) -> None:
