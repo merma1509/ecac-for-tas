@@ -36,7 +36,68 @@ whose current `pyproject.toml` version is `0.1.1`.
   quotes the 0/20 stub figures. The dead ECAC-setup branch (which imported a
   `_capability` helper that does not exist in `traces.py`) is gone.
 
+- **The comparator honesty test no longer demands a block the host cannot
+  perform.** `test_comparator_honesty.py` failed any comparator that declared
+  enforced mechanisms yet blocked nothing, which flagged `OS_Sandbox` by design:
+  on a kernel without Landlock (or in a container where the syscall is refused,
+  as inside `python:3.12-slim`) it reports `mechanism="none"` and blocks 0
+  traces. Treating that as a false claim would push the comparator to simulate a
+  deny — the dishonesty the file exists to prevent. The exemption is narrow and
+  itself checked: it applies only when `mode_os_sandbox.selftest().verified` says
+  no mechanism is in effect, and `test_host_exemption_is_not_a_blanket_escape`
+  asserts that a host which _can_ confine still has to block something.
+
 ### Added
+
+- **Block basis is reported per trace, so a count cannot be read as a
+  mechanism.** `baselines.block_basis()` labels every comparison result
+  `coverage`, `check` or `none`, and `summarise_basis()` totals them per
+  baseline. PACT is the case that motivated it: it blocks 14 of 20 traces, and
+  every one of those denials reads `no capability for (etype, target)` — the
+  fixture never issued the grant. Those fourteen therefore describe
+  **provisioning**, not a check above it, and a reader seeing the bare count
+  would credit PACT with fourteen defences.
+
+  Measured on this tree (`summarise_basis(run_comparison())`):
+
+  | Baseline      | blocks by `check` | blocks by `coverage` | allowed |
+  | ------------- | ----------------: | -------------------: | ------: |
+  | ECAC          |                20 |                    0 |       0 |
+  | CaMeL         |                 4 |                    0 |      16 |
+  | PACT          |             **0** |               **14** |       6 |
+  | ChainCaps     |                 3 |                    0 |      17 |
+  | Cordon        |                 3 |                    0 |      17 |
+  | PathAllowlist |                 9 |                    0 |      11 |
+  | OS_Sandbox    |                 4 |                    0 |      16 |
+  | FORGE         |                 9 |                    0 |      11 |
+  | Allowlist     |                 2 |                    0 |      18 |
+  | ArgProv       |                 6 |                    0 |      14 |
+
+  PACT is the only comparator whose entire score is provisioning rather than
+  inspection, and that zero is now a column instead of a sentence.
+  `tests/test_block_basis.py` pins the classification, pins that ECAC blocks by
+  `check` only, and fails if PACT grows a real check — so the disclosure in
+  `docs/VERIFICATION.md` cannot silently rot.
+
+- **The documented gaps are now executable facts.**
+  `tests/test_documented_limitations.py` turns three limitations this
+  repository cannot close by writing Python into facts the suite verifies.
+  - **Same-process mode is detection, not prevention.** A store write reaches
+    external state with no gate and no executor, because it is an ordinary
+    object in the same address space as the tool. Only process isolation
+    closes this.
+  - **Network egress is unconfined.** `socket` cannot be blocked by the import
+    hook while delivery needs `smtplib`/`imaplib`, and no syscall filter is
+    installed, so a compromised subprocess can reach any host.
+  - **Envelope discovery depends on the transport.** Envelope-derived
+    occurrences must carry `source="smtp-envelope"`, so evidence from the MTA's
+    own transaction record stays distinguishable from a probe over addresses the
+    broker already knew. A relay that exposes no transactions degrades discovery
+    to that probe.
+
+  Each test passes _while the gap exists_ and is worded so that passing is not
+  mistaken for success: closing a gap breaks the test and forces the
+  documentation to be updated instead of quietly becoming wrong.
 
 - **Mediation is reported as three states in the diagnostic run.**
   `diagnostic_report()["mediation"]` is `{evaluated, complete, failures, note}`,
@@ -77,6 +138,28 @@ whose current `pyproject.toml` version is `0.1.1`.
   targets untouched.
 
 ### Fixed
+
+- **An attachment could be swapped without moving the approval hash, and the
+  live shim had no attachment support at all.** Writing the round-trip test that
+  P3 asked for found three defects rather than one:
+  - The live `RealEmailShim` had no attachment support — `send()` took no
+    attachment argument and `metadata` never carried one, so an approval covered
+    a message with no attachments regardless of what was transmitted.
+  - `canonical_request_from_effect` accepted attachment bytes only as `bytes`,
+    but `executor_ipc._json_safe` base64-encodes them at the process boundary.
+    In multi-process mode every attachment dropped out of the canonical request,
+    so `request_hash()` differed between the two paths and **substituting the
+    blob left the hash unchanged** — the binding was absent in the most isolated
+    mode, which is where the claim matters most.
+  - No test reached either path, which is why both were invisible.
+
+  `canonical_request_from_effect` now decodes the base64 form and hashes text it
+  cannot decode instead of dropping the field, `RealEmailShim.send()` takes
+  `attachments`, `_build_message()` emits real MIME parts, and the effect carries
+  the blobs so the gate can bind them. `tests/test_smtp_attachment_binding.py`
+  covers the round trip, hash equality across processes, blob substitution, a
+  non-UTF-8 payload, name binding, and a live send through aiosmtpd asserting the
+  attachment reaches the wire.
 
 - **A shim was judged against the `default` task's mandate, not its own.**
   `FileShim._commit_op()` built `Commit(effect=effect, task=None, ...)`, and
