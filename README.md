@@ -74,6 +74,13 @@ Or via `dev.sh`:
   it cannot see an address it was never asked about, so an undeclared recipient is
   confined by NoAmp and the capability scope, not by the probe. A hidden BCC that
   reached the MTA is caught after the fact by the oracle reading the MTA log.
+- **Attachments are part of what an approval binds.** `RealEmailShim.send()` takes
+  `attachments`, emits them as real MIME parts, and puts the blobs on the effect so the
+  canonical request can bind their digests. The binding survives the IPC boundary: attachment
+  bytes are base64-encoded by `_json_safe` there and decoded back in
+  `canonical_request_from_effect`, which refuses to drop a field it cannot decode. Swapping a
+  blob now moves `request_hash()` in both modes — before this, the multiprocess path silently
+  discarded every attachment, so the binding was absent in the most isolated mode of all.
 - **NoAmp ≠ Auth.** A forged capability that passes Auth still fails NoAmp (`owner ≠ "User"`)
 - **Session Taint Mode.** `read(CONFIDENTIAL file)` taints the session; FlowOK blocks
   subsequent `send` unless a broker-recorded declass exists.
@@ -88,6 +95,14 @@ Or via `dev.sh`:
   therefore measures ECAC's gate against those reduced models, and is regression coverage of
   gate logic on supplied traces — NOT a causal evaluation of mechanism effectiveness, and not a
   claim about the real systems (see "Honest limitations")
+- **A block count says _why_ it blocked.** `baselines.block_basis()` labels every comparison
+  result `coverage` (denied because no grant covered the operation — a property of the fixture
+  setup), `check` (an inspection ran and reached a verdict), or `none` (allowed).
+  `summarise_basis()` totals them. Measured here: ECAC 20 by check / 0 by coverage;
+  **PACT 0 by check / 14 by coverage** — every PACT denial reads `no capability for
+(etype, target)`, so its score measures provisioning, not inspection; CaMeL 4, ChainCaps 3,
+  Cordon 3, PathAllowlist 9, OS_Sandbox 4, FORGE 9, Allowlist 2, ArgProv 6, all by check.
+  `tests/test_block_basis.py` pins the classification and fails if PACT grows a real check.
 - **Adversarial workload regressions:** 17/18 supplied traces blocked; M4 benign correctly allowed
 - **Independent oracle (out-of-band).** `effect_broker/oracle.py` re-derives 'did this effect
   occur?' from the real filesystem / real SMTP MTA log, never the broker store — it can refute
@@ -143,3 +158,11 @@ Or via `dev.sh`:
   annotation burden, and TCB line count on a fixed labeled scenario set — regression
   metrics on supplied scenarios, not a causal estimate vs adaptive/live attackers.
 - **Formal specification** implementation verified in `tests/test_formal_invariants.py`
+- **These limitations are pinned, not just asserted.** `tests/test_documented_limitations.py`
+  makes the three gaps this code cannot close by writing Python into facts the suite checks:
+  same-process store mutation reaching external state with no gate, `socket` remaining
+  importable in the subprocess (and never being claimed as confined by
+  `_get_confinement_status()`), and envelope-derived occurrences carrying
+  `source="smtp-envelope"`. Each test passes _while the gap exists_, so it cannot be mistaken
+  for success — and closing a gap breaks the test, which forces this section to be updated
+  instead of quietly going stale.
