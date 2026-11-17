@@ -14,6 +14,8 @@ from what the MTA actually does.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import email.message
 import imaplib
 import smtplib
@@ -194,7 +196,12 @@ class RealEmailShim:
         return Integrity.USER  # default: user-originated
 
     def _build_message(
-        self, sender: str, recipient: str, body: str, **extra: str
+        self,
+        sender: str,
+        recipient: str,
+        body: str,
+        attachments: list[dict[str, object]] | None = None,
+        **extra: str,
     ) -> tuple[bytes, str, int]:
         """Build RFC 822 message. Returns (raw_bytes, subject, body_size).
 
@@ -202,6 +209,11 @@ class RealEmailShim:
         with date headers and MTA wrapping, and equal lengths say nothing about
         equal content. The approval binds `body` itself, which `send()` puts on
         the effect (B4).
+
+        Attachments are added as their own MIME parts and are bound by digest on
+        the effect, separately from this framed message: the framing bytes shift
+        with the date header and MTA wrapping, so binding them would make an
+        identical message hash differently on two runs.
         """
         msg = email.message.EmailMessage()
         msg["From"] = sender
@@ -210,6 +222,26 @@ class RealEmailShim:
             msg["CC"] = ", ".join(extra.values())
         msg["Subject"] = f"ECAC: {recipient}"
         msg.set_content(body)
+        for attachment in attachments or []:
+            name = str(attachment.get("name", "attachment"))
+            raw_payload = attachment.get("bytes", b"")
+            payload: object = raw_payload
+            if isinstance(raw_payload, str):
+                # Already base64 on the way back from IPC; the shim accepts the
+                # same two shapes the canonical request does.
+                try:
+                    payload = base64.b64decode(raw_payload, validate=True)
+                except (binascii.Error, ValueError):
+                    payload = raw_payload.encode("utf-8")
+            if not isinstance(payload, bytes):
+                raise EmailSecurityError(
+                    f"[{self.tool_name}] attachment {name!r} has no byte payload "
+                    f"(got {type(payload).__name__}); refusing to send an "
+                    f"unbound attachment."
+                )
+            msg.add_attachment(
+                payload, maintype="application", subtype="octet-stream", filename=name
+            )
         raw = msg.as_bytes()
         return raw, msg["Subject"], len(raw)
 
@@ -421,7 +453,14 @@ class RealEmailShim:
         except (smtplib.SMTPException, OSError, SMTPError) as ex:
             raise SMTPError(f"BCC probe failed: {ex}") from ex
 
-    def send(self, sender: str, recipient: str, body: str, **extra_recipients: str) -> None:
+    def send(
+        self,
+        sender: str,
+        recipient: str,
+        body: str,
+        attachments: list[dict[str, object]] | None = None,
+        **extra_recipients: str,
+    ) -> None:
         """Send an email with real MTA-based BCC detection.
 
         Three phases:
@@ -445,7 +484,7 @@ class RealEmailShim:
         # `body` is bound separately below — the framed message is not, because
         # its bytes change with the date header and MTA wrapping (B4).
         raw_msg, subject, body_size = self._build_message(
-            sender, canon_recipient, body, **extra_recipients
+            sender, canon_recipient, body, attachments=attachments, **extra_recipients
         )
 
         # Phase 1: SMTP RSET-only probe — discovers ACTUAL MTA recipients.
@@ -520,6 +559,13 @@ class RealEmailShim:
                 # Identity the approval must bind to the actual recipient(s).
                 "sender": sender,
                 "acting_account": acting_account,
+                # Attachments travel with the effect so the canonical request
+                # can bind their digests. Without this the approval authorized
+                # an arbitrary attachment blob, which is the gap P3 names. The
+                # blobs are the bytes the message will carry; `_json_safe` will
+                # base64 them at the IPC boundary and `canonical_request_from_
+                # effect` decodes them, so both paths agree.
+                "attachments": list(attachments or []),
             },
             provenance=(
                 Data("shim-send", conf, integ),

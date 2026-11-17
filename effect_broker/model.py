@@ -23,6 +23,7 @@ THREE ORTHOGONAL TRUST CONCEPTS (do not conflate):
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import threading
 import time
@@ -898,6 +899,22 @@ def canonical_request_from_effect(
             if isinstance(att_bytes, bytes):
                 # Raw bytes, hashed once here — never decoded with errors=replace.
                 attachments.append((str(att_name), sha256_raw(att_bytes)))
+            elif isinstance(att_bytes, str) and att_bytes:
+                # After the IPC boundary the bytes have been base64-encoded by
+                # `executor_ipc._json_safe`, so they arrive as `str`. Accepting
+                # only `bytes` made this field vanish across processes: the
+                # canonical request silently lost every attachment, and a
+                # substituted blob left the binding hash unchanged. Decoding
+                # restores the raw-bytes contract that the same-process path
+                # already had.
+                try:
+                    decoded = base64.b64decode(att_bytes, validate=True)
+                except (binascii.Error, ValueError):
+                    # Not base64: hash the text as its own bytes rather than
+                    # dropping the field. An attachment that cannot be bound is
+                    # not an attachment that may be ignored.
+                    decoded = att_bytes.encode("utf-8")
+                attachments.append((str(att_name), sha256_raw(decoded)))
 
     return CanonicalRequest(
         version=CANONICAL_REQUEST_VERSION,

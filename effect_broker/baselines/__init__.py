@@ -142,6 +142,60 @@ COMPARATOR_MECHANISMS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 }
 
 
+def block_basis(baseline_name: str, reason: str, blocked: bool) -> str:
+    """Classify WHY a trace was blocked: coverage, check, or not blocked.
+
+    A block count alone cannot answer the question the comparison is supposed to
+    answer. `PACT` blocks 14 of 20 traces, but every one of those denials is
+    "no capability for (etype, target)" — the capability was never issued by the
+    fixture, so the block demonstrates the grant table, not a check above it.
+    A reader who sees only the count would credit PACT with fourteen defences.
+
+    Three bases, and each is falsifiable from `reason`:
+
+    ``coverage``
+        Denied because no grant/authority covered the operation at all. The
+        absence is in the *setup*, so the number measures provisioning.
+    ``check``
+        Denied by an inspection that ran and reached a verdict: a flow rule,
+        expiry, freshness, content binding, a kernel refusal.
+    ``none``
+        Allowed.
+    """
+    if not blocked:
+        return "none"
+
+    lowered = reason.lower()
+    # Phrasings that mean "the authority table had no entry for this".
+    coverage_markers = (
+        "no capability",
+        "not in capability",
+        "no grant",
+        "not granted",
+        "unknown capability",
+        "no proposal",
+        "not in scope",
+    )
+    if any(marker in lowered for marker in coverage_markers):
+        return "coverage"
+    return "check"
+
+
+def summarise_basis(results: dict[str, list[dict]]) -> dict[str, dict[str, int]]:
+    """Per-baseline counts of blocks by basis, for honest reporting.
+
+    Returned shape: ``{baseline: {"coverage": n, "check": m, "none": k}}``.
+    """
+    summary: dict[str, dict[str, int]] = {}
+    for name, traces in results.items():
+        counts = {"coverage": 0, "check": 0, "none": 0}
+        for trace in traces:
+            basis = str(trace.get("basis", "none"))
+            counts[basis] = counts.get(basis, 0) + 1
+        summary[name] = counts
+    return summary
+
+
 def run_comparison() -> dict[str, list[dict]]:
     """Run all baselines against adversarial traces."""
     from .traces import ADVERSARIAL_TRACES
@@ -247,12 +301,18 @@ def run_comparison() -> dict[str, list[dict]]:
                     setup_baseline(broker, baseline_name)
 
                 blocked, evidence = broker.commit_effect(effect, task_id=task_id)
+                reason = evidence.get("reason", "")
                 results[baseline_name].append(
                     {
                         "name": name,
                         "blocked": not blocked,  # True = blocked (allowed = False)
-                        "reason": evidence.get("reason", ""),
+                        "reason": reason,
                         "policy": evidence.get("policy", ""),
+                        # Why the block happened, so the comparison cannot be
+                        # read as "this many attacks were stopped by a check"
+                        # when some were stopped by the absence of a grant in
+                        # the fixture. See `block_basis`.
+                        "basis": block_basis(baseline_name, reason, not blocked),
                     }
                 )
     finally:
