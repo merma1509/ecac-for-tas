@@ -1880,8 +1880,12 @@ class EffectBroker:
         # Register read effect output in the trusted provenance chain.
         # the entry is bound to the authorizing capability's scope
         # (scope_hash) so a provenance_id cannot be replayed under a different
-        # capability. content=None because the broker stores content="" (would be
-        # large) — the content binding degrades to "not bound" for read outputs.
+        # capability. The entry is CONTENT-BOUND: register_read_provenance
+        # hashes read_output.content, so a leaked provenance_id cannot be
+        # reused for a different (non-empty) payload of the same name/label.
+        # read_output.content is "" because the broker does not store the read
+        # bytes (simulated read; would be large) — the binding is to the exact
+        # read output as recorded, not to "any content".
         if effect.etype == "read" and task.session is not None:
             file_res = self.store.resolve(effect.target)
             if file_res is not None:
@@ -1902,7 +1906,7 @@ class EffectBroker:
                     read_output,
                     effect.capability_nonce,
                     capability=cap,
-                    content=None,
+                    content=read_output.content,
                 )
                 # Note: we don't need to modify the effect (it's immutable).
                 # The provenance chain is tracked by the session, not the effect.

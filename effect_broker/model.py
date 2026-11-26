@@ -554,9 +554,13 @@ class Session:
             return False
         if entry.data.integrity != datum.integrity:
             return False
-        if entry.content_hash is not None:
-            return compute_content_hash(datum.content) == entry.content_hash
-        return True
+        if entry.content_hash is None:
+            # Fail closed: a provenance entry with NO content binding cannot
+            # attest the exact bytes, so it is not trusted as the source of any
+            # output body. (Broker reads always set a content hash now; None
+            # would only arise from a legacy/unbound entry.)
+            return False
+        return compute_content_hash(datum.content) == entry.content_hash
 
     def provenance_mismatch_reason(self, datum: Data) -> str:
         """Explain WHY `datum` is not trusted provenance (for evidence strings).
