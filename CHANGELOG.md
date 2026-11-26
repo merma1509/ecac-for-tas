@@ -139,6 +139,20 @@ whose current `pyproject.toml` version is `0.1.1`.
 
 ### Fixed
 
+- **A declass grant could bypass the integrity (Biba) check, and a
+  task-scoped wildcard grant could be reused on another task's effect.**
+  `check_flow`'s session-taint branch returned early on a validated declass,
+  so the per-datum integrity check was never reached for a tainted send — a
+  send steered by an UNTRUSTED datum committed as soon as a declass existed.
+  The declass now sets a flag and falls through to the per-datum loop: it
+  waives the confidentiality clause only; integrity still runs and only an
+  explicit `endorse` clears it. Separately, `LabelException.matches_effect`
+  short-circuited on `match_target="*"` before the `task_id` check, so a
+  task-scoped wildcard grant matched another task's effect; the task check
+  now runs first and is never wildcardable. Pinned by
+  `tests/test_declass_integrity.py` and
+  `tests/test_wildcard_grant_task_binding.py` (982 passed).
+
 - **An attachment could be swapped without moving the approval hash, and the
   live shim had no attachment support at all.** Writing the round-trip test that
   P3 asked for found three defects rather than one:
