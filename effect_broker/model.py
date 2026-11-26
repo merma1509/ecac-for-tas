@@ -1107,7 +1107,16 @@ class LabelException:
         if self.etype is not None and effect.etype != self.etype:
             return False
 
-        # Wildcard match_target="*" matches any target set
+        # Task scope check: if task_id is set, it must match.
+        # MUST run BEFORE the wildcard short-circuit, otherwise a grant scoped
+        # to one task with match_target="*" would match any task's effect
+        # (cross-task privilege transfer). Task binding is never wildcardable.
+        if self.task_id is not None:
+            effect_task_id = effect.task_id or "default"
+            if effect_task_id != self.task_id:
+                return False
+
+        # Wildcard match_target="*" matches any target set (within task scope)
         if self.match_target == "*":
             return True
 
@@ -1118,12 +1127,6 @@ class LabelException:
         effect_targets = effect.complete_targets()
         if not (effect_targets <= authorized_targets):
             return False
-
-        # Task scope check: if task_id is set, it must match
-        if self.task_id is not None:
-            effect_task_id = effect.task_id or "default"
-            if effect_task_id != self.task_id:
-                return False
 
         return True
 

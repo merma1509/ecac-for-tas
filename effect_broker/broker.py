@@ -1079,25 +1079,34 @@ class EffectBroker:
         # If session is tainted, send effects require a declass exception.
         # This is the conservative cross-effect guard: once CONFIDENTIAL data
         # was read in this session, every send needs explicit declass.
+        # a declass clears the taint CONFIDENTIALITY gate but must not
+        # short-circuit the predicate. Set by the taint branch; consulted in the
+        # per-datum loop so integrity (Biba) is still checked.
+        taint_declassed = False
         if task.session is not None and task.session.tainted:
             if effect.etype == "send":
                 # Check if there's a declass exception that covers this send
                 if self._has_validated_exception(effect, "declass", "CONFIDENTIAL"):
-                    return True, "flow-ok(session-taint-cleared-by-declass)"
-                # PLAN_2 S3 — record that THIS task had a taint-blocked send.
-                # A later declass on the same task is evidence of over-blocking
-                # (false-denial proxy). Idempotent per (task, send-block).
-                m = self._taint_metrics
-                if m is not None and task.task_id not in self._tasks_with_taint_block:
-                    m.sends_blocked_by_taint += 1
-                    self._tasks_with_taint_block.add(task.task_id)
-                return False, (
-                    f"session-taint("
-                    f"session={task.session.session_id} "
-                    f"has-read-confidential, "
-                    f"reason={task.session.taint_reason!r}, "
-                    f"declass-required)"
-                )
+                    # declass clears the taint CONFIDENTIALITY gate.
+                    # Do NOT return here — fall through to the per-datum loop so
+                    # the INTEGRITY (Biba) check still runs. The conf violation
+                    # caused by the declassified read is waived below.
+                    taint_declassed = True
+                else:
+                    # No declass: record the taint-blocked send (false-denial metric).
+                    # a later declass on the same task is evidence of
+                    # over-blocking (false-denial proxy). Idempotent per task.
+                    m = self._taint_metrics
+                    if m is not None and task.task_id not in self._tasks_with_taint_block:
+                        m.sends_blocked_by_taint += 1
+                        self._tasks_with_taint_block.add(task.task_id)
+                    return False, (
+                        f"session-taint("
+                        f"session={task.session.session_id} "
+                        f"has-read-confidential, "
+                        f"reason={task.session.taint_reason!r}, "
+                        f"declass-required)"
+                    )
 
         sink_confidentiality, sink_integrity = task.flow_boundary
 
@@ -1131,7 +1140,10 @@ class EffectBroker:
             for datum in effect.provenance:
                 sens = datum.confidentiality > sink_confidentiality
                 decl = self._has_validated_exception(effect, "declass", datum.confidentiality.name)
-                if sens and not decl:
+                # a declass that cleared the session-taint gate also waives
+                # the confidentiality violation for the data that caused the taint.
+                # It must NOT waive integrity — the `low` check below still runs.
+                if sens and not decl and not taint_declassed:
                     return False, (
                         f"conf-leak({datum.name}:"
                         f"{datum.confidentiality.name}>{sink_confidentiality.name})"
