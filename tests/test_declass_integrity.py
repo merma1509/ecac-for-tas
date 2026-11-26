@@ -30,6 +30,7 @@ from effect_broker.model import (
 )
 from effect_broker.traces import build
 
+
 # Helpers (mirror tests/test_mechanism_attacks.py so the setup is identical)
 def _task(ceiling_scope: frozenset[str]) -> Task:
     ceiling = Capability(
@@ -105,7 +106,9 @@ class TestPlan1DeclassIntegrity:
         task = _task(frozenset({"*"}))
         broker.register_task(task)
         broker.capabilities["cap-p1-read"] = _cap("User", "*", "*", frozenset({"*"}), "cap-p1-read")
-        broker.capabilities["cap-p1-send"] = _cap("User", "send", "*", frozenset({"*"}), "cap-p1-send")
+        broker.capabilities["cap-p1-send"] = _cap(
+            "User", "send", "*", frozenset({"*"}), "cap-p1-send"
+        )
 
         _taint(broker, task, "cap-p1-read")
 
@@ -134,8 +137,12 @@ class TestPlan1DeclassIntegrity:
         broker = build()
         task = _task(frozenset({"*"}))
         broker.register_task(task)
-        broker.capabilities["cap-p1a-read"] = _cap("User", "*", "*", frozenset({"*"}), "cap-p1a-read")
-        broker.capabilities["cap-p1a-send"] = _cap("User", "send", "*", frozenset({"*"}), "cap-p1a-send")
+        broker.capabilities["cap-p1a-read"] = _cap(
+            "User", "*", "*", frozenset({"*"}), "cap-p1a-read"
+        )
+        broker.capabilities["cap-p1a-send"] = _cap(
+            "User", "send", "*", frozenset({"*"}), "cap-p1a-send"
+        )
 
         _taint(broker, task, "cap-p1a-read")
 
@@ -180,8 +187,12 @@ class TestPlan1DeclassIntegrity:
         broker = build()
         task = _task(frozenset({"*"}))
         broker.register_task(task)
-        broker.capabilities["cap-p1l-read"] = _cap("User", "*", "*", frozenset({"*"}), "cap-p1l-read")
-        broker.capabilities["cap-p1l-send"] = _cap("User", "send", "*", frozenset({"*"}), "cap-p1l-send")
+        broker.capabilities["cap-p1l-read"] = _cap(
+            "User", "*", "*", frozenset({"*"}), "cap-p1l-read"
+        )
+        broker.capabilities["cap-p1l-send"] = _cap(
+            "User", "send", "*", frozenset({"*"}), "cap-p1l-send"
+        )
 
         _taint(broker, task, "cap-p1l-read")
 

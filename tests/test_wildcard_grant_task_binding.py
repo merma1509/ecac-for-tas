@@ -106,7 +106,9 @@ class TestWildcardGrantTaskBinding:
         task_a = _task("task-a")
         broker.register_task(task_a)
         broker.capabilities["wt-cap-read"] = _cap("User", "*", "*", frozenset({"*"}), "wt-cap-read")
-        broker.capabilities["wt-cap-send"] = _cap("User", "send", "*", frozenset({"*"}), "wt-cap-send")
+        broker.capabilities["wt-cap-send"] = _cap(
+            "User", "send", "*", frozenset({"*"}), "wt-cap-send"
+        )
 
         _taint(broker, task_a, "wt-cap-read")
 
@@ -148,8 +150,12 @@ class TestWildcardGrantTaskBinding:
         broker.register_task(task_a)
         broker.register_task(task_b)
 
-        broker.capabilities["wt-cap-read-b"] = _cap("User", "*", "*", frozenset({"*"}), "wt-cap-read-b")
-        broker.capabilities["wt-cap-send-b"] = _cap("User", "send", "*", frozenset({"*"}), "wt-cap-send-b")
+        broker.capabilities["wt-cap-read-b"] = _cap(
+            "User", "*", "*", frozenset({"*"}), "wt-cap-read-b"
+        )
+        broker.capabilities["wt-cap-send-b"] = _cap(
+            "User", "send", "*", frozenset({"*"}), "wt-cap-send-b"
+        )
 
         # Taint task B's session.
         _taint(broker, task_b, "wt-cap-read-b")
@@ -197,8 +203,12 @@ class TestWildcardGrantTaskBinding:
         broker = build()
         task_a = _task("task-a")
         broker.register_task(task_a)
-        broker.capabilities["wt-cap-read-l"] = _cap("User", "*", "*", frozenset({"*"}), "wt-cap-read-l")
-        broker.capabilities["wt-cap-send-l"] = _cap("User", "send", "*", frozenset({"*"}), "wt-cap-send-l")
+        broker.capabilities["wt-cap-read-l"] = _cap(
+            "User", "*", "*", frozenset({"*"}), "wt-cap-read-l"
+        )
+        broker.capabilities["wt-cap-send-l"] = _cap(
+            "User", "send", "*", frozenset({"*"}), "wt-cap-send-l"
+        )
 
         _taint(broker, task_a, "wt-cap-read-l")
 
